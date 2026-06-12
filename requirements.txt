@@ -1,9 +1,12 @@
-akshare>=1.14.0
-pandas>=2.0.0
-numpy>=1.24.0
-requests>=2.28.0
-pyyaml>=6.0
-cachetools>=5.3.0
-scikit-learn>=1.2.0
-matplotlib>=3.7.0
-python-dateutil>=2.8.0
+# 核心依赖
+mootdx>=0.10.0            # 通达信 TCP 行情（K线+财务快照，永不封IP）
+requests>=2.28.0          # HTTP API 直连（腾讯行情/同花顺热点/东财）
+pandas>=2.0.0             # 数据处理与 DataFrame 操作
+
+# 辅助依赖
+numpy>=1.24.0             # 因子计算
+scikit-learn>=1.2.0       # Ridge 回归权重优化
+akshare>=1.14.0           # A 股代码列表 + 大单资金流数据
+cachetools>=5.3.0         # 实时行情内存缓存 (TTLCache)
+pyyaml>=6.0               # 配置文件加载 (config.yml)
+stockstats                 # （可选）技术指标计算，已有内置实现则可不装
