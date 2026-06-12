@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+data/kline_cache.db
+data/predictions.db
+data/codes_cache.json
+data/model_weights/
+data/daily_reports/
+data/backtest_results/
+docs/
+stock-picker.code-workspace
+.claude/
+.env

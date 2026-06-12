@@ -1,0 +1,96 @@
+# ============================================================
+# A股智能选股系统 — 核心配置
+# ============================================================
+
+# ---- 数据源 ----
+data_sources:
+  primary: akshare           # 主数据源（已装 v1.18.39）
+  fallback: baostock         # 备用数据源
+  tencent_api: true          # 腾讯行情API（备用，不封IP）
+
+  # 数据源优先级回退链
+  priority_chains:
+    realtime_quote:          # 实时行情
+      - tencent
+      - null
+    kline:                   # 历史K线
+      - baostock
+      - mootdx
+      - null
+    capital_flow:            # 主力资金流
+      - akshare
+      - push2_direct         # 直连东财push2 API
+      - null
+    north_flow:              # 北向资金
+      - akshare
+      - null
+
+# ---- 短线策略权重 ----
+short_term:
+  weights:
+    capital_flow: 0.27       # 主力资金流（近10日累计流入）
+    north_flow: 0.10         # 北向资金（近10日累计净买入）
+    momentum: 0.15           # 动量/RPS排位
+    technical: 0.15          # 技术形态（均线/MACD/KDJ）
+    volume_price: 0.10       # 量价配合（量比/尾盘承接）
+    risk: 0.10               # 风险过滤
+    hot_theme: 0.08          # 同花顺热点/题材归因
+    dragon_tiger: 0.05       # 龙虎榜信号
+
+  # 买入条件
+  buy:
+    max_candidates: 3         # 最多推荐数量
+    min_score: 60             # 最低评分（0-100），低于此值跳过
+    exclude_st: true
+    exclude_limit_up: true    # 涨停封死的股票
+    min_volume: 30000000      # 最低日成交额（3000万）
+    min_listing_days: 60      # 最低上市天数
+
+  # 卖出规则
+  sell:
+    take_profit: 0.02         # 止盈 +2%
+    stop_loss: -0.02          # 止损 -2%
+    time_stop_days: 3         # 时间止损（T+3）
+
+# ---- 长线策略权重 ----
+long_term:
+  weights:
+    fundamental: 0.30         # 基本面（ROE/净利润增速）
+    north_flow: 0.20          # 北向资金（长期加仓信号）
+    momentum: 0.15            # 中期动量（60/120日RPS）
+    valuation: 0.15           # 估值分位（PE/PB历史分位）
+    risk: 0.10                # 风险控制
+    institutional: 0.10       # 机构持仓变化
+
+  hold_period:
+    min_months: 3
+    max_months: 6
+
+  # 买入条件
+  buy:
+    max_candidates: 5         # 最多推荐数量
+    min_score: 65             # 最低评分（0-100），低于此值跳过
+
+# ---- 模型迭代 ----
+model:
+  version_dir: data/model_weights
+  min_records_for_optimize: 30   # 至少积累30条推荐记录才触发优化
+  optimizer: ridge               # 优化算法：ridge / lasso / linear
+  ridge_alpha: 1.0
+  auto_rollback_threshold: -0.05 # 新版胜率下降超5%则自动回滚
+
+# ---- 回测 ----
+backtest:
+  default_start: "2024-01-01"
+  default_end: "2025-12-31"
+  initial_capital: 1000000       # 初始资金
+  commission_rate: 0.0003         # 手续费万三
+  slippage: 0.001                 # 滑点 0.1%
+  parallel_workers: 4             # 数据拉取并行数
+
+# ---- 推送 ----
+notifications:
+  console: true                  # 控制台输出
+  # 以下后续配置：
+  # feishu_webhook: ""
+  # wechat_bot: ""

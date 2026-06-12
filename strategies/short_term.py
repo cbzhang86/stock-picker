@@ -1,0 +1,369 @@
+"""
+短线尾盘策略
+
+核心逻辑：
+  尾盘（14:50-15:00）全市场扫描 → 多因子评分 → 推荐Top N
+
+权重分配：
+  主力资金流 30% + 北向资金 15% + RPS动量 15%
+  + 技术形态 15% + 量价配合 10% + 风险 10% + 新闻脉冲 5%
+
+因子权重设计参考：
+  - 原提示词中"主力资金近10天持续流入（高优先级加分项）"
+  - "北向资金近10天持续加仓（高优先级加分项）"
+  - "尾盘承接、流动性、技术趋势、风险过滤、新闻脉冲"
+
+卖出规则：
+  - 止盈：T+1 开盘+2% 以上分批止盈
+  - 止损：T+1 开盘-2% 或 收盘跌破MA5
+  - 时间止损：T+3 日无表现
+"""
+
+import logging
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pandas as pd
+
+from strategies.base import BaseStrategy
+from core.data_engine import DataEngine
+from core.scoring_model import ScoringModel
+from core.risk_filter import RiskFilter
+from core.portfolio_optimizer import PortfolioOptimizer
+
+logger = logging.getLogger(__name__)
+
+
+class ShortTermStrategy(BaseStrategy):
+    """短线尾盘策略"""
+
+    def __init__(self, config: dict = None):
+        super().__init__(config)
+        config = config or {}
+        self.data_engine = DataEngine()
+        # 修复：从 config.yml 的 weights 键加载，而非不存在的 weights_model
+        weights_cfg = config.get('weights', config.get('weights_model'))
+        self.scoring_model = ScoringModel(
+            weights=weights_cfg if weights_cfg else None
+        )
+        # 从嵌套的 buy 段读取参数
+        buy_cfg = config.get('buy', {})
+        self.risk_filter = RiskFilter(config=buy_cfg)
+        self.top_n = buy_cfg.get('max_candidates', 3)
+        self.min_score = buy_cfg.get('min_score', 60)
+
+    def run(self, market_data: Dict = None) -> List[Dict]:
+        """
+        运行短线尾盘策略
+
+        参数：
+          market_data: 可选，外部传入的全市场数据
+
+        返回：
+          推荐列表 [{code, name, score, rating, decision, ...}]
+        """
+        logger.info("=" * 50)
+        logger.info("短线尾盘策略运行中...")
+
+        # 1. 获取全市场行情
+        if market_data:
+            quotes_df = market_data.get('quotes_df')
+        else:
+            quotes_df = self.data_engine.get_all_quotes()
+
+        if quotes_df is None or quotes_df.empty:
+            logger.warning("无可用的行情数据，策略跳过")
+            return []
+
+        logger.info(f"全市场共 {len(quotes_df)} 只股票")
+
+        # 1.5 预加载同花顺热点（一次拉取，全流程共用）
+        hot_df = self.data_engine.get_ths_hot_stocks()
+        hot_codes = set()
+        if not hot_df.empty:
+            hot_codes = set(str(c).zfill(6) for c in hot_df['代码'].tolist() if pd.notna(c))
+            logger.info(f"同花顺强势股: {len(hot_codes)} 只有题材归因标签")
+            # 提取热门题材排名
+            themes = self.data_engine.extract_hot_themes(hot_df)
+            if themes:
+                logger.info(f"TOP5 热门题材: {[t['theme'] for t in themes[:5]]}")
+
+        # 2. 批量过滤 + 预评分
+        candidates = self._prefilter(quotes_df)
+        logger.info(f"预过滤后 {len(candidates)} 只进入详评")
+
+        if len(candidates) == 0:
+            logger.info("今日尾盘策略跳过：没有足够合格的标的")
+            return []
+
+        # 3. 获取详细数据
+        enriched = self._enrich_data(candidates, hot_codes)
+
+        # 4. 评分 + 排序
+        recommendations = self.scoring_model.rank_stocks(
+            enriched, mode='short',
+            top_n=self.top_n, min_score=self.min_score
+        )
+
+        if not recommendations:
+            logger.info("今日尾盘策略跳过：没有评分达标的标的")
+        else:
+            logger.info(f"推荐 {len(recommendations)} 只股票")
+
+        # 附加数据源状态到结果
+        source_status = self.data_engine.get_data_source_summary()
+        for rec in recommendations:
+            rec['data_source_status'] = source_status
+            rec['market_data'] = {}
+
+        # 附加市场级数据
+        try:
+            north_summary = self.data_engine.get_north_flow_summary()
+            if north_summary:
+                for rec in recommendations:
+                    rec['market_data'] = {'north_flow': north_summary}
+        except Exception:
+            pass
+
+        # 对推荐结果补充板块归属和龙虎榜（仅对 top N 做，走 em_get 限流）
+        for rec in recommendations:
+            code = rec['code']
+            try:
+                blocks = self.data_engine.get_stock_blocks(code)
+                rec['blocks'] = blocks
+            except Exception:
+                rec['blocks'] = {"total": 0, "boards": [], "concept_tags": []}
+            try:
+                dt = self.data_engine.get_dragon_tiger(code)
+                rec['dragon_tiger'] = dt
+            except Exception:
+                rec['dragon_tiger'] = {"records": [], "seats": {"buy": [], "sell": []}, "institution": {}}
+            # 补充因子分解中的 hot_theme 和 dragon_tiger 实际得分
+            rec['breakdown'].pop('hot_theme', None)
+            rec['breakdown'].pop('dragon_tiger', None)
+
+        # 组合优化：评分加权仓位分配
+        recommendations = PortfolioOptimizer.allocate(recommendations)
+
+        return recommendations
+
+    def _prefilter(self, quotes_df: pd.DataFrame) -> list:
+        """
+        初筛过滤
+
+        快速过滤掉明显不合格的股票，减少后续API调用
+
+        过滤条件：
+        - 非ST
+        - 非涨停封死
+        - 成交额 > 3000万
+        - 非停牌（有价格）
+        """
+        candidates = []
+
+        for _, row in quotes_df.iterrows():
+            stock = {
+                'code': str(row['code']).zfill(6),
+                'name': row.get('name', ''),
+                'price': row.get('price', 0),
+                'pct_chg': row.get('pct_chg', 0),
+                'amount': row.get('amount', 0),
+                'turnover': row.get('turnover', 0),
+                'volume_ratio': row.get('volume_ratio', 1),
+                'pe': row.get('pe', None),
+                'pb': row.get('pb', None),
+                'name_raw': row.get('name', ''),
+            }
+
+            # 风险过滤
+            risk_result = self.risk_filter.check_stock(stock)
+            stock['risk_check'] = risk_result
+
+            if risk_result['passed'] or risk_result['score_penalty'] < 0.8:
+                # 设置风险评分（0-100，越高越安全）
+                stock['risk_score'] = 100.0 * (1.0 - risk_result.get('score_penalty', 0))
+                candidates.append(stock)
+
+        return candidates
+
+    def _enrich_data(self, candidates: list, hot_codes: set = None) -> list:
+        """
+        获取详细数据 — 多维度初筛后取前 200 只拉取完整数据
+
+        初筛评分（利用已有数据，不额外请求）：
+          - 流动性 30分：成交额排名百分位
+          - 活跃度 20分：换手率排名百分位
+          - 短期动量 15分：当日涨幅（正合理，过高扣分）
+          - 风险 20分：risk_score
+          - 估值 15分：PE合理区间得分
+          - 合计 100分
+
+        取前 200 只进入详评阶段
+        """
+        # 1. 先给所有候选股算初步评分
+        scored = []
+        # 收集排名数据
+        amounts = [s.get('amount', 0) or 0 for s in candidates]
+        turnovers = [s.get('turnover', 0) or 0 for s in candidates]
+        pct_chgs = [s.get('pct_chg', 0) or 0 for s in candidates]
+
+        import numpy as np
+        # 改进：用numpy的percentile替代O(n²)的循环
+        amount_arr = np.array(amounts)
+        turnover_arr = np.array(turnovers)
+
+        def pct_rank_arr(arr, val):
+            if len(arr) == 0:
+                return 50
+            return np.searchsorted(np.sort(arr), val) / len(arr) * 100
+
+        for stock in candidates:
+            amount = stock.get('amount', 0) or 0
+            turnover = stock.get('turnover', 0) or 0
+            pct_chg = stock.get('pct_chg', 0) or 0
+            risk_score = stock.get('risk_score', 50)
+            pe = stock.get('pe')
+
+            # 流动性评分：成交额越高分越高
+            amount_score = pct_rank_arr(amount_arr, amount) * 0.30
+
+            # 活跃度评分：换手率1%-10%最佳，过低冷清，过高异常
+            if 1 <= turnover <= 10:
+                turnover_score = pct_rank_arr(turnover_arr, turnover) * 0.20
+            elif 0.5 <= turnover < 1:
+                turnover_score = 30 * 0.20
+            elif turnover > 10:
+                turnover_score = 20 * 0.20
+            else:
+                turnover_score = 5 * 0.20
+
+            # 短期动量：涨跌幅在1%~5%最佳，过大回调风险高，过小无动量
+            if 1 <= pct_chg <= 5:
+                momentum_score = 85 * 0.15
+            elif -1 < pct_chg < 1:
+                momentum_score = 60 * 0.15
+            elif 5 < pct_chg <= 9:
+                momentum_score = 50 * 0.15
+            elif -5 < pct_chg <= -1:
+                momentum_score = 30 * 0.15
+            else:
+                momentum_score = 15 * 0.15
+
+            # 风险评分
+            risk_score_component = risk_score * 0.20
+
+            # 估值评分：PE在10-30合理区间得分高
+            if pe and pe > 0:
+                if 10 <= pe <= 30:
+                    pe_score = 85 * 0.15
+                elif 5 <= pe < 10 or 30 < pe <= 50:
+                    pe_score = 65 * 0.15
+                elif 50 < pe <= 100:
+                    pe_score = 40 * 0.15
+                else:
+                    pe_score = 20 * 0.15
+            else:
+                pe_score = 30 * 0.15  # PE负或缺失
+
+            preliminary_score = amount_score + turnover_score + momentum_score + risk_score_component + pe_score
+
+            stock['preliminary_score'] = round(preliminary_score, 2)
+            scored.append(stock)
+
+        # 按初步评分排序取前 200
+        scored.sort(key=lambda x: x.get('preliminary_score', 0), reverse=True)
+        top_candidates = scored[:200]
+        logger.info(f"初步评分排序，前10只: {[(s['code'], s.get('name',''), s['preliminary_score']) for s in top_candidates[:10]]}")
+
+        enriched = []
+        all_raw_returns = {}
+        total = len(top_candidates)
+        logger.info(f"详评 {total} 只（初步评分前200）")
+
+        # 预加载大单缓存（一次拉全量，后续单个查询是毫秒级）
+        if total > 0:
+            self.data_engine.get_main_fund_accumulated(top_candidates[0]['code'])
+
+        # 先集中获取所有资金的流（前200只全部是毫秒级，因为大单已缓存）
+        for stock in top_candidates:
+            code = stock['code']
+            try:
+                main_accum = self.data_engine.get_main_fund_accumulated(code, days=10)
+            except Exception:
+                main_accum = None
+            stock['main_fund_accumulated'] = main_accum
+
+            try:
+                north_accum = self.data_engine.get_north_flow_accumulated(code, days=10)
+            except Exception:
+                north_accum = None
+            stock['north_flow_accumulated'] = north_accum
+
+        # K线 + 技术指标（并行拉取，每只独立线程）
+        # 缓存命中的毫秒级返回，未命中的走baostock
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from threading import Lock
+        enrich_lock = Lock()
+
+        def fetch_kline(stock):
+            code = stock['code']
+            try:
+                kline = self.data_engine.get_kline(code)
+                if kline is not None and not kline.empty and len(kline) >= 20:
+                    close = kline['close']
+                    high = kline.get('high', close)
+                    low = kline.get('low', close)
+                    macd = self.scoring_model.factor_lib.calc_macd_status(close)
+                    stock['macd_status'] = macd
+                    stock['kline_df'] = kline
+                    raw_return_20 = (close.iloc[-1] / close.iloc[-20] - 1) * 100
+                    with enrich_lock:
+                        all_raw_returns[code] = raw_return_20
+                    stock['raw_return_20'] = raw_return_20
+                else:
+                    stock['macd_status'] = {'score': 50, 'status': 'unknown'}
+                    stock['raw_return_20'] = 0
+            except Exception as e:
+                logger.warning(f"{code} 技术面失败: {str(e)[:60]}")
+                stock['macd_status'] = {'score': 50, 'status': 'unknown'}
+                stock['raw_return_20'] = 0
+            return stock
+
+        # baostock 是全局单例，只能用1个线程。但大部分已缓存，串行走就行。
+        # 用 max_workers=3 让少量未命中并行，大部分已命中毫秒返回
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(fetch_kline, s): s for s in top_candidates}
+            for future in as_completed(futures):
+                enriched.append(future.result())
+
+        # 横截面RPS计算
+        if all_raw_returns:
+            codes_list = list(all_raw_returns.keys())
+            returns_series = pd.Series([all_raw_returns[c] for c in codes_list])
+            rps_values = returns_series.rank(pct=True) * 100
+            for code, rps_val in zip(codes_list, rps_values):
+                for s in enriched:
+                    if s['code'] == code:
+                        s['rps_20'] = float(rps_val)
+                        break
+
+        # 补充新数据源信号（不额外请求 API，只打标签）
+        # 板块归属和龙虎榜在最终推荐后单独补充（避免 em_get 限流阻塞200只流程）
+        for s in enriched:
+            s['is_hot_stock'] = hot_codes and s['code'] in hot_codes
+            s['blocks'] = {"total": 0, "boards": [], "concept_tags": []}
+            s['dragon_tiger'] = {"records": [], "seats": {"buy": [], "sell": []}, "institution": {}}
+
+        logger.info(f"详评完成: {len(enriched)} 只")
+        return enriched
+
+    def get_required_fields(self) -> list:
+        return [
+            'code', 'name', 'price', 'pct_chg', 'amount',
+            'turnover', 'volume_ratio', 'pe', 'pb', 'name_raw'
+        ]
+
+    def describe(self) -> str:
+        return (f"短线尾盘策略: T+0尾盘选股 → T+1开盘卖出。"
+                f"主力资金(25%)+动量(15%)+技术(15%)+量价(10%)+风控(10%)+热点(8%)+龙虎榜(5%)")
