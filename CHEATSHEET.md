@@ -56,15 +56,42 @@ ScoringModel 的权重加载顺序：
 
 ---
 
-## 4. 数据源失效保护
+## 4. 数据源失效保护 + 熔断机制
+
+### 失效保护
 
 系统已经内置：某个数据源不通时，对应因子中性化为 50 分，权重重分配给其他活跃因子。
 
 **不需要手动处理数据源失败。** 如果看到状态里有 "主力资金流(东方财富): 不可用"，这是正常的——东财在境外网络下被 WAF 挡了，系统会自动降权。
 
 当前确实不通的有：
-- 主力资金流(东财) → 回退到大单交易缓存（685只）
-- 北向资金个股(东财) → 回退到 hexin.cn 全市场汇总
+- 主力资金流个股(东财 `stock_individual_fund_flow`) → 熔断跳过
+- 北向资金个股(东财 `stock_hsgt_individual_em`) → 熔断跳过
+
+### 独立数据源级熔断
+
+系统使用 `_source_available` 字典实现**数据源级别的独立熔断**，各 endpoint 互不影响：
+
+```python
+_source_available = {
+    'big_deal': True,      # stock_fund_flow_big_deal — ✅ 通
+    'capital_flow': True,  # stock_individual_fund_flow — ❌ 不通
+    'north_flow': True,    # stock_hsgt_individual_em — ❌ 不通
+    'push2': True,         # push2 直连 — ❌ 不通
+}
+```
+
+**关键设计：** `big_deal` 和 `north_flow` 的熔断完全独立。北向 200 只全部超时只影响 `north_flow` 标志位，不影响大单缓存。之前有个 Bug：用单变量 `_akshare_available` 共享熔断，北向第 1 只失败后大单缓存也被连带熔断，199 只资金流全变 50 分，25s 的大单加载白花了。
+
+### 大单缓存覆盖范围
+
+`stock_fund_flow_big_deal()` 只包含**当日有大单交易**的股票（约 685 只），不是全市场 5205 只。如果一只票今天没有大单交易，它就不在缓存里，`get_main_fund_accumulated()` 返回 `None`，`capital_flow` 因子得 50 分中性值。
+
+降级路径：
+1. **大单缓存命中**（685 只）→ 返回真实净流入 → capital_flow 正常评分
+2. **大单缓存未命中**（其余 4520+ 只）→ 返回 None → 因子降权中性 50 分，权重分配给其他因子
+
+**不需要处理——这是正常行为，没有大单交易不意味着没有主力资金，系统会通过权重分配自动补偿。**
 
 ---
 
