@@ -729,7 +729,13 @@ class DataEngine:
     def get_north_flow_accumulated(self, code: str, days: int = 10) -> Optional[float]:
         """
         北向资金近N日累计（东方财富源，网络受限时返回None）
+        已加入熔断：首次失败后本运行周期不再重试。
+        降级方案：用 get_north_flow_summary() 全市场汇总替代个股数据。
         """
+        # akShare熔断：如果之前失败过，跳过
+        if not self._akshare_available:
+            return None
+
         try:
             import akshare as ak
             df = ak.stock_hsgt_individual_em(symbol=str(code).zfill(6))
@@ -737,6 +743,7 @@ class DataEngine:
                 self._update_source_status('akshare_north_flow', True)
                 return df.tail(days)['当日净流入'].sum()
         except Exception as e:
+            self._akshare_available = False  # 熔断：本运行周期不再重试
             self._update_source_status('akshare_north_flow', False, str(e)[:60])
         return None
 
