@@ -404,18 +404,38 @@ akshare ──→ 大单/代码   ├─ calc_bollinger
 
 ## 🔧 数据源
 
-| 数据 | 数据源 | 优先级 | 协议 | 防封措施 |
-|------|--------|:-----:|------|---------|
-| K 线 + 财务 | mootdx（通达信） | 🥇 **首选** | TCP 7709 | 永不封 IP |
-| 实时行情 | 腾讯财经 | 🥇 **首选** | HTTP | 不封 IP |
-| 同花顺强势股 | 10jqka | 🥈 | HTTP | 零鉴权 73ms |
-| 北向资金 | hexin.cn | 🥈 | HTTP | 零鉴权 |
-| 板块归属 | 东财 push2 | 🥉 | HTTP | em_get 限流 |
-| 龙虎榜 | 东财 datacenter | 🥉 | HTTP | em_get 限流 |
-| 大单资金流 | akshare | 🥉 | HTTP | 仅当日 |
-| 代码列表 | akshare | — | HTTP | 本地 JSON 缓存 |
+| 数据 | 数据源 | 优先级 | 协议 | 防封措施 | 状态 |
+|------|--------|:-----:|------|---------|:----:|
+| K 线 + 财务 | mootdx（通达信） | 🥇 **首选** | TCP 7709 | 永不封 IP | ✅ |
+| 实时行情 | 腾讯财经 | 🥇 **首选** | HTTP | 不封 IP | ✅ |
+| 同花顺强势股 | 10jqka | 🥈 | HTTP | 零鉴权 73ms | ✅ |
+| 北向资金实时汇总 | hexin.cn | 🥈 | HTTP | 零鉴权 | ✅ |
+| 大单资金流（685 只） | akshare big_deal | 🥈 | HTTP | 独立熔断，不与其他源共享 | ✅ |
+| 板块归属 | 东财 push2 | 🥉 | HTTP | em_get 限流 | ✅ |
+| 龙虎榜 | 东财 datacenter | 🥉 | HTTP | em_get 限流 | ✅ |
+| 个股北向 | akshare | — | HTTP | ❌ 境外不通，独立熔断，不影响其他源 | ⛔ |
+| 个股资金流 | akshare | — | HTTP | ❌ 境外不通，独立熔断，不影响其他源 | ⛔ |
 
-**失效保护**：当某数据源不可用时，对应因子自动中性化为 50 分，其权重重分配给其他活跃因子。评分不会被压缩。
+### 独立数据源级熔断
+
+系统使用 `_source_available` 字典实现数据源级别的独立熔断，各 endpoint 互不影响：
+
+```python
+_source_available = {
+    'big_deal': True,      # stock_fund_flow_big_deal — 通的
+    'capital_flow': True,  # stock_individual_fund_flow — 不通
+    'north_flow': True,    # stock_hsgt_individual_em — 不通
+    'push2': True,         # push2 直连 — 不通
+}
+```
+
+`big_deal` 和 `north_flow` 的熔断完全独立。北向 200 只超时只影响 `north_flow` 标志位，不影响大单缓存。之前用单变量共享熔断时，北向失败连带大单缓存也被熔断，25s 的大单加载白花了——已修复。
+
+### 大单缓存覆盖范围
+
+`stock_fund_flow_big_deal()` 只包含**当日有大单交易**的股票（约 685 只），不是全市场 5205 只。没有大单交易的股票 `capital_flow` 因子取中性 50 分，权重自动分配给其他因子。这是正常行为，无需处理。
+
+### 失效保护
 
 ---
 

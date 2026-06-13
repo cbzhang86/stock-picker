@@ -408,16 +408,38 @@ akshare ─────→ BigDeal    ├─ calc_bollinger
 
 ## 🔧 Data Sources
 
-| Data | Source | Priority | Protocol | Anti-Ban |
-|------|--------|:-------:|----------|----------|
-| K-Line + Financials | mootdx (Tongdaxin) | 🥇 **Primary** | TCP 7709 | Never banned |
-| Real-time Quotes | Tencent Finance | 🥇 **Primary** | HTTP | Never banned |
-| Hot Stocks | 10jqka (Tonghuashun) | 🥈 | HTTP | Zero auth |
-| North-bound Capital | hexin.cn | 🥈 | HTTP | Zero auth |
-| Sector Membership | East Money slist | 🥉 | HTTP | em_get rate-limited |
-| Dragon-Tiger List | East Money datacenter | 🥉 | HTTP | em_get rate-limited |
-| Large-Deal Flow | akshare | 🥉 | HTTP | Current-day only |
-| Code List | akshare | — | HTTP | JSON cached |
+| Data | Source | Priority | Protocol | Anti-Ban | Status |
+|------|--------|:-------:|----------|----------|:------:|
+| K-Line + Financials | mootdx (Tongdaxin) | 🥇 **Primary** | TCP 7709 | Never banned | ✅ |
+| Real-time Quotes | Tencent Finance | 🥇 **Primary** | HTTP | Never banned | ✅ |
+| Hot Stocks | 10jqka (Tonghuashun) | 🥈 | HTTP | Zero auth | ✅ |
+| North-bound Capital Summary | hexin.cn | 🥈 | HTTP | Zero auth | ✅ |
+| Large-Deal Flow (685 stocks) | akshare big_deal | 🥈 | HTTP | Independent fuse, not shared | ✅ |
+| Sector Membership | East Money slist | 🥉 | HTTP | em_get rate-limited | ✅ |
+| Dragon-Tiger List | East Money datacenter | 🥉 | HTTP | em_get rate-limited | ✅ |
+| Per-stock Capital Flow | akshare | — | HTTP | ❌ Blocked overseas, independent fuse | ⛔ |
+| Per-stock North-bound | akshare | — | HTTP | ❌ Blocked overseas, independent fuse | ⛔ |
+
+### Independent Source-Level Fuse
+
+The system uses `_source_available` dict for source-level independent fusing — each endpoint is isolated:
+
+```python
+_source_available = {
+    'big_deal': True,      # stock_fund_flow_big_deal — works
+    'capital_flow': True,  # stock_individual_fund_flow — blocked
+    'north_flow': True,    # stock_hsgt_individual_em — blocked
+    'push2': True,         # push2 direct — blocked
+}
+```
+
+`big_deal` and `north_flow` are completely independent. 200 north-bound timeouts only affect `north_flow`, never the big deal cache. A previous bug used a shared single variable (`_akshare_available`), which caused the big deal cache to be fused off when north-bound failed — wasting the 25s load.
+
+### Large-Deal Cache Coverage
+
+`stock_fund_flow_big_deal()` only covers stocks **with large deals today** (~685 stocks), not all 5205. Stocks without large deals get `capital_flow` factor neutralized to 50, with weight redistributed to other factors. This is expected behavior.
+
+### Failure Protection
 
 ### Failure Protection
 
