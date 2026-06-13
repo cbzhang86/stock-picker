@@ -613,58 +613,58 @@ class DataEngine:
         }
 
     # ========== 资金面（akshare，可能被网络限制） ==========
-    _akshare_available = True  # akShare熔断标志：首次失败后本轮不再重试
+    # 数据源级别的熔断标志，各 endpoint 独立，互不影响
+    _source_available = {
+        'big_deal': True,      # stock_fund_flow_big_deal — 全市场大单（✅ 通的）
+        'capital_flow': True,  # stock_individual_fund_flow — 个股主力（❌ 可能不通）
+        'north_flow': True,    # stock_hsgt_individual_em — 个股北向（❌ 可能不通）
+        'push2': True,         # push2 直连（❌ 不通）
+    }
 
     def get_main_fund_accumulated(self, code: str, days: int = 10) -> Optional[float]:
         """
         主力资金近N日累计 — 多源回退链：
-        1. 大单交易汇总（今日大单净流向，最快）
-        2. akshare (东方财富 SDK，备用)
+        1. 大单交易汇总（今日大单净流向，最快，独立熔断）
+        2. akshare (东方财富 SDK，备用，独立熔断)
         3. 直连东财 push2 API (绕过SDK，待启用)
         调用方自动降权处理
         """
-        # 源1: 全市场大单交易汇总（内存缓存，毫秒级）
+        # 源1: 全市场大单交易汇总（内存缓存，毫秒级，不与个股北向共用熔断）
         result = self._get_capital_flow_big_deal(code)
         if result is not None:
             return result
 
-        # akShare熔断：如果之前失败过，跳过akshare源
-        if not self._akshare_available:
-            return None
+        # 源2: akshare 个股资金流（带短超时，自己独立的熔断）
+        if self._source_available.get('capital_flow', True):
+            try:
+                import akshare as ak
+                market = 'sh' if str(code).zfill(6).startswith(self.SH_PREFIXES) else 'sz'
+                df = ak.stock_individual_fund_flow(stock=str(code).zfill(6), market=market)
+                if df is not None and not df.empty:
+                    result = float(df.tail(days)['主力净流入-净额'].sum())
+                    self._update_source_status('akshare_fund_flow', True)
+                    return result
+            except Exception as e:
+                self._source_available['capital_flow'] = False  # 独立熔断
+                self._update_source_status('akshare_fund_flow', False, str(e)[:60])
 
-        # 源2: akshare (带短超时)
-        try:
-            import akshare as ak
-            market = 'sh' if str(code).zfill(6).startswith(self.SH_PREFIXES) else 'sz'
-            df = ak.stock_individual_fund_flow(stock=str(code).zfill(6), market=market)
-            if df is not None and not df.empty:
-                result = float(df.tail(days)['主力净流入-净额'].sum())
-                self._update_source_status('akshare_fund_flow', True)
-                return result
-        except Exception as e:
-            self._akshare_available = False  # 熔断：本运行周期不再重试
-            self._update_source_status('akshare_fund_flow', False, str(e)[:60])
-
-        # 源2: 直连东财 push2 API（当前网络环境不通，保留代码待以后启用）
+        # 源3: 直连东财 push2 API（当前网络环境不通，保留代码待以后启用）
         # result = self._get_capital_flow_push2(code, days)
         # if result is not None:
         #     return result
 
-        # 源3: 全市场大单交易汇总（今日净流入）
-        result = self._get_capital_flow_big_deal(code)
-        if result is not None:
-            self._update_source_status('akshare_fund_flow', True)
-            return result
-
         return None
 
     def _get_capital_flow_big_deal(self, code: str) -> Optional[float]:
-        """从全市场大单交易汇总中推算个股今日主力净流入（买入-卖出差额）"""
-        # akShare熔断
-        if not self._akshare_available:
+        """从全市场大单交易汇总中推算个股今日主力净流入（买入-卖出差额）
+
+        独立熔断：不和 get_north_flow_accumulated 共享标志位。
+        因为 big_deal 数据本身是通的，不能被个股北向的失败连带熔断。
+        """
+        if not self._source_available.get('big_deal', True):
             return None
         try:
-            # 缓存：整个 session 只拉一次全量大单数据，持久化到磁盘
+            # 缓存：整个 session 只拉一次全量大单数据
             if not hasattr(self, '_big_deal_cache') or self._big_deal_cache is None:
                 self._big_deal_cache = {}
                 import akshare as ak
@@ -672,7 +672,7 @@ class DataEngine:
                 df = ak.stock_fund_flow_big_deal()
                 df.columns = ['成交时间', '股票代码', '股票简称', '成交价格',
                                '成交量', '成交金额', '大单性质', '涨跌幅', '涨跌额']
-                df['成交金额'] = pd.to_numeric(df['成交金额'], errors='coerce').fillna(0) * 10000
+                df['股票代码'] = df['股票代码'].astype(str).str.zfill(6)  # 统一为6位字符串
                 buy_mask = df['大单性质'].str.contains('买|主', na=False)
                 sell_mask = df['大单性质'].str.contains('卖', na=False)
                 buy_sum = df[buy_mask].groupby('股票代码')['成交金额'].sum()
@@ -682,19 +682,22 @@ class DataEngine:
                 self._update_source_status('akshare_fund_flow', True)
                 logger.info(f"全市场大单数据已加载: {len(net)} 只股票，每只约{len(df)//len(net)}笔大单")
 
-            code_int = int(code)
-            if code_int in self._big_deal_cache.index:
-                net_val = float(self._big_deal_cache.loc[code_int])
+            code_str = str(code).zfill(6)
+            if code_str in self._big_deal_cache.index:
+                net_val = float(self._big_deal_cache.loc[code_str])
                 if abs(net_val) > 0:
                     return net_val
             return None
         except Exception as e:
             logger.warning(f"大单资金流失败 {code}: {str(e)[:80]}")
+            self._source_available['big_deal'] = False
             self._big_deal_cache = None
         return None
 
     def _get_capital_flow_push2(self, code: str, days: int = 10) -> Optional[float]:
         """直连东方财富 push2his 资金流 API（绕过 akshare SDK）"""
+        if not self._source_available.get('push2', True):
+            return None
         try:
             market = 1 if str(code).zfill(6).startswith(('6', '9')) else 0
             url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
@@ -724,16 +727,16 @@ class DataEngine:
                     return total
         except Exception as e:
             logger.warning(f"push2资金流失败 {code}: {str(e)[:60]}")
+            self._source_available['push2'] = False
         return None
 
     def get_north_flow_accumulated(self, code: str, days: int = 10) -> Optional[float]:
         """
         北向资金近N日累计（东方财富源，网络受限时返回None）
-        已加入熔断：首次失败后本运行周期不再重试。
+        独立熔断：不影响 get_main_fund_accumulated 的大单缓存。
         降级方案：用 get_north_flow_summary() 全市场汇总替代个股数据。
         """
-        # akShare熔断：如果之前失败过，跳过
-        if not self._akshare_available:
+        if not self._source_available.get('north_flow', True):
             return None
 
         try:
@@ -743,7 +746,7 @@ class DataEngine:
                 self._update_source_status('akshare_north_flow', True)
                 return df.tail(days)['当日净流入'].sum()
         except Exception as e:
-            self._akshare_available = False  # 熔断：本运行周期不再重试
+            self._source_available['north_flow'] = False  # 独立熔断，不影响 big_deal
             self._update_source_status('akshare_north_flow', False, str(e)[:60])
         return None
 
