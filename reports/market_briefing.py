@@ -103,10 +103,10 @@ def generate_market_briefing(recommendations: List[Dict],
             rating = rec.get('rating_cn', '')
             allocation = rec.get('allocation_pct', 0)
             bd = rec.get('breakdown', {})
-            # 前3因子
+            # 全部因子
             top_factors = sorted(bd.items(),
                                  key=lambda x: x[1].get('weighted', 0),
-                                 reverse=True)[:3]
+                                 reverse=True)
             factors_str = ' '.join(f"{f}({d.get('raw_score',0):.0f})"
                                    for f, d in top_factors)
             lines.append(f"    {i}. {code} {name}")

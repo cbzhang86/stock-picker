@@ -173,6 +173,9 @@ class DataEngine:
         来源：a-stock-data §1.1
         优势：TCP 二进制协议，永不封 IP，~0.01s/只（复用连接更接近0.01s）
         """
+        import socket
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(10.0)
         try:
             from mootdx.quotes import Quotes
             if self._mootdx_client is None:
@@ -610,6 +613,7 @@ class DataEngine:
         }
 
     # ========== 资金面（akshare，可能被网络限制） ==========
+    _akshare_available = True  # akShare熔断标志：首次失败后本轮不再重试
 
     def get_main_fund_accumulated(self, code: str, days: int = 10) -> Optional[float]:
         """
@@ -624,6 +628,10 @@ class DataEngine:
         if result is not None:
             return result
 
+        # akShare熔断：如果之前失败过，跳过akshare源
+        if not self._akshare_available:
+            return None
+
         # 源2: akshare (带短超时)
         try:
             import akshare as ak
@@ -634,6 +642,7 @@ class DataEngine:
                 self._update_source_status('akshare_fund_flow', True)
                 return result
         except Exception as e:
+            self._akshare_available = False  # 熔断：本运行周期不再重试
             self._update_source_status('akshare_fund_flow', False, str(e)[:60])
 
         # 源2: 直连东财 push2 API（当前网络环境不通，保留代码待以后启用）
@@ -651,6 +660,9 @@ class DataEngine:
 
     def _get_capital_flow_big_deal(self, code: str) -> Optional[float]:
         """从全市场大单交易汇总中推算个股今日主力净流入（买入-卖出差额）"""
+        # akShare熔断
+        if not self._akshare_available:
+            return None
         try:
             # 缓存：整个 session 只拉一次全量大单数据，持久化到磁盘
             if not hasattr(self, '_big_deal_cache') or self._big_deal_cache is None:

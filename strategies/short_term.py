@@ -281,9 +281,7 @@ class ShortTermStrategy(BaseStrategy):
         total = len(top_candidates)
         logger.info(f"详评 {total} 只（初步评分前200）")
 
-        # 预加载大单缓存（一次拉全量，后续单个查询是毫秒级）
-        if total > 0:
-            self.data_engine.get_main_fund_accumulated(top_candidates[0]['code'])
+        # 预加载大单缓存 — 跳过（境外网络akshare可能超时，各股票单独调用时自动降权）
 
         # 先集中获取所有资金的流（前200只全部是毫秒级，因为大单已缓存）
         for stock in top_candidates:
@@ -335,7 +333,14 @@ class ShortTermStrategy(BaseStrategy):
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {executor.submit(fetch_kline, s): s for s in top_candidates}
             for future in as_completed(futures):
-                enriched.append(future.result())
+                try:
+                    enriched.append(future.result(timeout=30))
+                except Exception:
+                    # 超时或异常：跳过该股票
+                    stock = futures[future]
+                    stock['macd_status'] = {'score': 50, 'status': 'unknown'}
+                    stock['raw_return_20'] = 0
+                    enriched.append(stock)
 
         # 横截面RPS计算
         if all_raw_returns:

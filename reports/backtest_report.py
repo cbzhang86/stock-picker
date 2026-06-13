@@ -228,7 +228,7 @@ def generate_daily_report(recommendations: List[Dict], mode: str = 'short') -> s
                 breakdown.items(),
                 key=lambda x: x[1].get('weighted', 0),
                 reverse=True
-            )[:3]
+            )
             desc_parts = []
             for factor, data in top_factors:
                 raw = data.get('raw_score', 0)

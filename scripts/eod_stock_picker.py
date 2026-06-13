@@ -21,6 +21,9 @@ import logging
 import sys
 import os
 
+# 全局socket超时15秒，防止akshare/mootdx在境外网络挂死
+import socket; socket.setdefaulttimeout(15)
+
 # 解决 Windows 控制台 GBK 编码不支持 emoji 的问题
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
