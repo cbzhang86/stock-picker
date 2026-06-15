@@ -3,15 +3,11 @@
 
 核心逻辑：
   尾盘（14:50-15:00）全市场扫描 → 多因子评分 → 推荐Top N
+  如果市场赚钱效应差，自动跳过推荐。
 
 权重分配：
-  主力资金流 30% + 北向资金 15% + RPS动量 15%
-  + 技术形态 15% + 量价配合 10% + 风险 10% + 新闻脉冲 5%
-
-因子权重设计参考：
-  - 原提示词中"主力资金近10天持续流入（高优先级加分项）"
-  - "北向资金近10天持续加仓（高优先级加分项）"
-  - "尾盘承接、流动性、技术趋势、风险过滤、新闻脉冲"
+  主力资金流 27% + 北向资金 10% + RPS动量 15%
+  + 技术形态 15% + 量价配合 10% + 风险 10% + 热点题材 8% + 龙虎榜 5%
 
 卖出规则：
   - 止盈：T+1 开盘+2% 以上分批止盈
@@ -78,16 +74,32 @@ class ShortTermStrategy(BaseStrategy):
 
         logger.info(f"全市场共 {len(quotes_df)} 只股票")
 
-        # 1.5 预加载同花顺热点（一次拉取，全流程共用）
+        # 1.5 市场环境评估（0额外API成本，从行情数据计算）
         hot_df = self.data_engine.get_ths_hot_stocks()
         hot_codes = set()
         if not hot_df.empty:
             hot_codes = set(str(c).zfill(6) for c in hot_df['代码'].tolist() if pd.notna(c))
             logger.info(f"同花顺强势股: {len(hot_codes)} 只有题材归因标签")
-            # 提取热门题材排名
-            themes = self.data_engine.extract_hot_themes(hot_df)
-            if themes:
-                logger.info(f"TOP5 热门题材: {[t['theme'] for t in themes[:5]]}")
+        market_assessment = self._assess_market(quotes_df, hot_df)
+        logger.info(f"市场环境综合评分: {market_assessment['total']}/100 "
+                     f"({market_assessment['level']})")
+
+        if market_assessment['skip']:
+            logger.warning(f"市场赚钱效应较差({market_assessment['level']})，策略跳过")
+            # 仍然把市场评估信息传出去（供报告显示）
+            return [{
+                'market_assessment': market_assessment,
+                'data_source_status': self.data_engine.get_data_source_summary(),
+                'skip_reason': f"市场赚钱效应较差({market_assessment['level']})，建议空仓观望或减仓",
+            }]
+
+        # 根据市场环境调整参数
+        if market_assessment['level'] == '弱市':
+            self.top_n = min(self.top_n, 2)   # 弱市最多推荐2只
+            effective_min_score = max(self.min_score, 65)  # 提高评分门槛
+            logger.info(f"弱市模式: 最多推荐{self.top_n}只, 最低评分{effective_min_score}")
+        else:
+            effective_min_score = self.min_score
 
         # 2. 批量过滤 + 预评分
         candidates = self._prefilter(quotes_df)
@@ -103,7 +115,7 @@ class ShortTermStrategy(BaseStrategy):
         # 4. 评分 + 排序
         recommendations = self.scoring_model.rank_stocks(
             enriched, mode='short',
-            top_n=self.top_n, min_score=self.min_score
+            top_n=self.top_n, min_score=effective_min_score
         )
 
         if not recommendations:
@@ -186,6 +198,133 @@ class ShortTermStrategy(BaseStrategy):
                 candidates.append(stock)
 
         return candidates
+
+    def _assess_market(self, quotes_df: pd.DataFrame, hot_df: pd.DataFrame) -> Dict:
+        """
+        市场环境评估 — 判断今日是否适合短线操作
+
+        从全市场行情数据计算5个维度指标，综合评分。
+        0额外API成本（全从已有数据计算）。
+
+        返回：{
+            total: 综合评分(0-100),
+            level: 强市/中性市/弱市/极差市,
+            skip: 是否跳过推荐,
+            details: {各分项得分},
+            summary: 文字描述,
+        }
+        """
+        import numpy as np
+
+        pct = quotes_df['pct_chg'].dropna()
+        advancing = int((pct > 0).sum())
+        declining = int((pct < 0).sum())
+        flat = int((pct == 0).sum())
+        total = advancing + declining + flat
+        ad_ratio = advancing / max(declining, 1)
+
+        limit_ups = int((pct >= 9.5).sum())
+        limit_downs = int((pct <= -9.5).sum())
+        ud_ratio = limit_ups / max(limit_downs, 1)
+
+        median_chg = float(pct.median())
+        pct_up_3 = int((pct >= 3).sum())
+        hot_count = len(hot_df) if hot_df is not None and not hot_df.empty else 0
+
+        # 北向资金
+        north = None
+        try:
+            north = self.data_engine.get_north_flow_summary()
+        except Exception:
+            pass
+        north_total = north['total'] if north else 0
+
+        # 各维度评分（0-100）
+        def scale(value, thresholds):
+            """thresholds: [(下限, 上限, 100分时值), ...] 线性内插"""
+            for lo, hi, score_at_hi in thresholds:
+                if lo <= value < hi:
+                    return score_at_hi
+            return 50  # 默认中性
+
+        # 涨跌比评分 (30分权重): >2=满分, 1-2=线性, <0.5=0分
+        ad_score = scale(ad_ratio, [
+            (0, 0.3, 0), (0.3, 0.5, 10), (0.5, 0.8, 30),
+            (0.8, 1.0, 50), (1.0, 1.5, 70), (1.5, 2.0, 85),
+            (2.0, 999, 100),
+        ])
+
+        # 涨停跌停比评分 (25分权重): >5=满分, <1=0分
+        ud_score = scale(ud_ratio, [
+            (0, 0.5, 0), (0.5, 1.0, 15), (1.0, 2.0, 40),
+            (2.0, 3.0, 60), (3.0, 5.0, 80), (5.0, 999, 100),
+        ])
+
+        # 中位数涨幅评分 (20分权重): >1%=满分, <-1%=0分
+        median_score = scale(median_chg, [
+            (-10, -2, 0), (-2, -1, 15), (-1, -0.5, 35),
+            (-0.5, 0, 50), (0, 0.5, 70), (0.5, 1.0, 85),
+            (1.0, 10, 100),
+        ])
+
+        # 强势股数量评分 (15分权重): >100=满分, <20=0分
+        hot_score = scale(hot_count, [
+            (0, 10, 0), (10, 20, 15), (20, 30, 30),
+            (30, 50, 50), (50, 80, 70), (80, 100, 85),
+            (100, 9999, 100),
+        ])
+
+        # 北向资金评分 (10分权重): >40亿=满分, <-80亿=0分
+        north_score = scale(north_total, [
+            (-999, -80, 0), (-80, -40, 20), (-40, -10, 40),
+            (-10, 10, 60), (10, 40, 80), (40, 999, 100),
+        ])
+
+        total_score = (
+            ad_score * 0.30 + ud_score * 0.25 + median_score * 0.20
+            + hot_score * 0.15 + north_score * 0.10
+        )
+
+        if total_score < 40:
+            level = '极差市'
+            skip = True
+        elif total_score < 55:
+            level = '弱市'
+            skip = False
+        elif total_score < 70:
+            level = '中性市'
+            skip = False
+        else:
+            level = '强市'
+            skip = False
+
+        logger.info(f"  市场环境: 涨跌比{ad_ratio:.2f}({advancing}/{declining}) "
+                     f"涨停{limit_ups}跌停{limit_downs} "
+                     f"中位数涨幅{median_chg:+.2f}% "
+                     f"强势股{hot_count}只 北向{north_total:+.0f}亿")
+
+        return {
+            'total': round(total_score, 1),
+            'level': level,
+            'skip': skip,
+            'summary': (
+                f"涨跌比{ad_ratio:.2f}，涨停{limit_ups}跌停{limit_downs}，"
+                f"中位数涨幅{median_chg:+.2f}%，强势股{hot_count}只"
+            ),
+            'details': {
+                'ad_ratio': round(ad_ratio, 2),
+                'advancing': advancing, 'declining': declining,
+                'limit_ups': limit_ups, 'limit_downs': limit_downs,
+                'median_chg': median_chg,
+                'hot_count': hot_count,
+                'north_total': north_total,
+                'ad_score': round(ad_score, 1),
+                'ud_score': round(ud_score, 1),
+                'median_score': round(median_score, 1),
+                'hot_score': round(hot_score, 1),
+                'north_score': round(north_score, 1),
+            },
+        }
 
     def _enrich_data(self, candidates: list, hot_codes: set = None) -> list:
         """
@@ -371,4 +510,6 @@ class ShortTermStrategy(BaseStrategy):
 
     def describe(self) -> str:
         return (f"短线尾盘策略: T+0尾盘选股 → T+1开盘卖出。"
-                f"主力资金(25%)+动量(15%)+技术(15%)+量价(10%)+风控(10%)+热点(8%)+龙虎榜(5%)")
+                f"主力资金(27%)+动量(15%)+技术(15%)+量价(10%)+风控(10%)"
+                f"+北向(10%)+热点(8%)+龙虎榜(5%)。"
+                f"含市场环境评估，极差市自动跳过。")

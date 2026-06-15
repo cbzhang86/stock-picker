@@ -179,6 +179,24 @@ def generate_daily_report(recommendations: List[Dict], mode: str = 'short') -> s
         lines.append("原因：当前没有评分合格的标的")
         return "\n".join(lines)
 
+    # 市场环境诊断（跳过交易但仍有信息的场景）
+    skip_reason = recommendations[0].get('skip_reason', '')
+    market_assessment = recommendations[0].get('market_assessment', {})
+    if skip_reason:
+        lines.append(f"  ⚠️ {skip_reason}")
+        lines.append("")
+        if market_assessment:
+            d = market_assessment.get('details', {})
+            lines.append(f"  市场环境综合评分: {market_assessment.get('total', 0)}/100 "
+                         f"({market_assessment.get('level', '')})")
+            lines.append(f"  涨跌比: {d.get('advancing', 0)}/{d.get('declining', 0)} "
+                         f"涨停{d.get('limit_ups', 0)}跌停{d.get('limit_downs', 0)} "
+                         f"中位数涨幅{d.get('median_chg', 0):+.2f}%")
+            lines.append(f"  强势股: {d.get('hot_count', 0)}只 "
+                         f"北向: {d.get('north_total', 0):+.0f}亿")
+        lines.append("")
+        return "\n".join(lines)
+
     # 数据源状态诊断
     source_status = recommendations[0].get('data_source_status', {})
     failed_sources = {k: v for k, v in source_status.items()
