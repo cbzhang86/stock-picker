@@ -72,6 +72,7 @@ class DataEngine:
         self.cache = TTLCache(maxsize=100, ttl=60)
         self._all_codes = None
         self._big_deal_cache = None
+        self._ths_fund_flow_cache = None
         self._mootdx_client = None  # 懒加载，重用TCP连接
         self._kline_cache_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), 'data', 'kline_cache.db'
@@ -612,47 +613,73 @@ class DataEngine:
             'price_above_ma20': ma20 > -0.01,
         }
 
-    # ========== 资金面（akshare，可能被网络限制） ==========
+        # ========== 资金面 ==========
     # 数据源级别的熔断标志，各 endpoint 独立，互不影响
     _source_available = {
-        'big_deal': True,      # stock_fund_flow_big_deal — 全市场大单（✅ 通的）
-        'capital_flow': True,  # stock_individual_fund_flow — 个股主力（❌ 可能不通）
-        'north_flow': True,    # stock_hsgt_individual_em — 个股北向（❌ 可能不通）
-        'push2': True,         # push2 直连（❌ 不通）
+        'big_deal': True,         # stock_fund_flow_big_deal — 东财大单
+        'ths_fund_flow': True,    # stock_fund_flow_individual — 同花顺全市场资金流（通）
+        'north_flow': True,       # stock_hsgt_individual_em — 北向（不通）
+        'push2': True,            # push2 直连（不通）
     }
 
     def get_main_fund_accumulated(self, code: str, days: int = 10) -> Optional[float]:
         """
         主力资金近N日累计 — 多源回退链：
-        1. 大单交易汇总（今日大单净流向，最快，独立熔断）
-        2. akshare (东方财富 SDK，备用，独立熔断)
-        3. 直连东财 push2 API (绕过SDK，待启用)
-        调用方自动降权处理
+        1. 大单交易汇总（今日大单净流向，最快，缓存685只）
+        2. 同花顺全市场资金流排行（全量5189只，独立熔断）
         """
-        # 源1: 全市场大单交易汇总（内存缓存，毫秒级，不与个股北向共用熔断）
+        # 源1: 大单交易汇总（内存缓存，毫秒级）
         result = self._get_capital_flow_big_deal(code)
         if result is not None:
             return result
 
-        # 源2: akshare 个股资金流（带短超时，自己独立的熔断）
-        if self._source_available.get('capital_flow', True):
-            try:
+        # 源2: 同花顺全市场资金流（一次性拉取5189只，独立熔断）
+        if self._source_available.get('ths_fund_flow', True):
+            result = self._get_ths_fund_flow(code)
+            if result is not None:
+                return result
+
+        return None
+
+    def _get_ths_fund_flow(self, code: str) -> Optional[float]:
+        """
+        同花顺全市场资金流排行，一次性拉取并缓存。
+        从 '主力净流入' 列提取个股当日主力资金净额。
+        """
+        if not self._source_available.get('ths_fund_flow', True):
+            return None
+        try:
+            if not hasattr(self, '_ths_fund_flow_cache') or self._ths_fund_flow_cache is None:
+                self._ths_fund_flow_cache = {}
                 import akshare as ak
-                market = 'sh' if str(code).zfill(6).startswith(self.SH_PREFIXES) else 'sz'
-                df = ak.stock_individual_fund_flow(stock=str(code).zfill(6), market=market)
+                df = ak.stock_fund_flow_individual()
                 if df is not None and not df.empty:
-                    result = float(df.tail(days)['主力净流入-净额'].sum())
+                    for _, row in df.iterrows():
+                        code_str = str(row.iloc[1]).zfill(6)
+                        raw = str(row.iloc[6])
+                        try:
+                            if '亿' in raw:
+                                val = float(raw.replace('亿', '')) * 1e8
+                            elif '万' in raw:
+                                val = float(raw.replace('万', '')) * 1e4
+                            else:
+                                val = float(raw)
+                        except (ValueError, TypeError):
+                            val = 0
+                        self._ths_fund_flow_cache[code_str] = val
                     self._update_source_status('akshare_fund_flow', True)
-                    return result
-            except Exception as e:
-                self._source_available['capital_flow'] = False  # 独立熔断
-                self._update_source_status('akshare_fund_flow', False, str(e)[:60])
+                    logger.info(f"同花顺全市场资金流已加载: {len(self._ths_fund_flow_cache)} 只")
 
-        # 源3: 直连东财 push2 API（当前网络环境不通，保留代码待以后启用）
-        # result = self._get_capital_flow_push2(code, days)
-        # if result is not None:
-        #     return result
-
+            code_str = str(code).zfill(6)
+            if code_str in self._ths_fund_flow_cache:
+                val = self._ths_fund_flow_cache.get(code_str, 0)
+                if abs(val) > 0:
+                    return val
+            return None
+        except Exception as e:
+            logger.warning(f"同花顺资金流失败 {code}: {str(e)[:60]}")
+            self._source_available['ths_fund_flow'] = False
+            self._ths_fund_flow_cache = None
         return None
 
     def _get_capital_flow_big_deal(self, code: str) -> Optional[float]:
