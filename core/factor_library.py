@@ -1,23 +1,28 @@
 """
-因子库 — 30+ 量化因子计算
+因子库 — 短线/长线评分因子计算
 
-因子分类：
-  资金面（6）  — 主力资金流、北向资金、融资融券
-  动量（5）    — RPS 多种周期排位、N日新高比例
-  技术（8）    — 均线、MACD、KDJ、RSI、BOLL、量比、换手率
-  量价（4）    — 量价配合度、尾盘承接力
-  估值（4）    — PE/PB/PS分位、股息率
-  风险（3）    — 波动率、回撤、涨跌停状态
+因子分类（实际接入打分链路的）：
+  资金面 (3)  — 主力资金、北向资金、机构动向
+  动量   (2)  — RPS 排位、机构资金面
+  量价   (2)  — 量比、换手率
+  技术面 (1)  — 通过 TechnicalScorer 综合分
+  热点   (2)  — 同花顺强势股 + 龙虎榜
+
+基础面 (长线，4)  — fundamental/valuation/institutional/risk
 
 参考来源：
-  - Sequoia-X 各策略文件（RPS排位、均线金叉）
+  - Sequoia-X 各策略文件（RPS 排位、均线金叉）
   - daily-stock StockTrendAnalyzer（技术分析器）
   - a-stock-data tencent_quote（估值数据）
+
+说明：calc_rsi / calc_bollinger_position / calc_kdj_status / calc_ma_bias 等
+技术分析子函数已统一在 core/technical_scorer.py 实现，FactorLibrary 不再
+重复实现。如果未来要给某策略用中间变量，可在那里调用 TechnicalScorer。
 """
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Union, Optional
+from typing import Dict, List
 
 
 class FactorLibrary:
@@ -52,17 +57,6 @@ class FactorLibrary:
         return np.clip(score, 0, 100)
 
     @staticmethod
-    def calc_fund_trend_score(trend_slope: float) -> float:
-        """
-        主力资金趋势评分
-        趋势斜率 > 0 且大 → 持续流入，高分
-        参考 Sequoia-X 的 RPS 排位逻辑
-        """
-        # 斜率以万元/天为单位
-        score = 50 + trend_slope * 10
-        return np.clip(score, 0, 100)
-
-    @staticmethod
     def calc_north_flow_score(accumulated_net: float, days: int = 10) -> float:
         """
         北向资金评分（0-100）
@@ -92,20 +86,8 @@ class FactorLibrary:
         """RPS 值 → 评分（0-100）"""
         return float(np.clip(rps_value, 0, 100))
 
-    @staticmethod
-    def calc_n_day_high_ratio(close: pd.Series, high: pd.Series,
-                              lookback: int = 20, n_days: int = 5) -> float:
-        """
-        N日内创新高比例
-        NR20 = 近5天中创20日新高的天数比例
-        """
-        rolling_high = high.rolling(lookback).max()
-        new_high = close >= rolling_high
-        ratio = new_high.tail(n_days).sum() / n_days
-        return float(ratio)
-
     # ========== 技术形态因子 ==========
-
+    # MACD 状态判断作为简易回退（首选 TechnicalScorer，已在 scoring_model 里处理）
     @staticmethod
     def calc_macd_status(close: pd.Series, fast: int = 12, slow: int = 26,
                          signal_period: int = 9) -> Dict:
@@ -161,155 +143,6 @@ class FactorLibrary:
             'strength': strength
         }
 
-    @staticmethod
-    def calc_kdj_status(high: pd.Series, low: pd.Series, close: pd.Series,
-                        n: int = 9, m1: int = 3, m2: int = 3) -> Dict:
-        """
-        KDJ 指标判断
-        超买区（K>80）/ 超卖区（K<20）/ 金叉
-        """
-        if len(close) < n + max(m1, m2):
-            return {'status': 'unknown', 'score': 50}
-
-        low_min = low.rolling(n).min()
-        high_max = high.rolling(n).max()
-        rsv = (close - low_min) / (high_max - low_min) * 100
-
-        k = rsv.ewm(span=m1, adjust=False).mean()
-        d = k.ewm(span=m2, adjust=False).mean()
-        j = 3 * k - 2 * d
-
-        current_k = k.iloc[-1]
-        current_d = d.iloc[-1]
-
-        if current_k > 80 and current_d > 80:
-            status = 'overbought'
-            score = 20  # 超买，风险高
-        elif current_k < 20 and current_d < 20:
-            status = 'oversold'
-            score = 80  # 超卖，可能反弹
-        elif current_k > current_d and current_k > 50:
-            status = 'bullish'
-            score = 65
-        elif current_k < current_d and current_k < 50:
-            status = 'bearish'
-            score = 35
-        else:
-            status = 'neutral'
-            score = 50
-
-        return {
-            'status': status,
-            'score': score,
-            'k': current_k,
-            'd': current_d,
-            'j': j.iloc[-1] if len(j) > 0 else 0
-        }
-
-    @staticmethod
-    def calc_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-        """RSI 计算"""
-        delta = close.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.ewm(span=period, adjust=False).mean()
-        avg_loss = loss.ewm(span=period, adjust=False).mean()
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-
-    def calc_rsi_score(self, rsi_value: float) -> float:
-        """RSI 值 → 评分"""
-        # 30-70 为正常区间，40-60 中性
-        if rsi_value > 80:
-            return 30  # 超买，风险高
-        elif rsi_value > 70:
-            return 50  # 偏高
-        elif rsi_value > 60:
-            return 70  # 强势但不极端
-        elif rsi_value > 40:
-            return 60  # 中性偏强
-        elif rsi_value > 30:
-            return 50  # 中性偏弱
-        elif rsi_value > 20:
-            return 40  # 偏弱
-        else:
-            return 30  # 超卖
-
-    @staticmethod
-    def calc_bollinger_position(close: pd.Series, period: int = 20,
-                                std_dev: int = 2) -> Dict:
-        """
-        BOLL 布林带位置判断
-        返回当前位置：上轨之上/中轨之上/下轨之上/下轨之下
-        """
-        if len(close) < period:
-            return {'position': 'unknown', 'score': 50}
-
-        ma = close.rolling(period).mean()
-        std = close.rolling(period).std()
-        upper = ma + std_dev * std
-        lower = ma - std_dev * std
-
-        current_close = close.iloc[-1]
-        current_upper = upper.iloc[-1]
-        current_lower = lower.iloc[-1]
-        current_ma = ma.iloc[-1]
-
-        band_width = current_upper - current_lower
-
-        if current_close > current_upper:
-            position = 'above_upper'
-            score = 30  # 突破上轨，可能过热
-        elif current_close > current_ma:
-            position = 'above_mid'
-            # 越接近上轨分越高（趋势强）
-            score = 50 + 50 * (current_close - current_ma) / (band_width / 2)
-        elif current_close > current_lower:
-            position = 'above_lower'
-            score = 50 - 50 * (current_ma - current_close) / (band_width / 2)
-        else:
-            position = 'below_lower'
-            score = 20  # 跌破下轨，弱势
-
-        return {
-            'position': position,
-            'score': np.clip(score, 0, 100),
-            'upper': current_upper,
-            'mid': current_ma,
-            'lower': current_lower,
-            'band_width': band_width
-        }
-
-    @staticmethod
-    def calc_ma_bias(close: pd.Series, ma_period: int = 20) -> float:
-        """均线乖离率（价格偏离均线的程度）"""
-        if len(close) < ma_period:
-            return 0.0
-        ma = close.rolling(ma_period).mean().iloc[-1]
-        if ma == 0:
-            return 0.0
-        return (close.iloc[-1] - ma) / ma * 100
-
-    def calc_ma_bias_score(self, bias: float) -> float:
-        """乖离率评分"""
-        # 偏离过大（>8%）可能回调，得分降低
-        abs_bias = abs(bias)
-        if abs_bias > 15:
-            return 20
-        elif abs_bias > 10:
-            return 35
-        elif bias > 5:
-            return 50  # 偏高，注意回调
-        elif bias > 0:
-            return 65  # 小幅偏离均线上方，强势
-        elif bias > -3:
-            return 60  # 小幅偏离下方，可能有支撑
-        elif bias > -8:
-            return 45  # 偏离较多
-        else:
-            return 25  # 严重偏离
-
     # ========== 量价因子 ==========
 
     @staticmethod
@@ -360,87 +193,6 @@ class FactorLibrary:
             return 30
         else:  # > 10
             return 40
-
-    @staticmethod
-    def calc_tail_up_score(current_price: float, close_5min_ago: float) -> float:
-        """
-        尾盘拉升评分
-        收盘前30分钟价格上升 → 加分
-        参考原提示词中的"尾盘承接"逻辑
-        """
-        if close_5min_ago is None or close_5min_ago == 0:
-            return 50
-        pct = (current_price - close_5min_ago) / close_5min_ago * 100
-        if pct > 1.0:
-            return 85
-        elif pct > 0.5:
-            return 75
-        elif pct > 0:
-            return 60
-        elif pct > -0.5:
-            return 45
-        else:
-            return 30
-
-    # ========== 新增因子 ==========
-
-    @staticmethod
-    def calc_ma_alignment_score(close: pd.Series) -> float:
-        """均线排列评分：多头排列高分，空头排列低分"""
-        if len(close) < 20:
-            return 50
-        ma5 = close.rolling(5).mean().iloc[-1]
-        ma10 = close.rolling(10).mean().iloc[-1]
-        ma20 = close.rolling(20).mean().iloc[-1]
-
-        if ma5 > ma10 > ma20:
-            return 85
-        elif ma5 > ma10 and ma10 > ma20 * 0.98:
-            return 70
-        elif ma5 < ma10 < ma20:
-            return 25
-        elif ma5 < ma20 and ma10 < ma20:
-            return 35
-        else:
-            return 50
-
-    @staticmethod
-    def calc_volume_trend_score(volume: pd.Series, period: int = 5) -> float:
-        """量能趋势评分：近N日量能递增 → 高分"""
-        if len(volume) < period:
-            return 50
-        recent = volume.tail(period).values
-        # 避免除零
-        if recent[0] == 0:
-            return 50
-        ratio = recent[-1] / recent[0]
-        if ratio > 1.3:
-            return 80
-        elif ratio > 1.0:
-            return 65
-        elif ratio < 0.7:
-            return 30
-        else:
-            return 50
-
-    @staticmethod
-    def calc_support_resistance_score(close: pd.Series, low: pd.Series, high: pd.Series) -> float:
-        """支撑阻力评分：价格在关键支撑位附近 → 高分"""
-        if len(close) < 30:
-            return 50
-        support_20 = low.rolling(20).min().iloc[-1]
-        resistance_20 = high.rolling(20).max().iloc[-1]
-        current = close.iloc[-1]
-
-        distance_to_support = (current - support_20) / support_20 * 100 if support_20 > 0 else 999
-        if distance_to_support < 2:
-            return 75
-        elif distance_to_support < 5:
-            return 60
-        elif distance_to_support > 15:
-            return 35
-        else:
-            return 50
 
     @staticmethod
     def calc_hot_theme_score(is_hot_stock: bool, blocks: dict = None) -> float:
@@ -545,39 +297,64 @@ class FactorLibrary:
         return np.clip(score, 0, 100)
 
     @staticmethod
-    def calc_valuation_score(pe: float, pb: float, roe: float = None) -> float:
+    def calc_valuation_score(pe: float, pb: float, roe: float = None,
+                              ps: float = None, div_yield: float = None) -> float:
         """
-        估值评分（0-100）— PE 分位估值 + PB 辅助
-        替代 long_term.py 内联的纯 PE 阈值逻辑
+        估值评分（0-100）— PB + PS（分位指标）+ 股息率
+
+        设计意图：PE 在 fundamental_score 里已经算，valuation 这里只算
+        跟 PE 不直接相关的估值维度，避免双重计算同一信号。
+
+        评分逻辑：
+          - PB 估值带（PB 越低分越高，但破净本身可能是银行/钢铁）
+          - PS（市销率，亏损企业也能算）
+          - 股息率（高分配合高分 PB = 真低估；高分股息 + 低 PB = 价值陷阱警示）
+          - 极高股息（>8%）扣分（可能有派息不可持续风险）
+
+        参数：
+          pe: 不使用（保留字段以兼容上层调用）
+          pb: 市净率
+          roe: 不使用
+          ps: 市销率（可选）
+          div_yield: 股息率 %（可选）
         """
         score = 50.0
 
-        if pe is not None and pe > 0:
-            if pe < 10:
-                score += 30  # 明显低估
-            elif pe < 15:
-                score += 20
-            elif pe < 20:
-                score += 15
-            elif pe < 30:
-                score += 5
-            elif pe < 50:
-                score -= 5
-            else:
-                score -= 15  # PE >= 50，偏贵
-        elif pe is not None and pe < 0:
-            score -= 20  # 亏损，估值不适用
-
-        # PB辅助
+        # PB 维度（核心）
         if pb is not None and pb > 0:
-            if 1 < pb < 3 and pe is not None and pe > 0 and pe < 20:
-                score += 10  # PB合理 + PE低 = 低估确认
-            elif pb < 1 and pe is not None and pe > 0:
-                score -= 5   # 破净（可能银行股，扣少量分）
+            if pb < 1:
+                score += 15  # 破净，深度低估
+            elif pb < 2:
+                score += 12  # 低估
+            elif pb < 4:
+                score += 5   # 合理偏低
+            elif pb < 8:
+                score -= 5   # 中高估
+            else:
+                score -= 15  # 高估 (>8pb)
+        elif pb is not None and pb <= 0:
+            score -= 10
 
-        # ROE 辅助：高ROE + 低PE = 可能低估
-        if roe is not None and roe > 15 and pe is not None and pe < 15:
-            score += 10
+        # PS 维度（辅助，亏损企业也适用）
+        if ps is not None and ps > 0:
+            if ps < 1:
+                score += 10  # 低 PS，可能低估
+            elif ps < 3:
+                score += 3
+            elif ps < 8:
+                score -= 3
+            else:
+                score -= 10  # 高 PS 估值偏贵
+
+        # 股息率维度（高分 = 高分，但极端高 = 警示）
+        if div_yield is not None and div_yield > 0:
+            if 2 <= div_yield <= 5:
+                score += 8   # 健康股息率
+            elif 5 < div_yield <= 8:
+                score += 3   # 较高但可接受
+            elif div_yield > 8:
+                score -= 5   # 异常高，可能不可持续
+            # div_yield < 2 不加分（市场上大多数股票都这样）
 
         return np.clip(score, 0, 100)
 
@@ -683,12 +460,6 @@ class FactorLibrary:
         factors['dragon_tiger'] = self.calc_dragon_tiger_score(
             stock_data.get('dragon_tiger')
         )
-
-        # 新因子（辅助信号，不直接参与短线权重，但供报告引用）
-        if 'ma5' in stock_data and 'ma10' in stock_data and 'ma20' in stock_data:
-            factors['ma_alignment'] = self.calc_ma_alignment_score(
-                pd.Series([stock_data.get('ma5', 0), stock_data.get('ma10', 0), stock_data.get('ma20', 0)])
-            )
 
         if mode == 'long':
             # 基本面因子：使用新的 ROE/PE 多维度评分，而非内联硬编码

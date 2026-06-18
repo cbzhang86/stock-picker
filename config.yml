@@ -26,16 +26,31 @@ data_sources:
       - null
 
 # ---- 短线策略权重 ----
+# 权重起点：A 股量化研报中位数对齐（资金流+动量共50%，题材弱化15%）
+# 设计原则：每阶段迭代
+#   阶段1（现在）：研报中位为起点（避免 optimizer 陷入局部最优）
+#   阶段2（>=30条预测后）：feedback/optimizer.py 自动 Ridge 校准
+#   阶段3（B5c 完成后）：IC × IR 反比加权，长短融合三段式
 short_term:
   weights:
-    capital_flow: 0.27       # 主力资金流（近10日累计流入）
-    north_flow: 0.10         # 北向资金（近10日累计净买入）
-    momentum: 0.15           # 动量/RPS排位
-    technical: 0.15          # 技术形态（均线/MACD/KDJ）
-    volume_price: 0.10       # 量价配合（量比/尾盘承接）
-    risk: 0.10               # 风险过滤
-    hot_theme: 0.08          # 同花顺热点/题材归因
-    dragon_tiger: 0.05       # 龙虎榜信号
+    capital_flow: 0.25         # 主力资金流（近10日累计流入）
+    north_flow: 0.10           # 北向资金（短期信号权重上调，熔断自动降权50）
+    momentum: 0.25             # 动量/RPS排位（A 股最强 cross-sectional 因子）
+    technical: 0.15            # 技术形态（均线/MACD）
+    volume_price: 0.10         # 量价配合
+    hot_theme: 0.10            # 同花顺热点/题材归因（研报中位下调到 10%，原本 15% 让予 north_flow）
+    dragon_tiger: 0.05         # 龙虎榜信号（叠加于 capital_flow 表达游资动量维度）
+    # 合计 1.00。设计原理：
+    # - 资金流 + 龙虎榜 总计 0.30，表达"游资动量"复合维度
+    # - momentum 0.25 是 A 股学术公认的 cross-sectional alpha 源
+    # - 技术 + 量价 = 0.25 提供系统化择时确认
+    # - hot_theme + north_flow 各 0.10，反映"题材 + 境外聪明钱"的辅助信号
+    # risk 不在权重表（语义不属于评分分项，而是过滤/惩罚）。
+    # 风控通过 risk_filter 前置拦截（ST/涨停封死/解禁压力等），
+    # 剩余软风险由 scoring_model 的 penalty 路径在总分上额外扣减。
+
+  # 游资本组总权重：capital_flow + hot_theme + dragon_tiger = 0.43（2026-06-16 调整）
+  # 游资线作为短线核心驱动力；north_flow 海外接口不稳降至 0.05 防止集体降权
 
   # 买入条件
   buy:
@@ -53,14 +68,18 @@ short_term:
     time_stop_days: 3         # 时间止损（T+3）
 
 # ---- 长线策略权重 ----
+# 权重起点：A 股量化研报中位数对齐（基础财务+估值共50%，中期动量+北向共35%）
 long_term:
   weights:
-    fundamental: 0.30         # 基本面（ROE/净利润增速）
-    north_flow: 0.20          # 北向资金（长期加仓信号）
-    momentum: 0.15            # 中期动量（60/120日RPS）
-    valuation: 0.15           # 估值分位（PE/PB历史分位）
-    risk: 0.10                # 风险控制
-    institutional: 0.10       # 机构持仓变化
+    fundamental: 0.30         # 基本面（ROE+净利率+负债率）
+    north_flow: 0.20          # 北向资金（长线权重显著上调，月度 IC 约 0.05-0.08）
+    momentum: 0.15            # 中期动量（60/120日RPS，与短线动量切开）
+    valuation: 0.20           # 估值水位（PB+PS+股息率，分位指标，不含 PE）
+    institutional: 0.15       # 机构动向（龙虎榜机构+大股东增减持）
+    # 合计 1.00。设计原理：
+    # - fundamental + valuation = 0.50 基础财务面
+    # - momentum + north_flow = 0.35 中期趋势 + 境外聪明钱
+    # - institutional = 0.15 机构动向
 
   hold_period:
     min_months: 3

@@ -13,7 +13,7 @@
 """
 
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -178,7 +178,7 @@ def generate_market_briefing(recommendations: List[Dict],
         lines.append("  💡 短线：T+1 开盘+2%止盈 / -2%止损 / T+3时间止损")
     else:
         lines.append("  💡 长线：3-6个月，按月跟踪北向+季报")
-    lines.append(f"  生成时间: {date.today().strftime('%Y-%m-%d %H:%M')}")
+    lines.append(f"  生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("=" * 45)
 
     return "\n".join(lines)

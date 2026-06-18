@@ -22,8 +22,28 @@ def generate_backtest_report(result: BacktestResult) -> str:
     lines = []
     lines.append(f"# 回测报告：{result.strategy_name}")
     lines.append(f"**区间**: {result.period[0]} ~ {result.period[1]}")
-    lines.append(f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines.append(f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("")
+
+    # === 数据来源说明（明确告知回测局限） ===
+    if getattr(result, 'mode', '') == 'kfactor':
+        lines.append("## 📋 模式说明：K 线因子回测")
+        lines.append("")
+        lines.append("- 基于 `data/kline_cache.db` 中各股的日 K 线，**逐日重算技术类因子**（momentum / technical / volume_price）")
+        lines.append("- 资金流 / 题材 / 龙虎榜 / 北向 / 基本面因子在 K 线维度下**没有数据**，无法校验")
+        lines.append("- 输出每个因子的 IC（Spearman rank 相关系数）+ 胜率分桶 + verdict 解读")
+        lines.append("- 适用于因子筛选验证，不替代策略级回测")
+        lines.append("")
+    else:
+        lines.append("## ⚠️ 数据来源说明（必读）")
+        lines.append("")
+        lines.append("- **当前回测是\"近似回测\"**，并非严格历史复现")
+        lines.append("- 引擎 `_get_day_snapshot()` 简化实现：拉取的是**当日实时全市场行情**而非历史某日的 snapshot")
+        lines.append("- 资金流 / 题材 / 题材归因 / 龙虎榜 / 北向因子在回测期间**没有真实历史数据可用**（这些数据是当日 akshare 截面，回溯时只能用今日数据）")
+        lines.append("- 因此这些因子的\"赢单/输单分差\"会趋近于 0 —— **不代表因子无效**，是当前数据条件下的事实")
+        lines.append("- 因子分析新增 **IC（信息系数）** + verdict 解读：|IC| > 0.03 算有效，便于对照真实 alpha")
+        lines.append("- 如要严谨验证某个因子，请用 `--mode kfactor` 进入 K 线因子回测")
+        lines.append("")
 
     if result.total_trades == 0:
         lines.append("⚠️ 回测区间内无交易记录")
@@ -68,18 +88,25 @@ def generate_backtest_report(result: BacktestResult) -> str:
     # 因子归因分析
     if result.factor_performance:
         lines.append("---")
-        lines.append("## 🔬 因子分析")
+        lines.append("## 🔬 因子分析（含 IC 信息系数）")
         lines.append("")
-        lines.append("| 因子 | 赢单平均分 | 输单平均分 | 分差 |")
-        lines.append("|------|-----------|-----------|------|")
+        lines.append("**赢单** = return_t1 ≥ 0；**输单** = return_t1 < 0；**IC** = Spearman(rank(raw_score), rank(return_t1))")
+        lines.append("")
+        lines.append("| 因子 | 赢单平均分 | 输单平均分 | 分差 | IC | 样本 | 判定 |")
+        lines.append("|------|-----------|-----------|------|------|------|------|")
         sorted_factors = sorted(
             result.factor_performance.items(),
-            key=lambda x: abs(x[1].get('spread', 0)), reverse=True
+            key=lambda x: (abs(x[1].get('ic') or 0), abs(x[1].get('spread', 0))),
+            reverse=True
         )
         for factor, perf in sorted_factors:
+            ic_str = f"{perf.get('ic', 0):+.4f}" if perf.get('ic') is not None else "—"
+            n = perf.get('n_samples', 0)
+            verdict = perf.get('verdict', '—')
             lines.append(f"| {factor} | {perf.get('win_avg', 0):.1f} | "
                         f"{perf.get('lose_avg', 0):.1f} | "
-                        f"{perf.get('spread', 0):+.1f} |")
+                        f"{perf.get('spread', 0):+.1f} | "
+                        f"{ic_str} | {n} | {verdict} |")
 
     # 月度表现
     if result.monthly_returns:

@@ -73,6 +73,9 @@ class DataEngine:
         self._all_codes = None
         self._big_deal_cache = None
         self._ths_fund_flow_cache = None
+        self._lockup_cache = {}           # 解禁日历缓存（2026-06-16 新增）
+        self._lockup_cache_date = None
+        self._lockup_cache_horizon = 0
         self._mootdx_client = None  # 懒加载，重用TCP连接
         self._kline_cache_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), 'data', 'kline_cache.db'
@@ -620,6 +623,7 @@ class DataEngine:
         'ths_fund_flow': True,    # stock_fund_flow_individual — 同花顺全市场资金流（通）
         'north_flow': True,       # stock_hsgt_individual_em — 北向（不通）
         'push2': True,            # push2 直连（不通）
+        'lockup': True,           # stock_restricted_release_detail_em — 限售解禁（2026-06-16 新增）
     }
 
     def get_main_fund_accumulated(self, code: str, days: int = 10) -> Optional[float]:
@@ -966,6 +970,83 @@ class DataEngine:
             logger.warning(f"东财板块归属失败 {code}: {str(e)[:60]}")
         return {"total": 0, "boards": [], "concept_tags": []}
 
+    # ========== 9.5. 限售股解禁日历（2026-06-16 新增） ==========
+
+    def _ensure_lockup_cache(self, days_ahead: int = 90) -> None:
+        """按需拉取当前日期后 N 天解禁日历，加载到模块级 dict 缓存。
+
+        AkShare stock_restricted_release_detail_em(start, end) 一次拿若干天的全市场解禁列表 ~3-4s。
+        200 只候选票直接 O(1) 查询，无需重拉。 缓存失效：当日 16:00 后、跨日重置。
+        """
+        from datetime import date, timedelta
+        if not self._source_available.get('lockup', True):
+            self._lockup_cache = {}
+            self._lockup_cache_date = None
+            return
+        today = date.today()
+        # 已经缓存，且是今天的 -> 复用
+        if (self._lockup_cache_date == today
+                and self._lockup_cache_horizon >= days_ahead
+                and self._lockup_cache):
+            return
+        try:
+            import akshare as ak
+            # 包含昨日 + 未来 days_ahead 天，兼容复盘和当日评分
+            start = (today - timedelta(days=1)).strftime("%Y%m%d")
+            end = (today + timedelta(days=days_ahead)).strftime("%Y%m%d")
+            df = ak.stock_restricted_release_detail_em(start_date=start, end_date=end)
+            cache = {}
+            if df is not None and not df.empty:
+                col_code = "股票代码" if "股票代码" in df.columns else df.columns[1]
+                col_date = "解禁时间" if "解禁时间" in df.columns else df.columns[3]
+                col_ratio = "占解禁前流通市值比例"
+                col_amt = "实际解禁市值"
+                col_type = "限售股类型"
+                for _, row in df.iterrows():
+                    code = str(row[col_code]).zfill(6)
+                    if code not in cache:
+                        cache[code] = {
+                            "next_unlock_date": str(row[col_date])[:10],
+                            "max_ratio": 0.0,
+                            "total_amount": 0.0,
+                            "type": str(row[col_type]) if col_type in df.columns else "",
+                        }
+                    ratio = float(row[col_ratio]) if col_ratio in df.columns else 0.0
+                    amount = float(row[col_amt]) if col_amt in df.columns else 0.0
+                    if ratio > cache[code]["max_ratio"]:
+                        cache[code]["max_ratio"] = ratio
+                        cache[code]["next_unlock_date"] = str(row[col_date])[:10]
+                    cache[code]["total_amount"] += amount
+            self._lockup_cache = cache
+            self._lockup_cache_date = today
+            self._lockup_cache_horizon = days_ahead
+            logger.info(f"[lockup] 已缓存 {len(cache)} 只票未来 {days_ahead} 天解禁日历")
+        except Exception as e:
+            logger.warning(f"解禁日历缓存失败: {str(e)[:80]}")
+            self._source_available['lockup'] = False
+            self._lockup_cache = {}
+            self._lockup_cache_date = None
+
+    def get_lockup_expiry(self, code: str) -> Optional[Dict]:
+        """返回该票未来 90 天内的解禁压力概况。
+
+        Returns
+        -------
+        Optional[Dict]
+            {
+                "next_unlock_date": "2026-07-15",
+                "max_ratio": 0.085,        # 未来解禁数量/解禁前流通市值最大比例
+                "total_amount": 1.2e8,     # 累计解禁市值
+                "type": "首发原股东限售股份"
+            }
+            或 None（无解禁事件或缓存不可用）
+        """
+        if not self._source_available.get('lockup', True):
+            return None
+        self._ensure_lockup_cache()
+        code = str(code).zfill(6)
+        return self._lockup_cache.get(code)
+
     # ========== 10. 龙虎榜（a-stock-data §3.5） ==========
 
     def get_dragon_tiger(self, code: str, trade_date: str = None, look_back: int = 30) -> Dict:
@@ -986,6 +1067,9 @@ class DataEngine:
                 "source": "WEB", "client": "WEB",
             }
             r = em_get(datacenter_url, params=params, timeout=15)
+            if r is None:
+                logger.warning(f"龙虎榜记录失败 {code}: em_get 返回 None")
+                return {"records": [], "seats": seats, "institution": institution}
             data = r.json().get("result", {}).get("data", [])
             for row in data:
                 records.append({
@@ -1015,6 +1099,9 @@ class DataEngine:
                         "source": "WEB", "client": "WEB",
                     }
                     r = em_get(datacenter_url, params=params, timeout=15)
+                    if r is None:
+                        logger.warning(f"龙虎榜{key}席位失败 {code}: em_get 返回 None")
+                        continue
                     sdata = r.json().get("result", {}).get("data", [])
                     key = "buy" if side == 0 else "sell"
                     for row in sdata[:5]:

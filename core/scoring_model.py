@@ -65,25 +65,26 @@ class ScoringModel:
     - 单股票评分 + 批量排序
     """
 
-    # 默认权重
+    # 默认权重（与 config.yml 保持同步，作为 fallback）
+    # 短线：研报中位数对齐（资金流+龙虎榜共0.30 + momentum 0.25 + hot_theme 0.10）
+    # 长线：研报中位数对齐（基础财务+估值共0.50 + momentum+北向 0.35 + 机构 0.15）
+    # risk 不进权重表，由 penalty 路径独立扣分（见 ActiveWeight 与 penalty 注释）
     DEFAULT_WEIGHTS = {
         'short': {
-            'capital_flow': 0.27,    # 主力资金流
-            'north_flow': 0.10,       # 北向资金
-            'momentum': 0.15,         # 动量/RPS
-            'technical': 0.15,        # 技术形态
-            'volume_price': 0.10,     # 量价配合
-            'risk': 0.10,             # 风险过滤
-            'hot_theme': 0.08,        # 同花顺热点/题材归因
-            'dragon_tiger': 0.05,     # 龙虎榜信号
+            'capital_flow': 0.25,
+            'north_flow': 0.10,
+            'momentum': 0.25,
+            'technical': 0.15,
+            'volume_price': 0.10,
+            'hot_theme': 0.10,
+            'dragon_tiger': 0.05,
         },
         'long': {
-            'fundamental': 0.30,      # 基本面
-            'north_flow': 0.20,       # 北向资金
-            'momentum': 0.15,         # 中期动量
-            'valuation': 0.15,        # 估值
-            'risk': 0.10,             # 风险
-            'institutional': 0.10,    # 机构持仓
+            'fundamental': 0.30,
+            'north_flow': 0.20,
+            'momentum': 0.15,
+            'valuation': 0.20,
+            'institutional': 0.15,
         }
     }
 
@@ -163,9 +164,13 @@ class ScoringModel:
 
         # 判断各因子是否有真实数据支撑，将"数据不可用"的因子权重重分配给活跃因子
         # 防止 45% 权重输出恒定 50 分导致总分被压缩
+        # risk 因子不参与加权（语义上它是过滤/惩罚，不是分项；详见文末 risk penalty 段）
         neutral_weight = 0.0
         factor_scores = {}
+        weighted_score = 0.0
         for factor_name, weight in weights.items():
+            if factor_name == 'risk':
+                continue  # risk 走后的 penalty 路径，不在加权循环里混
             factor_score = factors.get(factor_name, 50.0)
             is_neutral = False
 
@@ -179,8 +184,10 @@ class ScoringModel:
             if is_neutral:
                 neutral_weight += weight
 
-        # 活跃因子权重总和
-        active_weight = 1.0 - neutral_weight
+        # 活跃因子权重总和（risk 不在内）
+        # 改进：用 weights 实际总和作为分母，避免 config 删/加键时分母硬编码 1.0 漂移
+        weights_total = sum(weights.values()) if weights else 1.0
+        active_weight = weights_total - neutral_weight
 
         for factor_name, (factor_score, weight, is_neutral) in factor_scores.items():
             if is_neutral:
@@ -193,7 +200,7 @@ class ScoringModel:
                     'data_available': False,
                     'note': '接口不可用，已降权'
                 }
-                score += weighted
+                weighted_score += weighted
             else:
                 # 数据可用：获得额外权重分配（按比例吸收不可用因子的权重）
                 extra = (neutral_weight * weight / active_weight) if active_weight > 0 else 0
@@ -206,13 +213,41 @@ class ScoringModel:
                     'weighted': round(weighted, 2),
                     'data_available': True
                 }
-                score += weighted
+                weighted_score += weighted
 
-        # 风险惩罚
+        # === Risk penalty（risk 改成纯扣分项，不进加权） ===
+        # 设计：risk_filter 已经把 ST/解禁压力/成交额过低/涨停封死的票 in-pass 直接拦。
+        # 留到打分阶段的票，可能仍有软风险（成交额偏低、换手率偏高、量比异常等），
+        # 这些 penalty<0.8 的"软风险"通过这里在总分上扣减。
         risk_check = stock_data.get('risk_check', {})
-        if risk_check and not risk_check.get('passed', True):
-            penalty = risk_check.get('score_penalty', 0)
-            score = score * (1 - penalty * 0.5)  # 最多扣50%
+        risk_penalty = 0.0
+        risk_note = ''
+        if risk_check:
+            if not risk_check.get('passed', True):
+                # 硬拦截：risk_filter 已在前置拦下，这里是为了双保险
+                risk_penalty = risk_check.get('score_penalty', 0)
+                risk_note = 'risk_check 未通过'
+            else:
+                # passed=True 但 score_penalty 不为 0：软风险扣分
+                # penalty=0.3 -> 扣 9%（0.3 * 0.3）
+                # penalty=0.5 -> 扣 15%
+                # penalty=0.7 -> 扣 21%
+                # 设计：从 0.5 改为 0.3，避免弱市普跌日大量"软风险 0.3"票被罚到 65 分线以下，
+                # 导致弱市全部刷空（违反"弱市至少推荐 1-2 只"的设计意图）
+                risk_penalty = risk_check.get('score_penalty', 0)
+                if risk_penalty > 0:
+                    risk_note = f"软风险扣分(penalty={risk_penalty})"
+
+        score = weighted_score * (1 - risk_penalty * 0.3)
+
+        # breakdown 里记录 risk（不参与加权，但展示信息）
+        if 'risk' in weights:
+            breakdown['risk'] = {
+                'raw_score': round((1 - risk_penalty) * 100, 2),
+                'weight': 0,
+                'weighted': 0,
+                'note': risk_note + ' (已迁出权重表)'
+            }
 
         # 转百分制 + 截断
         final_score = round(min(max(score, 0), 100), 2)

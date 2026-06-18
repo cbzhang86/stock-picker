@@ -42,8 +42,8 @@ logger = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser(description='A股选股策略回测')
-    parser.add_argument('--mode', choices=['short', 'long'], default='short',
-                        help='策略模式')
+    parser.add_argument('--mode', choices=['short', 'long', 'kfactor'], default='short',
+                        help='策略模式: short(短线) / long(长线) / kfactor(K线因子回测)')
     parser.add_argument('--start', default='2025-06-01', help='开始日期')
     parser.add_argument('--end', default='2026-06-11', help='结束日期')
     parser.add_argument('--out', help='输出文件路径')
@@ -61,11 +61,20 @@ def main():
     full_config = {**bt_config, **strategy_config}
 
     engine = BacktestEngine(full_config)
-    result = engine.run(
-        mode=args.mode,
-        start_date=args.start,
-        end_date=args.end,
-    )
+
+    if args.mode == 'kfactor':
+        # K 因子回测：直接调新方法，不走 run()
+        result = engine.run_kline_factor_backtest(
+            factors=['momentum', 'technical', 'volume_price'],
+            start_date=args.start,
+            end_date=args.end,
+        )
+    else:
+        result = engine.run(
+            mode=args.mode,
+            start_date=args.start,
+            end_date=args.end,
+        )
 
     report = generate_backtest_report(result)
 

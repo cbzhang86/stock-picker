@@ -27,7 +27,32 @@ class RiskFilter:
         self.exclude_st = self.config.get('exclude_st', True)
         self.exclude_limit_up = self.config.get('exclude_limit_up', True)
 
-    def check_stock(self, stock_info: Dict) -> Dict:
+    # 7. 限售解禁检查（需外部传入 data_engine，未启用则为 0）
+    def check_lockup(self, code: str, data_engine=None) -> Dict:
+        """
+        检查股票是否面临重大解禁压力（90 天内 max_ratio >= 0.5）
+
+        参数: data_engine — 用于查询解禁日历；为 None 时直接放行
+        返回: {triggered: bool, ratio: float, reason: str}
+        """
+        if data_engine is None:
+            return {'triggered': False, 'ratio': 0.0, 'reason': '无 data_engine，跳过'}
+        try:
+            info = data_engine.get_lockup_expiry(code)
+        except Exception:
+            return {'triggered': False, 'ratio': 0.0, 'reason': '查询异常，跳过'}
+        if info is None:
+            return {'triggered': False, 'ratio': 0.0, 'reason': '无解禁事件'}
+        ratio = info.get('max_ratio', 0.0) or 0.0
+        if ratio >= 0.5:
+            return {
+                'triggered': True,
+                'ratio': ratio,
+                'reason': f"解禁压力({info.get('next_unlock_date', '?')}, {ratio*100:.1f}%流通)"
+            }
+        return {'triggered': False, 'ratio': ratio, 'reason': f"解禁{ratio*100:.1f}%可控"}
+
+    def check_stock(self, stock_info: Dict, data_engine=None) -> Dict:
         """
         检查单只股票是否通过风控
 
@@ -94,6 +119,14 @@ class RiskFilter:
         if vol_ratio > 10:
             reasons.append(f'量比异常 ({vol_ratio:.1f})')
             penalty = max(penalty, 0.3)
+
+        # 7. 限售解禁压力（90 天内 max_ratio >= 0.5 即硬过滤）
+        code = stock_info.get('code')
+        if code and data_engine is not None:
+            lockup_check = self.check_lockup(code, data_engine)
+            if lockup_check['triggered']:
+                reasons.append(lockup_check['reason'])
+                penalty = max(penalty, 1.0)
 
         passed = len(reasons) == 0 or penalty < 0.8  # 惩罚>=0.8则直接过滤
 

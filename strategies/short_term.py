@@ -102,6 +102,12 @@ class ShortTermStrategy(BaseStrategy):
             effective_min_score = self.min_score
 
         # 2. 批量过滤 + 预评分
+        # 2.0 预热 lockup 缓存（一次 akshare 调用 ~3-4s，让 5000+ 只预过滤不走 IO）
+        try:
+            self.data_engine._ensure_lockup_cache()
+        except Exception as e:
+            logger.warning(f"lockup 缓存预热失败(已熔断): {str(e)[:60]}")
+
         candidates = self._prefilter(quotes_df)
         logger.info(f"预过滤后 {len(candidates)} 只进入详评")
 
@@ -113,15 +119,17 @@ class ShortTermStrategy(BaseStrategy):
         enriched = self._enrich_data(candidates, hot_codes)
 
         # 4. 评分 + 排序
+        # 弱市纪律：强制顶部不超过 2 只，避免推荐过密
+        effective_top_n = min(self.top_n, 2) if market_assessment['level'] == '弱市' else self.top_n
         recommendations = self.scoring_model.rank_stocks(
             enriched, mode='short',
-            top_n=self.top_n, min_score=effective_min_score
+            top_n=effective_top_n, min_score=effective_min_score
         )
 
         if not recommendations:
             logger.info("今日尾盘策略跳过：没有评分达标的标的")
         else:
-            logger.info(f"推荐 {len(recommendations)} 只股票")
+            logger.info(f"推荐 {len(recommendations)} 只股票 (上限{effective_top_n})")
 
         # 附加数据源状态到结果
         source_status = self.data_engine.get_data_source_summary()
@@ -151,9 +159,8 @@ class ShortTermStrategy(BaseStrategy):
                 rec['dragon_tiger'] = dt
             except Exception:
                 rec['dragon_tiger'] = {"records": [], "seats": {"buy": [], "sell": []}, "institution": {}}
-            # 补充因子分解中的 hot_theme 和 dragon_tiger 实际得分
-            rec['breakdown'].pop('hot_theme', None)
-            rec['breakdown'].pop('dragon_tiger', None)
+            # breakdown 中 hot_theme / dragon_tiger 的实际得分通过 scoring_model.compute_all_factors
+            # 算出来的，不要 pop 掉，让配置里 0.08+0.05 这 13% 权重真的生效
 
         # 组合优化：评分加权仓位分配
         recommendations = PortfolioOptimizer.allocate(recommendations)
@@ -189,7 +196,7 @@ class ShortTermStrategy(BaseStrategy):
             }
 
             # 风险过滤
-            risk_result = self.risk_filter.check_stock(stock)
+            risk_result = self.risk_filter.check_stock(stock, data_engine=self.data_engine)
             stock['risk_check'] = risk_result
 
             if risk_result['passed'] or risk_result['score_penalty'] < 0.8:
