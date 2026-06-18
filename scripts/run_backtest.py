@@ -6,13 +6,19 @@
   python scripts/run_backtest.py
 
   # 指定区间
-  python scripts/run_backtest.py --start 2025-01-01 --end 2025-12-31
+  python scripts/run_backtest.py --start 2026-01-01 --end 2026-06-11
 
   # 长线策略
   python scripts/run_backtest.py --mode long
 
+  # 回测 + 对比
+  python scripts/run_backtest.py --compare 1 2
+
+  # 查看历史回测记录
+  python scripts/run_backtest.py --list
+
   # 保存回测报告
-  python scripts/run_backtest.py --out reports/backtest_2025.md
+  python scripts/run_backtest.py --out reports/backtest.md
 """
 
 import argparse
@@ -20,7 +26,6 @@ import logging
 import sys
 import os
 
-# 解决 Windows 控制台 GBK 编码不支持 emoji 的问题
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
@@ -30,6 +35,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import yaml
 
 from core.backtest_engine import BacktestEngine
+from core.backtest_store import BacktestStore
 from reports.backtest_report import generate_backtest_report
 
 logging.basicConfig(
@@ -48,22 +54,42 @@ def main():
     parser.add_argument('--end', default='2026-06-11', help='结束日期')
     parser.add_argument('--out', help='输出文件路径')
     parser.add_argument('--config', default='config.yml', help='配置文件')
+    parser.add_argument('--list', action='store_true', help='查看历史回测记录')
+    parser.add_argument('--compare', nargs=2, type=int, metavar=('RUN_ID_A', 'RUN_ID_B'),
+                        help='对比两次回测记录')
 
     args = parser.parse_args()
-
     config = load_config(args.config)
 
-    # 从 config.yml 加载回测参数，合并命令行参数
+    store = BacktestStore()
+
+    if args.list:
+        runs = store.list_runs(20)
+        if not runs:
+            print("暂无回测记录")
+            return
+        print(f"{'ID':>4} {'策略':<16} {'模式':<8} {'区间':<24} {'交易':<6} {'胜率':<8} {'平均收益':<10} {'夏普':<8}")
+        print("-" * 90)
+        for r in runs:
+            print(f"{r['id']:>4} {r['strategy']:<16} {r['mode']:<8} "
+                  f"{r['start']}~{r['end']:<14} "
+                  f"{r['trades']:<6} {r['win_rate']:.1f}%    "
+                  f"{r['avg_return']:+.2f}%    {r['sharpe']:<8.2f}")
+        return
+
+    if args.compare:
+        diff = store.compare_runs(args.compare[0], args.compare[1])
+        print(diff)
+        return
+
+    # 正常回测
     bt_config = config.get('backtest', {})
-    # 从 config.yml 加载策略配置
     strategy_config = config.get(args.mode + '_term', {})
-    # 合并
     full_config = {**bt_config, **strategy_config}
 
     engine = BacktestEngine(full_config)
 
     if args.mode == 'kfactor':
-        # K 因子回测：直接调新方法，不走 run()
         result = engine.run_kline_factor_backtest(
             factors=['momentum', 'technical', 'volume_price'],
             start_date=args.start,
@@ -75,6 +101,9 @@ def main():
             start_date=args.start,
             end_date=args.end,
         )
+
+    # 保存回测结果
+    store.save_run(result, full_config)
 
     report = generate_backtest_report(result)
 

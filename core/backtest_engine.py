@@ -166,7 +166,8 @@ class BacktestEngine:
     def _load_historical_snapshots(self, codes: list, name_map: dict,
                                     start_date: str, end_date: str) -> Dict[str, pd.DataFrame]:
         """
-        预加载所有股票的历史 K 线，构建 {日期 -> 当日行情快照} 字典。
+        预加载所有股票的历史 K 线（仅从 SQLite 缓存读取，不触发 mootdx 降级），
+        构建 {日期 -> 当日行情快照} 字典。
 
         每个快照 DataFrame 包含字段：
           code, name, price(=close), pct_chg, amount, volume,
@@ -177,33 +178,51 @@ class BacktestEngine:
           - 名称取自今日行情（名称通常不变）
           - 股价=收盘价（非盘中实时价）
         """
-        import time as _time
+        import sqlite3
+        db_path = self.data_engine._kline_cache_path
+        if not os.path.exists(db_path):
+            logger.warning(f"K线缓存不存在: {db_path}")
+            return {}
 
-        # 分批读取，每批 200 只
+        import time as _time
         batch_size = 200
         total = len(codes)
         kline_dict = {}
-        skipped = 0
 
-        for batch_start in range(0, total, batch_size):
-            batch = codes[batch_start:batch_start+batch_size]
-            for code in batch:
-                try:
-                    kline = self.data_engine.get_kline(code, start_date=start_date,
-                                                         end_date=end_date)
-                    if kline is not None and not kline.empty and len(kline) >= 3:
-                        kline['date_str'] = kline['date'].dt.strftime('%Y-%m-%d')
-                        kline_dict[code] = kline
-                    else:
-                        skipped += 1
-                except Exception:
-                    skipped += 1
+        # 批量读取：一次性拉取所有股票在目标区间的 K 线
+        # 通过 SQLite 的 WHERE IN 拼接加速
+        codes_batches = [codes[i:i+500] for i in range(0, len(codes), 500)]
+        for cb in codes_batches:
+            try:
+                placeholders = ','.join(['?' for _ in cb])
+                conn = sqlite3.connect(db_path)
+                # 用 PARSE_DECLTYPES 加速日期解析
+                df_all = pd.read_sql_query(
+                    f"SELECT code, date, open, high, low, close, volume, amount "
+                    f"FROM kline_cache "
+                    f"WHERE code IN ({placeholders}) AND date>=? AND date<=? "
+                    f"ORDER BY code, date",
+                    conn, params=[str(c).zfill(6) for c in cb] + [start_date, end_date]
+                )
+                conn.close()
+                if not df_all.empty:
+                    df_all['date'] = pd.to_datetime(df_all['date'])
+                    df_all['date_str'] = df_all['date'].dt.strftime('%Y-%m-%d')
+                    for c in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+                        df_all[c] = pd.to_numeric(df_all[c], errors='coerce')
+                    # 按 code 分组存入字典
+                    for code in cb:
+                        code_str = str(code).zfill(6)
+                        sub = df_all[df_all['code'] == code_str]
+                        if len(sub) >= 3:
+                            kline_dict[code_str] = sub.reset_index(drop=True)
+            except Exception:
+                pass
 
-            if (batch_start // batch_size) % 3 == 0:
-                logger.info(f"  历史数据加载: {min(total, batch_start+batch_size)}/{total}"
-                            f" ({len(kline_dict)} 只有效)")
+            if (len(kline_dict) % 1000) == 0 or len(kline_dict) == 0 and len(codes_batches) == 1:
+                logger.info(f"  历史快照加载: {len(kline_dict)} 只有效K线")
 
-        logger.info(f"  历史数据加载完成: {len(kline_dict)}/{total} 只有效K线")
+        logger.info(f"  历史快照加载完成: {len(kline_dict)}/{total} 只有效K线")
 
         # 构建 {date: DataFrame}
         trade_dates = sorted(set(
