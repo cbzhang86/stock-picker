@@ -1,13 +1,13 @@
 ---
 name: stock-picker
-description: A股智能选股系统 — 全市场多因子评分/短线尾盘/长线持股/每日简报/同花顺热点/龙虎榜追踪/板块归属/基本面财务快照
+description: A股智能选股系统 — 全市场多因子评分/短线尾盘/长线持股/每日简报/同花顺热点/龙虎榜追踪/板块归属/基本面财务快照/市场环境评估
 origin: custom
-version: 4.0
+version: 4.1
 ---
 
-# A股智能选股系统 V4
+# A股智能选股系统 V4.1
 
-13 个直连数据源 · 30+ 量化因子 · 短线/长线双策略 · 回测引擎 · 自学习权重优化。
+13 个直连数据源 · 30+ 量化因子 · 短线/长线双策略 · 回测引擎（历史快照） · 自学习权重 · 市场环境评估
 
 兼容 [Claude Code](https://github.com/anthropics/claude-code) · [OpenClaw](https://github.com/anthropics/openclaw) · [Codex](https://github.com/openai/codex) · [Hermes](https://github.com/nez/pericles)
 

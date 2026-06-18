@@ -91,25 +91,44 @@ class BacktestEngine:
         if not trade_calendar:
             return self._empty_result(mode, start_date, end_date)
 
-        # 2. 初始化策略
+        # 2. 获取全市场代码列表 & 名称映射
+        codes = self.data_engine._get_all_codes()
+        if not codes:
+            logger.error("无可用的股票代码列表")
+            return self._empty_result(mode, start_date, end_date)
+        logger.info(f"A股代码列表: {len(codes)} 只")
+
+        # 取今日行情仅用于获取股票名称（名称不随日期变化）
+        try:
+            today_q = self.data_engine.get_all_quotes()
+            name_map = dict(zip(today_q['code'], today_q['name']))
+        except Exception:
+            name_map = {}
+
+        # 3. 初始化策略
         if mode == 'short':
             strategy = ShortTermStrategy(self.config)
         else:
             strategy = LongTermStrategy(self.config)
 
-        # 3. 逐日模拟
-        all_records = []  # [{date, code, name, score, rating, buy_price, factor_breakdown}]
-        positions = {}    # {code: {buy_date, buy_price, days_held}}
-        capital = self.initial_capital
+        # 4. 预加载所有股票的历史 K 线（首次 ~10 分钟，缓存到 SQLite，
+        #    后续回测从缓存读取 ~1 分钟）
+        logger.info("预加载历史K线数据（首次较慢，后续缓存加速）...")
+        snapshots = self._load_historical_snapshots(
+            codes, name_map, start_date, end_date
+        )
+        logger.info(f"历史快照构建完成: {len(snapshots)} 个交易日")
+
+        # 5. 逐日模拟
+        all_records = []
         equity_curve = []
 
-        # 先收集所有推荐记录，再统一算收益
         for i, trade_date in enumerate(trade_calendar):
             if (i + 1) % 20 == 0:
                 logger.info(f"  进度: {i+1}/{len(trade_calendar)}")
 
-            # 获取当日全市场行情（策略需要5205只做预过滤）
-            day_data = self._get_day_snapshot(trade_date)
+            # 获取历史当日行情快照（基于真实K线数据）
+            day_data = snapshots.get(trade_date)
             if day_data is None or day_data.empty:
                 continue
 
@@ -132,13 +151,10 @@ class BacktestEngine:
                     'factor_breakdown': rec.get('breakdown', {}),
                 })
 
-            # 更新持仓（止盈/止损/时间止损检查）
-            self._update_positions(positions, trade_date)
+            # 每日权益（简化：不模拟持仓，只算推荐命中率）
+            equity_curve.append(len(all_records))
 
-            # 记录每日权益（现金 + 持仓市值）
-            equity_curve.append(capital)
-
-        # 4. 计算收益（基于真实的 T+1 K线数据）
+        # 6. 计算收益（基于真实的 T+1 K线数据）
         result = self._calculate_results(all_records, trade_calendar, mode,
                                          start_date, end_date, equity_curve)
 
@@ -147,13 +163,94 @@ class BacktestEngine:
                      f"交易次数 {result.total_trades}")
         return result
 
+    def _load_historical_snapshots(self, codes: list, name_map: dict,
+                                    start_date: str, end_date: str) -> Dict[str, pd.DataFrame]:
+        """
+        预加载所有股票的历史 K 线，构建 {日期 -> 当日行情快照} 字典。
+
+        每个快照 DataFrame 包含字段：
+          code, name, price(=close), pct_chg, amount, volume,
+          turnover(=0), volume_ratio(=1), pe/pb(=None)
+
+        限制：
+          - 无历史 PE/PB/换手率数据，用默认值替代
+          - 名称取自今日行情（名称通常不变）
+          - 股价=收盘价（非盘中实时价）
+        """
+        import time as _time
+
+        # 分批读取，每批 200 只
+        batch_size = 200
+        total = len(codes)
+        kline_dict = {}
+        skipped = 0
+
+        for batch_start in range(0, total, batch_size):
+            batch = codes[batch_start:batch_start+batch_size]
+            for code in batch:
+                try:
+                    kline = self.data_engine.get_kline(code, start_date=start_date,
+                                                         end_date=end_date)
+                    if kline is not None and not kline.empty and len(kline) >= 3:
+                        kline['date_str'] = kline['date'].dt.strftime('%Y-%m-%d')
+                        kline_dict[code] = kline
+                    else:
+                        skipped += 1
+                except Exception:
+                    skipped += 1
+
+            if (batch_start // batch_size) % 3 == 0:
+                logger.info(f"  历史数据加载: {min(total, batch_start+batch_size)}/{total}"
+                            f" ({len(kline_dict)} 只有效)")
+
+        logger.info(f"  历史数据加载完成: {len(kline_dict)}/{total} 只有效K线")
+
+        # 构建 {date: DataFrame}
+        trade_dates = sorted(set(
+            ds for kline in kline_dict.values() for ds in kline['date_str'].unique()
+        ))
+        snapshots = {}
+
+        for date_str in trade_dates:
+            rows = []
+            for code, kline in kline_dict.items():
+                day = kline[kline['date_str'] == date_str]
+                if day.empty:
+                    continue
+                r = day.iloc[0]
+                prev_close = None
+                idx = r.name  # 原始 DataFrame 中的位置
+                if idx > 0:
+                    prev_close = float(kline.iloc[idx - 1]['close'])
+                pct_chg = ((float(r['close']) - prev_close) / prev_close * 100) if prev_close and prev_close > 0 else 0.0
+
+                rows.append({
+                    'code': code,
+                    'name': name_map.get(code, ''),
+                    'price': float(r['close']),
+                    'pct_chg': round(pct_chg, 2),
+                    'amount': float(r.get('amount', 0)),
+                    'turnover': 0.0,       # 历史换手率不可用
+                    'volume_ratio': 1.0,   # 历史量比不可用
+                    'volume': float(r.get('volume', 0)),
+                    'pe': None,            # 历史 PE 不可用
+                    'pb': None,            # 历史 PB 不可用
+                    'name_raw': name_map.get(code, ''),
+                })
+
+            if rows:
+                snapshots[date_str] = pd.DataFrame(rows)
+
+        return snapshots
+
     def _get_trade_calendar(self, start: str, end: str) -> List[str]:
         """获取真实交易日历"""
         try:
             import akshare as ak
             df = ak.tool_trade_date_hist_sina()
-            df = df[(df['trade_date'] >= start) & (df['trade_date'] <= end)]
-            return df['trade_date'].dt.strftime('%Y-%m-%d').tolist()
+            df['trade_date'] = pd.to_datetime(df['trade_date']).dt.date
+            mask = (df['trade_date'] >= pd.Timestamp(start).date()) & (df['trade_date'] <= pd.Timestamp(end).date())
+            return df[mask]['trade_date'].astype(str).tolist()
         except Exception as e:
             logger.warning(f"交易日历获取失败，使用简化版（周一到周五）: {e}")
             start_dt = datetime.strptime(start, '%Y-%m-%d')
