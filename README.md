@@ -69,15 +69,16 @@ A 股量化投资面临的核心问题是：数据源分散（行情、资金流
 | 北向资金实时汇总 | hexin.cn | 实时 | 🟢 极低 |
 | 个股板块归属 | 东财 slist | ~2.3s/只 | 🟡 限流 |
 | 龙虎榜 + 席位 + 机构动向 | 东财 datacenter | ~6s/只 | 🟡 限流 |
-| 大单资金流（685 只） | akshare | ~25s 全量 | 🟢 低 |
+| 主力资金流（5189 只） | 同花顺 | ~19s 全量 | 🟢 低 |
 
 </details>
 
 <details open>
 <summary><b>🧠 策略能力</b></summary>
 
-- **短线尾盘**：8 因子加权评分 → 初筛 → 预评分 → Top 200 详评 → 仓位分配
+- **短线尾盘**：7 因子加权评分 + 市场环境评估 → 初筛 → 预评分 → Top 200 详评 → 仓位分配
 - **长线持股**：ROE + PE + PB 基本面评分，3-6 个月持有周期
+- **市场环境感知**：涨跌比/涨停跌停比/中位数涨幅/强势股数量/北向资金 → 综合分，极差市自动跳过
 - **形态识别**：9 种 K 线形态自动检测（金叉、海龟突破、高旗形等）
 - **技术评分**：6 维度系统化评分（趋势 30 + 乖离 20 + 量能 15 + 支撑 10 + MACD 15 + RSI 10）
 - **组合优化**：评分加权仓位分配，单只上限 40%、保底 10%
@@ -496,7 +497,8 @@ _source_available = {
 | `core/scoring_model.py` | 评分模型 | 加权求和 → 评级映射 → 理由生成，支持权重重分配 |
 | `core/technical_scorer.py` | 技术评分 | 6 维度 100 分制系统化技术分析 |
 | `core/risk_filter.py` | 风控 | 6 道检查、惩罚系数、跳过判定 |
-| `core/backtest_engine.py` | 回测引擎 | 逐日模拟、真实 K 线、无随机数 |
+| `core/backtest_engine.py` | 回测引擎 | 历史K线快照逐日模拟、真实K线收益、因子IC归因 |
+| `core/backtest_store.py` | 回测存储 | SQLite持久化回测结果，支持 --list/--compare 版本对比 |
 | `core/portfolio_optimizer.py` | 组合优化 | 评分加权 / 等权，仓位约束管理 |
 | `strategies/short_term.py` | 短线策略 | 8 因子全市场扫描、预评分、详评、排序 |
 | `strategies/long_term.py` | 长线策略 | 6 因子基本面 + 北向 + 动量 |
@@ -507,7 +509,7 @@ _source_available = {
 | `feedback/tracker.py` | 预测追踪 | SQLite 持久化推荐 + 收益 |
 | `feedback/optimizer.py` | 权重优化 | Ridge 回归自动调参 |
 | `scripts/eod_stock_picker.py` | 唯一入口 | 策略运行 + 简报 + 回填 + 优化 |
-| `scripts/run_backtest.py` | 回测入口 | 全量回测启动 |
+| `scripts/run_backtest.py` | 回测入口 | 全量回测 + --list 查看历史 + --compare 版本对比 |
 | `config.yml` | 配置中心 | 权重 / 风控 / 回测 / 模型参数 |
 | `SKILL.md` | AI 技能 | Claude Code / OpenClaw / Hermes 接口定义 |
 
@@ -529,6 +531,8 @@ _source_available = {
 > "茅台基本面怎么样" → 显示 ROE/EPS/估值
 > "有什么热点题材" → 同花顺强势股归因
 > "跑一下回测" → 执行回测引擎
+> "对比两次回测" → 查看历史回测记录对比
+> "查看回测历史" → 列出所有回测记录
 
 ---
 
