@@ -23,6 +23,7 @@ from strategies.base import BaseStrategy
 from core.data_engine import DataEngine
 from core.scoring_model import ScoringModel
 from core.risk_filter import RiskFilter
+from core.portfolio_optimizer import PortfolioOptimizer
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,8 @@ class LongTermStrategy(BaseStrategy):
 
         if recommendations:
             logger.info(f"推荐 {len(recommendations)} 只长线标的")
+            # 组合优化：评分加权仓位分配
+            recommendations = PortfolioOptimizer.allocate(recommendations)
         return recommendations
 
     def _prefilter_long(self, quotes_df: pd.DataFrame) -> list:

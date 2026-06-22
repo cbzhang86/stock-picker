@@ -69,7 +69,7 @@ class PortfolioOptimizer:
         # 应用上限约束
         capped = [min(p, cls.MAX_ALLOCATION) for p in raw_alloc]
 
-        # 回收超限部分并重新分配
+        # 回收超限部分并重新分配（迭代收敛）
         excess = sum(raw_alloc) - sum(capped)
         while excess > 0.001:
             # 将超额按比例分配给未超限的
@@ -79,13 +79,16 @@ class PortfolioOptimizer:
             for i in range(len(capped)):
                 if capped[i] < cls.MAX_ALLOCATION:
                     capped[i] += excess * (capped[i] / uncapped_total)
-            excess = 0  # 一轮分配
+            # 重新截断上限，计算新的超额
+            new_capped = [min(p, cls.MAX_ALLOCATION) for p in capped]
+            excess = sum(capped) - sum(new_capped)
+            capped = new_capped
 
         # 应用下限约束
         result = []
         for r, pct in zip(recs, capped):
             r['allocation_pct'] = round(
-                max(pct, cls.MIN_ALLOCATION / 100) * 100, 1
+                max(pct, cls.MIN_ALLOCATION) * 100, 1
             )
             result.append(r)
 
@@ -99,10 +102,12 @@ class PortfolioOptimizer:
 
     @classmethod
     def _equal_weight(cls, recs: List[Dict]) -> List[Dict]:
-        """等权分配"""
-        weight = round(100.0 / len(recs), 1)
-        for r in recs:
-            r['allocation_pct'] = weight
+        """等权分配（保证总和=100%）"""
+        n = len(recs)
+        base = int(100 / n)
+        remainder = 100 - base * n
+        for i, r in enumerate(recs):
+            r['allocation_pct'] = base + (1 if i < remainder else 0)
         return recs
 
     @staticmethod
