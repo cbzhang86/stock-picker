@@ -71,6 +71,8 @@ class DataEngine:
         self._all_codes = None
         self._big_deal_cache = None
         self._ths_fund_flow_cache = None
+        self._asharehub_client = None  # 懒加载
+        self._northbound_cache = {}   # {code: {date: vol}}
         self._lockup_cache = {}           # 解禁日历缓存（2026-06-16 新增）
         self._lockup_cache_date = None
         self._lockup_cache_horizon = 0
@@ -619,7 +621,7 @@ class DataEngine:
     _source_available = {
         'big_deal': True,         # stock_fund_flow_big_deal — 东财大单
         'ths_fund_flow': True,    # stock_fund_flow_individual — 同花顺全市场资金流（通）
-        'north_flow': True,       # stock_hsgt_individual_em — 北向（不通）
+        'north_flow': True,       # northbound_holdings — 北向（asharehub/通）
         'push2': True,            # push2 直连（不通）
         'lockup': True,           # stock_restricted_release_detail_em — 限售解禁（2026-06-16 新增）
     }
@@ -823,21 +825,73 @@ class DataEngine:
 
     def get_north_flow_accumulated(self, code: str, days: int = 10) -> Optional[float]:
         """
-        北向资金近N日累计（东方财富源，网络受限时返回None）
-        独立熔断：不影响 get_main_fund_accumulated 的大单缓存。
-        降级方案：用 get_north_flow_summary() 全市场汇总替代个股数据。
+        北向资金近N日累计（asharehub northbound_holdings，已通）
+        计算逻辑：最新持股量 - N日前持股量 = 区间净增持股数（正=加仓）
+
+        熔断：
+          - 独立于 big_deal / ths_fund_flow，互不影响
         """
         if not self._source_available.get('north_flow', True):
             return None
 
         try:
-            import akshare as ak
-            df = ak.stock_hsgt_individual_em(symbol=str(code).zfill(6))
-            if df is not None and not df.empty:
-                self._update_source_status('akshare_north_flow', True)
-                return df.tail(days)['当日净流入'].sum()
+            from asharehub import AShareHub
+            if self._asharehub_client is None:
+                import os as _os
+                self._asharehub_client = AShareHub(
+                    api_key=_os.environ.get('ASHAREHUB_API_KEY', ''),
+                    version='v2'
+                )
+
+            code6 = str(code).zfill(6)
+            symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
+            client = self._asharehub_client
+
+            # 拉取足够的历史数据（按季度频率，拉120条足够）
+            cache_key = f"nb_{code6}"
+            if cache_key in self._northbound_cache:
+                records = self._northbound_cache[cache_key]
+            else:
+                df = client.northbound_holdings(symbol=symbol, limit=120)
+                if df is not None and not df.empty:
+                    records = {}
+                    for _, row in df.iterrows():
+                        records[str(row['trade_date'])] = float(row['vol'])
+                    self._northbound_cache[cache_key] = records
+                    self._update_source_status('akshare_north_flow', True)
+                else:
+                    return None
+
+            if not records:
+                return None
+
+            # 找最新和 N 天前的 vol
+            sorted_dates = sorted(records.keys(), reverse=True)
+            if len(sorted_dates) < 2:
+                return None
+
+            latest_date = sorted_dates[0]
+            latest_vol = records[latest_date]
+
+            # 找 N 天前的数据（按日历推算 N 天前的最接近记录）
+            from datetime import datetime, timedelta
+            target_date = (datetime.strptime(latest_date, '%Y%m%d') - timedelta(days=days)).strftime('%Y%m%d')
+            prev_vol = None
+            for d in sorted_dates:
+                if d <= target_date:
+                    prev_vol = records[d]
+                    break
+
+            if prev_vol is None or prev_vol == 0:
+                return None
+
+            vol_change = latest_vol - prev_vol
+            # 正=加仓，负=减仓。用 vol 变化率归一化到 0-100 分值
+            return vol_change
+
         except Exception as e:
-            self._source_available['north_flow'] = False  # 独立熔断，不影响 big_deal
+            logger.warning(f"asharehub北向失败 {code}: {str(e)[:60]}")
+            self._source_available['north_flow'] = False
             self._update_source_status('akshare_north_flow', False, str(e)[:60])
         return None
 
