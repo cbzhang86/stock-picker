@@ -67,6 +67,7 @@ A 股量化投资面临的核心问题是：数据源分散（行情、资金流
 | 基本面财务快照（37 字段） | mootdx TCP      | ~0.1s/只 | 🟢 永不封 |
 | 同花顺强势股 + 题材归因   | 10jqka          |  ~0.22s  |  🟢 极低  |
 | 北向资金实时汇总          | hexin.cn        |   实时   |  🟢 极低  |
+| 个股北向持仓              | asharehub       |  ~4s/只  |  🟢 需免费API Key |
 | 个股板块归属              | 东财 slist      | ~2.3s/只 |  🟡 限流  |
 | 龙虎榜 + 席位 + 机构动向  | 东财 datacenter |  ~6s/只  |  🟡 限流  |
 | 主力资金流（5189 只）     | 同花顺          | ~19s 全量 |   🟢 低   |
@@ -417,7 +418,7 @@ akshare ──→ 大单/代码   ├─ calc_bollinger
 | 大单资金流（685 只） | akshare big_deal |        🥈        | HTTP     | 独立熔断，不与其他源共享            |  ✅  |
 | 板块归属             | 东财 push2       |        🥉        | HTTP     | em_get 限流                         |  ✅  |
 | 龙虎榜               | 东财 datacenter  |        🥉        | HTTP     | em_get 限流                         |  ✅  |
-| 个股北向             | akshare          |        —        | HTTP     | ❌ 境外不通，独立熔断，不影响其他源 |  ⛔  |
+| 个股北向             | asharehub（API Key） |        🥈        | HTTP     | 需免费注册，基于持股量变化计算增减仓 |  ✅  |
 | 个股资金流           | akshare          |        —        | HTTP     | ❌ 境外不通，独立熔断，不影响其他源 |  ⛔  |
 
 ### 独立数据源级熔断
@@ -428,12 +429,12 @@ akshare ──→ 大单/代码   ├─ calc_bollinger
 _source_available = {
     'big_deal': True,      # stock_fund_flow_big_deal — 通的
     'capital_flow': True,  # stock_individual_fund_flow — 不通
-    'north_flow': True,    # stock_hsgt_individual_em — 不通
+    'north_flow': True,    # northbound_holdings — ✅ 通
     'push2': True,         # push2 直连 — 不通
 }
 ```
 
-`big_deal` 和 `north_flow` 的熔断完全独立。北向 200 只超时只影响 `north_flow` 标志位，不影响大单缓存。之前用单变量共享熔断时，北向失败连带大单缓存也被熔断，25s 的大单加载白花了——已修复。
+`big_deal` 和 `north_flow` 的熔断完全独立。
 
 ### 大单缓存覆盖范围
 

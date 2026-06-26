@@ -37,15 +37,23 @@ version: 4.1
 ## Prerequisites
 
 ```bash
-pip install mootdx requests pandas numpy scikit-learn cachetools akshare pyyaml
+pip install mootdx requests pandas numpy scikit-learn cachetools akshare pyyaml asharehub
 ```
 
 | 依赖 | 用途 |
 |------|------|
 | mootdx >= 0.10 | 通达信TCP行情（K线+财务快照，永不封IP） |
+| asharehub | 个股北向持仓数据（需免费API key） |
 | scikit-learn | Ridge回归权重自学习 |
 | akshare | 仅用于A股代码列表和大单数据 |
 | 其余 | HTTP请求/数据处理/缓存/配置 |
+
+### 环境变量
+
+```bash
+# AShareHub API key（免费申请：https://asharehub.com/console/register）
+export ASHAREHUB_API_KEY="ash_your_key_here"
+```
 
 ---
 

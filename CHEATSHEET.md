@@ -9,7 +9,8 @@
 | **🥇 首选** | **mootdx (TCP 7709)** | K线 + 财务快照 | **永不封 IP**，复用连接后 ~0.1s/只 |
 | **🥇 首选** | **腾讯财经 (HTTP)** | 实时行情 5205 只 | **不封 IP**，~46s 全市场 |
 | 🥈 | 同花顺热点 10jqka | 强势股 + 题材归因 | 零鉴权 73ms |
-| 🥈 | hexin.cn | 北向资金 | 零鉴权 |
+| 🥈 | hexin.cn | 北向资金汇总 | 零鉴权 |
+| 🥈 | asharehub (需免费API Key) | 个股北向持仓 | HTTP |
 | 🥉 | **东财 (em_get 限流)** | 板块归属/龙虎榜 | 有风控，必须经 `em_get()` 串行限流 |
 
 **铁律：K 线不要走 baostock！** baostock 是全局单例，线程不安全，且 ~8s/只。mootdx TCP ~0.1s/只，复用连接更快。
@@ -78,12 +79,12 @@ ScoringModel 的权重加载顺序：
 _source_available = {
     'big_deal': True,      # stock_fund_flow_big_deal — ✅ 通
     'capital_flow': True,  # stock_individual_fund_flow — ❌ 不通
-    'north_flow': True,    # stock_hsgt_individual_em — ❌ 不通
+    'north_flow': True,    # northbound_holdings (asharehub) — ✅ 通
     'push2': True,         # push2 直连 — ❌ 不通
 }
 ```
 
-**关键设计：** `big_deal` 和 `north_flow` 的熔断完全独立。北向 200 只全部超时只影响 `north_flow` 标志位，不影响大单缓存。之前有个 Bug：用单变量 `_akshare_available` 共享熔断，北向第 1 只失败后大单缓存也被连带熔断，199 只资金流全变 50 分，25s 的大单加载白花了。
+**关键设计：** `big_deal` 和 `north_flow` 的熔断完全独立。北向数据不可用不影响大单缓存。
 
 ### 大单缓存覆盖范围
 
