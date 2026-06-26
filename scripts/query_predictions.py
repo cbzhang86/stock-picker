@@ -2,7 +2,7 @@
 import sqlite3
 from datetime import datetime, timedelta
 
-conn = sqlite3.connect('data/predictions.db')
+conn = sqlite3.connect('data/db/predictions.db')
 
 # Get schema to understand table structure
 tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()

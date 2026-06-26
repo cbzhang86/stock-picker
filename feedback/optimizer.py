@@ -50,8 +50,28 @@ def optimize_weights(historical_results: pd.DataFrame,
         logger.warning(f"记录不足 {len(historical_results)} < 10，跳过优化")
         return {}
 
-    # 准备数据
-    X = historical_results[factor_columns].fillna(0.5).values
+    # 补齐可能缺失的因子列（历史数据可能没有某些字段）
+    for col in factor_columns:
+        if col not in historical_results.columns:
+            historical_results[col] = 0.5
+
+    # ---- 列过滤：剔除常数列，防止坍缩 ----
+    valid_columns = []
+    skipped = []
+    for col in factor_columns:
+        uniq = historical_results[col].nunique()
+        if uniq >= 3:
+            valid_columns.append(col)
+        else:
+            skipped.append(col)
+            logger.info(f"因子 {col} 跳过回归（唯一值={uniq} < 3）")
+
+    if not valid_columns:
+        logger.warning("所有因子均为常数列，跳过优化")
+        return {}
+
+    # 准备数据（仅有效列）
+    X = historical_results[valid_columns].fillna(0.5).values
     y = historical_results[target_column].fillna(0).values
 
     # 裁剪异常收益
@@ -63,17 +83,22 @@ def optimize_weights(historical_results: pd.DataFrame,
 
     coefficients = model.coef_
 
-    # 归一化（负系数→0）
-    weights = {}
+    # 构建全量权重：有效列用 Ridge 归一化系数，跳过列给 0
+    weights = {f: 0.0 for f in factor_columns}
     total_positive = sum(max(c, 0) for c in coefficients)
 
     if total_positive > 0:
-        for i, factor in enumerate(factor_columns):
+        for i, factor in enumerate(valid_columns):
             weights[factor] = round(max(coefficients[i], 0) / total_positive, 4)
     else:
-        # 全部负相关→均匀分布
-        n = len(factor_columns)
-        weights = {f: round(1.0 / n, 4) for f in factor_columns}
+        # 全部负相关→有效因子均匀分布
+        for i, factor in enumerate(valid_columns):
+            weights[factor] = round(1.0 / len(valid_columns), 4)
+
+    # ---- 坍缩保护：任一因子权重 > 0.8 则跳过本轮 ----
+    if any(w > 0.8 for w in weights.values()):
+        logger.warning(f"权重坍缩检测（权重 > 0.8）：{weights}，跳过本轮优化")
+        return {}
 
     return weights
 
@@ -81,8 +106,8 @@ def optimize_weights(historical_results: pd.DataFrame,
 class WeightsOptimizer:
     """权重优化调度器"""
 
-    def __init__(self, weights_dir: str = "data/model_weights",
-                 min_records: int = 30):
+    def __init__(self, weights_dir: str = "data/weights",
+                 min_records: int = 60):
         self.weights_dir = weights_dir
         self.min_records = min_records
         os.makedirs(weights_dir, exist_ok=True)
@@ -170,7 +195,17 @@ class WeightsOptimizer:
                 factor_dict = ast.literal_eval(fs) if isinstance(fs, str) else fs
             except Exception:
                 factor_dict = {}
-            factor_rows.append(factor_dict)
+            # 展平：因子值可能是 dict（如 {'raw_score': 85}），提取纯数值
+            if factor_dict:
+                flat = {}
+                for k, v in factor_dict.items():
+                    if isinstance(v, dict):
+                        flat[k] = v.get('raw_score', v.get('score', 50.0))
+                    else:
+                        flat[k] = v
+                factor_rows.append(flat)
+            else:
+                factor_rows.append(factor_dict)
 
         if not factor_rows:
             return None

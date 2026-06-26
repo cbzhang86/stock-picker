@@ -159,6 +159,14 @@ class ShortTermStrategy(BaseStrategy):
                 rec['dragon_tiger'] = dt
             except Exception:
                 rec['dragon_tiger'] = {"records": [], "seats": {"buy": [], "sell": []}, "institution": {}}
+            # 板块和龙虎榜数据已补全，重新计算 hot_theme 和 dragon_tiger 评分
+            updated_factors = self.scoring_model.factor_lib.compute_all_factors(rec, 'short')
+            if 'hot_theme' in updated_factors and rec.get('breakdown', {}).get('hot_theme'):
+                rec['breakdown']['hot_theme']['raw_score'] = updated_factors['hot_theme']
+                rec['breakdown']['hot_theme']['note'] = '板块归属已纳入'
+            if 'dragon_tiger' in updated_factors and rec.get('breakdown', {}).get('dragon_tiger'):
+                rec['breakdown']['dragon_tiger']['raw_score'] = updated_factors['dragon_tiger']
+                rec['breakdown']['dragon_tiger']['note'] = '龙虎榜数据已纳入'
             # breakdown 中 hot_theme / dragon_tiger 的实际得分通过 scoring_model.compute_all_factors
             # 算出来的，不要 pop 掉，让配置里 0.08+0.05 这 13% 权重真的生效
 
@@ -443,6 +451,13 @@ class ShortTermStrategy(BaseStrategy):
             except Exception:
                 north_accum = None
             stock['north_flow_accumulated'] = north_accum
+
+            # 尾盘成交结构（从已缓存的大单数据提取，不走额外API）
+            try:
+                tail_end = self.data_engine.get_tail_end_stats(code)
+                stock['tail_end_stats'] = tail_end
+            except Exception:
+                stock['tail_end_stats'] = {'available': False}
 
         # K线 + 技术指标（并行拉取，每只独立线程）
         # 缓存命中的毫秒级返回，未命中的走baostock

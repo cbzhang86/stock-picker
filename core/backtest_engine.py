@@ -639,7 +639,7 @@ class BacktestEngine:
         # 1. 找出 K 线缓存里有足够历史的所有股票
         import sqlite3
         import os
-        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'kline_cache.db')
+        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'cache', 'kline_cache.db')
         if not os.path.exists(db_path):
             logger.warning(f"K线缓存不存在: {db_path}")
             return self._empty_result_kfactor(factors, start_date, end_date)

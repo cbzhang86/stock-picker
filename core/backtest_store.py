@@ -33,7 +33,7 @@ class BacktestStore:
         if db_path is None:
             db_path = os.path.join(
                 os.path.dirname(os.path.dirname(__file__)),
-                'data', 'backtest_cache.db'
+                'data', 'cache', 'backtest_cache.db'
             )
         self.db_path = db_path
         self._init_db()

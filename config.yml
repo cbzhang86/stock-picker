@@ -92,8 +92,8 @@ long_term:
 
 # ---- 模型迭代 ----
 model:
-  version_dir: data/model_weights
-  min_records_for_optimize: 30   # 至少积累30条推荐记录才触发优化
+  version_dir: data/weights
+  min_records_for_optimize: 60   # 至少积累60条推荐记录才触发优化
   optimizer: ridge               # 优化算法：ridge / lasso / linear
   ridge_alpha: 1.0
   auto_rollback_threshold: -0.05 # 新版胜率下降超5%则自动回滚

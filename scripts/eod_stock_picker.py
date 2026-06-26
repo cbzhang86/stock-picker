@@ -136,7 +136,7 @@ def run_long_term(config: dict) -> list:
 
 def maybe_sync_weights(config: dict, mode: str):
     """如果优化器写入了新权重，同步到 v1.json"""
-    weights_dir = 'data/model_weights'
+    weights_dir = 'data/weights'
     v1_path = os.path.join(weights_dir, 'v1.json')
 
     # 找最新的权重文件（按时间排序）

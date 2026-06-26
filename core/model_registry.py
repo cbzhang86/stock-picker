@@ -21,7 +21,7 @@ class ModelRegistry:
     """模型版本注册表"""
 
     def __init__(self, registry_dir: str = "data/model_registry",
-                 weights_dir: str = "data/model_weights"):
+                 weights_dir: str = "data/weights"):
         self.registry_dir = registry_dir
         self.weights_dir = weights_dir
         os.makedirs(registry_dir, exist_ok=True)

@@ -89,7 +89,7 @@ class ScoringModel:
     }
 
     def __init__(self, weights: dict = None, model_version: str = 'v1',
-                 weights_dir: str = 'data/model_weights'):
+                 weights_dir: str = 'data/weights'):
         self.factor_lib = FactorLibrary()
         self.model_version = model_version
         self.weights_dir = weights_dir
@@ -229,16 +229,16 @@ class ScoringModel:
                 risk_note = 'risk_check 未通过'
             else:
                 # passed=True 但 score_penalty 不为 0：软风险扣分
-                # penalty=0.3 -> 扣 9%（0.3 * 0.3）
-                # penalty=0.5 -> 扣 15%
-                # penalty=0.7 -> 扣 21%
-                # 设计：从 0.5 改为 0.3，避免弱市普跌日大量"软风险 0.3"票被罚到 65 分线以下，
-                # 导致弱市全部刷空（违反"弱市至少推荐 1-2 只"的设计意图）
+                # penalty < 0.4 → ×0.2（轻度软风险）
+                # penalty ≥ 0.4 → ×0.5（较高风险如低成交额/高换手）
+                # 分段系数让轻度软风险（量比异常 0.3）不受太大影响，
+                # 同时让高风险的惩罚力度拉开差距
                 risk_penalty = risk_check.get('score_penalty', 0)
                 if risk_penalty > 0:
                     risk_note = f"软风险扣分(penalty={risk_penalty})"
 
-        score = weighted_score * (1 - risk_penalty * 0.3)
+        risk_coeff = 0.2 if risk_penalty < 0.4 else 0.5
+        score = weighted_score * (1 - risk_penalty * risk_coeff)
 
         # breakdown 里记录 risk（不参与加权，但展示信息）
         if 'risk' in weights:
@@ -417,6 +417,22 @@ class ScoringModel:
 
         返回：评分降序排列的推荐列表
         """
+        # 横截面排名：capital_flow 用百分位替代绝对值评分，避免全员满分
+        # 收集全部有效 main_fund_accumulated，在 200 只内排百分位
+        main_values = [
+            s.get('main_fund_accumulated')
+            for s in stocks_data
+            if s.get('main_fund_accumulated') is not None
+            and abs(s['main_fund_accumulated']) > 0
+        ]
+        if main_values:
+            for s in stocks_data:
+                mv = s.get('main_fund_accumulated')
+                if mv is not None and abs(mv) > 0:
+                    # 百分位 = 有多少股票 <= 该值 / 总数
+                    rank = sum(1 for v in main_values if v <= mv) / len(main_values)
+                    s['_capital_flow_percentile'] = rank
+
         results = []
         for stock in stocks_data:
             # 风控前置检查

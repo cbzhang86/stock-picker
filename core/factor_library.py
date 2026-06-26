@@ -148,27 +148,40 @@ class FactorLibrary:
     @staticmethod
     def calc_volume_ratio_score(volume_ratio: float) -> float:
         """
-        量比评分
-        量比 0.8-2.0 健康放量 → 高分
-        量比 < 0.5 缩量 → 低分
-        量比 > 5 异常放量 → 低分（可能有出货风险）
+        量比评分（连续分段线性函数）
+
+        设计原理：
+          量比 0.8-2.0 是健康放量区间，评分最高
+          缩量（< 0.3）→ 无人问津，低分
+          异常放量（> 5）→ 可能有出货风险，低分
+          峰值在量比 1.4 附近（温和放量+价格上涨的组合最理想）
+
+        锚点: (0.3, 25) → (0.8, 65) → (1.0, 75) → (1.4, 85)
+              → (3.0, 65) → (5.0, 40) → (15.0, 15)
         """
         if volume_ratio is None or volume_ratio <= 0:
-            return 50
+            return 50.0
 
-        if 0.8 <= volume_ratio <= 2.0:
-            score = 80
-        elif 2.0 < volume_ratio <= 3.0:
-            score = 70
-        elif 0.5 <= volume_ratio < 0.8:
-            score = 50
-        elif 3.0 < volume_ratio <= 5.0:
-            score = 40
-        elif volume_ratio < 0.5:
-            score = 30
-        else:  # > 5.0
-            score = 20
-        return score
+        r = volume_ratio
+
+        # 缩量区间：0 → 1.4（平滑上升）
+        if r <= 1.4:
+            if r < 0.3:
+                return 25.0
+            elif r < 0.8:
+                return 25 + (r - 0.3) / 0.5 * 40  # 25 → 65
+            elif r < 1.0:
+                return 65 + (r - 0.8) / 0.2 * 10  # 65 → 75
+            else:
+                return 75 + (r - 1.0) / 0.4 * 10  # 75 → 85
+
+        # 放量区间：1.4 → 无穷（平滑下降）
+        elif r <= 3.0:
+            return 85 - (r - 1.4) / 1.6 * 20   # 85 → 65
+        elif r <= 5.0:
+            return 65 - (r - 3.0) / 2.0 * 25   # 65 → 40
+        else:
+            return max(15, 40 - (r - 5.0) / 10.0 * 25)  # 40 → 15
 
     @staticmethod
     def calc_turnover_score(turnover: float) -> float:
@@ -421,7 +434,12 @@ class FactorLibrary:
         # 资金面 — 大单缓存是单日数据，传 days=None
         main_fund = stock_data.get('main_fund_accumulated')
         if main_fund is not None and abs(main_fund) > 0:
-            factors['capital_flow'] = self.calc_main_fund_score(main_fund, days=None)
+            # 优先使用横截面百分位（从 rank_stocks 传入，避免全员满分）
+            percentile = stock_data.get('_capital_flow_percentile')
+            if percentile is not None:
+                factors['capital_flow'] = min(percentile * 100, 100)
+            else:
+                factors['capital_flow'] = self.calc_main_fund_score(main_fund, days=None)
         else:
             factors['capital_flow'] = self.calc_main_fund_score(main_fund)
         factors['north_flow'] = self.calc_north_flow_score(
@@ -444,10 +462,38 @@ class FactorLibrary:
             macd_info = stock_data.get('macd_status', {})
             factors['technical'] = macd_info.get('score', 50) if isinstance(macd_info, dict) else 50
 
-        # 量价
-        factors['volume_price'] = self.calc_volume_ratio_score(
-            stock_data.get('volume_ratio')
-        )
+        # 量价（含尾盘成交结构增强）
+        base_vp = self.calc_volume_ratio_score(stock_data.get('volume_ratio'))
+        tail = stock_data.get('tail_end_stats', {})
+        tail_bonus = 0.0
+        if tail.get('available'):
+            # ① 尾盘30分钟成交占比（> 25% 说明尾盘资金集中介入）
+            tvr = tail.get('tail_volume_ratio', 0)
+            if tvr > 0.30:
+                tail_bonus += 12
+            elif tvr > 0.25:
+                tail_bonus += 9
+            elif tvr > 0.20:
+                tail_bonus += 5
+            elif tvr > 0.15:
+                tail_bonus += 3
+            elif tvr < 0.05:
+                tail_bonus -= 5  # 尾盘几乎无大单，说明资金不关注
+
+            # ② 尾盘资金逆转（全天净流出但尾盘30min净流入 = 强信号）
+            if tail.get('tail_reversal'):
+                tail_bonus += 12
+
+            # ③ 收盘价位置（相对VWAP）
+            pp = tail.get('price_position', 0)
+            if pp > 0.05:
+                tail_bonus += 6   # 收盘显著高于均价，强势收尾
+            elif pp > 0.02:
+                tail_bonus += 3
+            elif pp < -0.02:
+                tail_bonus -= 3   # 收盘低于均价，弱势收尾
+
+        factors['volume_price'] = np.clip(base_vp * 0.7 + tail_bonus, 0, 100)
 
         # 风险 — 风控通过时 score_penalty=0 → risk_score=100
         factors['risk'] = stock_data.get('risk_score', 100)

@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class PredictionTracker:
     """预测结果追踪器"""
 
-    def __init__(self, db_path: str = "data/predictions.db"):
+    def __init__(self, db_path: str = "data/db/predictions.db"):
         self.db_path = db_path
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else '.', exist_ok=True)
         self._init_db()

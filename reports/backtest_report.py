@@ -29,7 +29,7 @@ def generate_backtest_report(result: BacktestResult) -> str:
     if getattr(result, 'mode', '') == 'kfactor':
         lines.append("## 📋 模式说明：K 线因子回测")
         lines.append("")
-        lines.append("- 基于 `data/kline_cache.db` 中各股的日 K 线，**逐日重算技术类因子**（momentum / technical / volume_price）")
+        lines.append("- 基于 `data/cache/kline_cache.db` 中各股的日 K 线，**逐日重算技术类因子**（momentum / technical / volume_price）")
         lines.append("- 资金流 / 题材 / 龙虎榜 / 北向 / 基本面因子在 K 线维度下**没有数据**，无法校验")
         lines.append("- 输出每个因子的 IC（Spearman rank 相关系数）+ 胜率分桶 + verdict 解读")
         lines.append("- 适用于因子筛选验证，不替代策略级回测")

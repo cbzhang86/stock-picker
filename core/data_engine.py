@@ -78,7 +78,7 @@ class DataEngine:
         self._lockup_cache_horizon = 0
         self._mootdx_client = None  # 懒加载，重用TCP连接
         self._kline_cache_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), 'data', 'kline_cache.db'
+            os.path.dirname(os.path.dirname(__file__)), 'data', 'cache', 'kline_cache.db'
         )
         self._init_kline_cache()
 
@@ -294,7 +294,7 @@ class DataEngine:
 
     def _codes_cache_path(self) -> str:
         return os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), 'data', 'codes_cache.json'
+            os.path.dirname(os.path.dirname(__file__)), 'data', 'cache', 'codes_cache.json'
         )
 
     def _read_codes_cache(self, ignore_expiry: bool = False) -> Optional[list]:
@@ -710,6 +710,8 @@ class DataEngine:
                 sell_sum = df[sell_mask].groupby('股票代码')['成交金额'].sum()
                 net = buy_sum.subtract(sell_sum, fill_value=0)
                 self._big_deal_cache = net
+                # 保留原始 df 用于尾盘成交结构分析
+                self._big_deal_raw = df.copy()
                 self._update_source_status('akshare_fund_flow', True)
                 logger.info(f"全市场大单数据已加载: {len(net)} 只股票，每只约{len(df)//len(net)}笔大单")
 
@@ -724,6 +726,66 @@ class DataEngine:
             self._source_available['big_deal'] = False
             self._big_deal_cache = None
         return None
+
+    def get_tail_end_stats(self, code: str) -> Dict:
+        """
+        尾盘成交结构统计 — 从已缓存的大单数据中提取尾盘信号
+
+        三个子维度：
+          1. 尾盘30分钟成交占比（> 25% 说明尾盘资金集中介入）
+          2. 尾盘资金逆转（全天净流出但尾盘30min净流入 = 强信号）
+          3. VWAP位置强度（收盘价在当日成交均价之上）
+
+        返回：{'available': True/False, 'tail_volume_ratio': float, ...}
+        """
+        if not hasattr(self, '_big_deal_raw') or self._big_deal_raw is None:
+            return {'available': False}
+
+        code_str = str(code).zfill(6)
+        stock_deals = self._big_deal_raw[self._big_deal_raw['股票代码'] == code_str]
+        if stock_deals.empty:
+            return {'available': False}
+
+        # 全天的成交额和净流向
+        total_volume = stock_deals['成交金额'].sum()
+        buy_mask = stock_deals['大单性质'].str.contains('买|主', na=False)
+        total_buy = stock_deals[buy_mask]['成交金额'].sum()
+        total_sell = stock_deals[~buy_mask]['成交金额'].sum()
+        total_net = total_buy - total_sell
+
+        # 尾盘30分钟（14:30-15:00）
+        # 成交时间格式类似 '2025-01-15 14:35:00'
+        time_str = stock_deals['成交时间'].astype(str)
+        tail_mask = time_str.str.contains(r'14:3[0-9]|14:4[0-9]|14:5[0-9]', na=False)
+        tail_deals = stock_deals[tail_mask]
+        tail_volume = tail_deals['成交金额'].sum()
+        tail_buy = tail_deals[buy_mask & tail_mask]['成交金额'].sum()
+        tail_sell = tail_deals[~buy_mask & tail_mask]['成交金额'].sum()
+        tail_net = tail_buy - tail_sell
+
+        # 1. 尾盘成交占比
+        tail_volume_ratio = tail_volume / total_volume if total_volume > 0 else 0
+
+        # 2. 尾盘资金逆转
+        tail_reversal = (tail_net > 0 and total_net < 0)
+
+        # 3. 收盘位置（用大单的成交均价近似VWAP）
+        #    price_position > 0.67 表示收盘在均价上方（强势收尾）
+        vwap = stock_deals['成交金额'].sum() / stock_deals['成交量'].sum() \
+               if stock_deals['成交量'].sum() > 0 else 0
+        last_price = stock_deals['成交价格'].iloc[-1] if not stock_deals.empty else 0
+        price_position = (last_price - vwap) / vwap if vwap > 0 else 0
+
+        return {
+            'available': True,
+            'tail_volume_ratio': round(tail_volume_ratio, 4),
+            'total_net': round(total_net, 2),
+            'tail_net': round(tail_net, 2),
+            'tail_reversal': tail_reversal,
+            'vwap': round(vwap, 2),
+            'last_price': last_price,
+            'price_position': round(price_position, 4),
+        }
 
     def _get_capital_flow_push2(self, code: str, days: int = 10) -> Optional[float]:
         """直连东方财富 push2his 资金流 API（绕过 akshare SDK）"""
@@ -1070,7 +1132,7 @@ class DataEngine:
             if r is None:
                 logger.warning(f"龙虎榜记录失败 {code}: em_get 返回 None")
                 return {"records": [], "seats": seats, "institution": institution}
-            data = r.json().get("result", {}).get("data", [])
+            data = (r.json().get("result") or {}).get("data", [])
             for row in data:
                 records.append({
                     "date": str(row.get("TRADE_DATE", ""))[:10],
@@ -1102,7 +1164,7 @@ class DataEngine:
                     if r is None:
                         logger.warning(f"龙虎榜{key}席位失败 {code}: em_get 返回 None")
                         continue
-                    sdata = r.json().get("result", {}).get("data", [])
+                    sdata = (r.json().get("result") or {}).get("data", [])
                     key = "buy" if side == 0 else "sell"
                     for row in sdata[:5]:
                         seats[key].append({

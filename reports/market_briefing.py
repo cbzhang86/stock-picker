@@ -57,7 +57,7 @@ def generate_market_briefing(recommendations: List[Dict],
             down_count = (quotes['pct_chg'] <= 0).sum()
             total_amount = quotes['amount'].sum()
             lines.append(f"    上涨/下跌: {up_count}/{down_count}")
-            lines.append(f"    成交额: {total_amount:,.0f} 亿")
+            lines.append(f"    成交额: {total_amount / 10000:,.0f} 亿")
     except Exception:
         lines.append("    市场数据暂不可用")
 

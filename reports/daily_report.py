@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class DailyReportGenerator:
     """每日报告生成器"""
 
-    def __init__(self, output_dir: str = "data/daily_reports"):
+    def __init__(self, output_dir: str = "data/reports"):
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
