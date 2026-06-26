@@ -87,6 +87,10 @@ def run_short_term(config: dict) -> list:
     strategy = ShortTermStrategy(short_cfg)
     recommendations = strategy.run()
 
+    # 如果市场环境评估跳过，不记录推荐
+    if recommendations and recommendations[0].get('skip_reason'):
+        return recommendations
+
     # 记录推荐
     tracker = PredictionTracker()
     from datetime import date

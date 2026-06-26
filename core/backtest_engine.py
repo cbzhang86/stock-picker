@@ -28,7 +28,6 @@ import numpy as np
 import pandas as pd
 
 from core.data_engine import DataEngine
-from core.scoring_model import ScoringModel
 from strategies.short_term import ShortTermStrategy
 from strategies.long_term import LongTermStrategy
 
