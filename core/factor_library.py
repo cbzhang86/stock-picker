@@ -61,6 +61,10 @@ class FactorLibrary:
         """
         北向资金评分（0-100）
         北向持续净买入 → 高分
+
+        注意：accumulated_net 来自 asharehub northbound_holdings，
+        单位是"持股量变化（股数）"，而非金额（元）。
+        用 days 天数做加权日均后评分，横截面百分位会稀释偏差。
         """
         if accumulated_net is None or days == 0:
             return 50.0  # 北向不可用，中性降权（与主力资金保持一致）

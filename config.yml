@@ -50,7 +50,7 @@ short_term:
     # 剩余软风险由 scoring_model 的 penalty 路径在总分上额外扣减。
 
   # 游资本组总权重：capital_flow + hot_theme + dragon_tiger = 0.43（2026-06-16 调整）
-  # 游资线作为短线核心驱动力；north_flow 海外接口不稳降至 0.05 防止集体降权
+  # 游资线作为短线核心驱动力；north_flow 通过 asharehub 接入已通
 
   # 买入条件
   buy:

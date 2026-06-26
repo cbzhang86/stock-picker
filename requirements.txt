@@ -9,4 +9,4 @@ scikit-learn>=1.2.0       # Ridge 回归权重优化
 akshare>=1.14.0           # A 股代码列表 + 大单资金流数据
 cachetools>=5.3.0         # 实时行情内存缓存 (TTLCache)
 pyyaml>=6.0               # 配置文件加载 (config.yml)
-stockstats                 # （可选）技术指标计算，已有内置实现则可不装
+asharehub>=0.6.0          # 北向资金持仓数据（需免费 API Key：https://asharehub.com/console/register）
