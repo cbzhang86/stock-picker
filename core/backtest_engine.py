@@ -504,11 +504,11 @@ class BacktestEngine:
             factor_scores = {}
             for fname, detail in breakdown.items():
                 if isinstance(detail, dict):
-                    factor_scores[fname] = detail.get('raw_score', 50)
+                    raw = detail.get('raw_score', 50)
                 else:
-                    factor_scores[fname] = 50
-            rows.append({'return_t1': score, 'factor_scores': factor_scores,
-                         'is_win': score >= 0})  # 边缘盈亏归入赢
+                    raw = 50
+                # 跳过常数列（如回测中恒定为 50 的 capital_flow），这些算 IC 没意义
+                factor_scores[fname] = raw
 
         if not rows:
             return {}
@@ -529,6 +529,10 @@ class BacktestEngine:
                     lose_scores.append(fs)
                 all_scores.append(fs)
                 all_returns.append(r['return_t1'])
+
+            # 跳过常数列：标准差为 0 的因子无法计算相关性
+            if np.std(all_scores) == 0:
+                continue
 
             # spread（赢亏均值差）
             win_avg = np.mean(win_scores) if win_scores else 50
