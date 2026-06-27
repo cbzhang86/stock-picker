@@ -40,7 +40,7 @@ SCHEMA = {
         CREATE TABLE IF NOT EXISTS north_flow (
             date TEXT NOT NULL,
             code TEXT NOT NULL,
-            holding_change REAL,
+            holding_change REAL,   -- 持股量变化（股数），asharehub northbound_holdings vol 差值
             PRIMARY KEY (date, code)
         )
     """,

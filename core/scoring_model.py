@@ -89,16 +89,19 @@ class ScoringModel:
     }
 
     def __init__(self, weights: dict = None, model_version: str = 'v1',
-                 weights_dir: str = 'data/weights'):
+                 weights_dir: str = 'data/weights', sell_config: dict = None):
         self.factor_lib = FactorLibrary()
         self.model_version = model_version
         self.weights_dir = weights_dir
+        self.sell_config = sell_config or {}
         os.makedirs(self.weights_dir, exist_ok=True)
 
         # 加载权重（优先级：v1.json > config传入 > DEFAULT_WEIGHTS）
         loaded = self._load_weights(model_version)
         if loaded:
             self.weights = loaded
+            if weights and weights != loaded:
+                logger.warning(f"v1.json 权重与 config.yml 不一致！config 权重被忽略。")
             logger.info(f"权重从 {model_version}.json 加载")
         elif weights:
             self.weights = weights
@@ -261,11 +264,13 @@ class ScoringModel:
         # 决策建议
         decision = self._make_decision(final_score, mode)
 
-        # 计算目标价和止损价
+        # 计算目标价和止损价（优先从 sell_config 读取）
         price = stock_data.get('price', 0)
         if mode == 'short':
-            target_price = round(price * 1.02, 2)   # T+1 止盈 +2%
-            stop_price = round(price * 0.98, 2)     # T+1 止损 -2%
+            tp = self.sell_config.get('take_profit', 0.02)
+            sl = abs(self.sell_config.get('stop_loss', -0.02))
+            target_price = round(price * (1 + tp), 2)
+            stop_price = round(price * (1 - sl), 2)
         else:
             target_price = round(price * 1.15, 2)   # 长线 +15%
             stop_price = round(price * 0.92, 2)     # 长线 -8%

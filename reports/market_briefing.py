@@ -58,8 +58,9 @@ def generate_market_briefing(recommendations: List[Dict],
             total_amount = quotes['amount'].sum()
             lines.append(f"    上涨/下跌: {up_count}/{down_count}")
             lines.append(f"    成交额: {total_amount / 10000:,.0f} 亿")
-    except Exception:
+    except Exception as e:
         lines.append("    市场数据暂不可用")
+        logger.warning(f"市场行情获取失败: {e}")
 
     # 北向资金
     try:
@@ -68,8 +69,8 @@ def generate_market_briefing(recommendations: List[Dict],
             direction = "净流入" if north['total'] > 0 else "净流出"
             lines.append(f"    北向资金: {direction} {north['total']:+.2f}亿"
                          f"（沪{north['hgt']:+.2f} / 深{north['sgt']:+.2f}）")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"北向数据获取失败: {e}")
     lines.append("")
 
     # ── 2. 题材热度 TOP 10 ──
@@ -87,8 +88,9 @@ def generate_market_briefing(recommendations: List[Dict],
                     lead_pct = lead.get('pct_chg', '')
                     lines.append(f"    {i:2d}. {t['theme']}（{t['count']}只）"
                                  f"→ {lead_name} {lead_pct:+.1f}%")
-    except Exception:
+    except Exception as e:
         lines.append("    题材数据暂不可用")
+        logger.warning(f"题材热度获取失败: {e}")
     lines.append("")
 
     # ── 3. 技术评分排名 TOP 5（从推荐中提取） ──
@@ -151,8 +153,8 @@ def generate_market_briefing(recommendations: List[Dict],
                 if roe and str(roe) != 'N/A':
                     lines.append(f"       ROE {roe:.1f}%  EPS {eps:.2f}  PE {pe}")
             lines.append("")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"长线策略运行失败: {e}")
 
     # ── 5. 数据源状态 ──
     try:
@@ -169,8 +171,8 @@ def generate_market_briefing(recommendations: List[Dict],
                 err_str = f" ({err})" if err else ""
                 lines.append(f"    - {label}: 不可用{err_str}")
             lines.append("")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"数据源状态获取失败: {e}")
 
     # ── 底部说明 ──
     lines.append("=" * 45)

@@ -114,7 +114,9 @@ class WeightsOptimizer:
                  min_records: int = 60):
         self.weights_dir = weights_dir
         self.min_records = min_records
+        self.cache_dir = "data/cache"
         os.makedirs(weights_dir, exist_ok=True)
+        os.makedirs(self.cache_dir, exist_ok=True)
 
     def maybe_optimize(self, tracker, current_weights: dict,
                        mode: str = 'short') -> Optional[Dict]:
@@ -308,7 +310,7 @@ class WeightsOptimizer:
 
     def _load_last_optimize_count(self, mode: str) -> int:
         """读取上次优化时的训练记录数"""
-        path = os.path.join(self.weights_dir, f'.last_optimize_{mode}')
+        path = os.path.join(self.cache_dir, f'.last_optimize_{mode}')
         try:
             with open(path) as f:
                 return int(f.read().strip())
@@ -317,7 +319,7 @@ class WeightsOptimizer:
 
     def _save_last_optimize_count(self, count: int, mode: str):
         """记录本次优化时的训练记录数"""
-        path = os.path.join(self.weights_dir, f'.last_optimize_{mode}')
+        path = os.path.join(self.cache_dir, f'.last_optimize_{mode}')
         try:
             with open(path, 'w') as f:
                 f.write(str(count))

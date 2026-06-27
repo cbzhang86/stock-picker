@@ -138,6 +138,7 @@ class DataEngine:
 
     def _get_kline_from_cache(self, code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
         """从本地缓存读取K线"""
+        conn = None
         try:
             import sqlite3
             conn = sqlite3.connect(self._kline_cache_path)
@@ -146,7 +147,6 @@ class DataEngine:
                 "WHERE code=? AND date>=? AND date<=? ORDER BY date",
                 conn, params=(code, start_date, end_date)
             )
-            conn.close()
             if not df.empty:
                 df['date'] = pd.to_datetime(df['date'])
                 for c in ['open', 'high', 'low', 'close', 'volume', 'amount']:
@@ -156,11 +156,15 @@ class DataEngine:
         except Exception as e:
             logger.warning(f"K线缓存读取失败 {code}: {str(e)[:80]}")
             return None
+        finally:
+            if conn:
+                conn.close()
 
     def _save_kline_to_cache(self, code: str, df: pd.DataFrame):
         """将K线写入本地缓存"""
         if df is None or df.empty:
             return
+        conn = None
         try:
             import sqlite3
             conn = sqlite3.connect(self._kline_cache_path)
@@ -177,9 +181,11 @@ class DataEngine:
                 "VALUES (?,?,?,?,?,?,?,?)", rows
             )
             conn.commit()
-            conn.close()
         except Exception as e:
             logger.warning(f"K线缓存写入失败 {code}: {e}")
+        finally:
+            if conn:
+                conn.close()
 
     def _fetch_kline_mootdx(self, code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
         """
@@ -494,7 +500,7 @@ class DataEngine:
             rs = bs.query_history_k_data_plus(
                 bs_code, 'date,open,high,low,close,volume,amount',
                 start_date=start_date, end_date=end_date,
-                frequency='d', adjustflag='2')
+                frequency='d', adjustflag='1')
             data = []
             while (rs.error_code == '0') and rs.next():
                 data.append(rs.get_row_data())
@@ -578,6 +584,7 @@ class DataEngine:
                     'report_date': str(fin.iloc[-1].name)[:7] if hasattr(fin.iloc[-1], 'name') else '',
                 }
                 # 写入缓存
+                conn = None
                 try:
                     import sqlite3
                     conn = sqlite3.connect(self._kline_cache_path)
@@ -588,9 +595,11 @@ class DataEngine:
                          result['profit'], result['income'], result['bvps'])
                     )
                     conn.commit()
-                    conn.close()
                 except Exception as e:
                     logger.warning(f"fin_cache写入失败 {code}: {str(e)[:80]}")
+                finally:
+                    if conn:
+                        conn.close()
                 return result
         except Exception as e:
             logger.warning(f"财务快照失败 {code}: {str(e)[:50]}")
@@ -598,6 +607,7 @@ class DataEngine:
 
     def _get_fin_from_cache(self, code: str) -> Optional[Dict]:
         """从SQLite缓存读取财务数据"""
+        conn = None
         try:
             import sqlite3
             conn = sqlite3.connect(self._kline_cache_path)
@@ -606,7 +616,6 @@ class DataEngine:
                 "WHERE code=? ORDER BY report_date DESC LIMIT 1", (code,)
             )
             row = cursor.fetchone()
-            conn.close()
             if row and row[0] is not None:
                 return {
                     'eps': float(row[0] or 0),
@@ -618,8 +627,11 @@ class DataEngine:
                 }
         except Exception as e:
             logger.warning(f"fin_cache读取失败 {code}: {str(e)[:80]}")
+            return None
+        finally:
+            if conn:
+                conn.close()
         return None
-
     # ========== 5. 技术指标快捷版 ==========
 
     def get_technical_summary(self, code: str) -> dict:
@@ -668,8 +680,7 @@ class DataEngine:
         'big_deal': True,         # stock_fund_flow_big_deal — 东财大单
         'ths_fund_flow': True,    # stock_fund_flow_individual — 同花顺全市场资金流（通）
         'north_flow': True,       # northbound_holdings — 北向（asharehub/通）
-        'push2': True,            # push2 直连（不通）
-        'lockup': True,           # stock_restricted_release_detail_em — 限售解禁（2026-06-16 新增）
+        'lockup': True,
         'asharehub_moneyflow': True, # AShareHub个股资金流（独立熔断）
         'asharehub_tech_factors': True, # AShareHub技术因子（独立熔断）
         'asharehub_concepts': True,    # AShareHub概念板块（独立熔断）
@@ -881,6 +892,7 @@ class DataEngine:
         except Exception as e:
             logger.warning(f"同花顺资金流失败 {code}: {str(e)[:60]}")
             self._source_available['ths_fund_flow'] = False
+            self._update_source_status('ths_fund_flow', False, str(e)[:60])
             self._ths_fund_flow_cache = None
         return None
 
@@ -922,6 +934,7 @@ class DataEngine:
         except Exception as e:
             logger.warning(f"大单资金流失败 {code}: {str(e)[:80]}")
             self._source_available['big_deal'] = False
+            self._update_source_status('big_deal', False, str(e)[:80])
             self._big_deal_cache = None
         return None
 
@@ -984,42 +997,6 @@ class DataEngine:
             'last_price': last_price,
             'price_position': round(price_position, 4),
         }
-
-    def _get_capital_flow_push2(self, code: str, days: int = 10) -> Optional[float]:
-        """直连东方财富 push2his 资金流 API（绕过 akshare SDK）"""
-        if not self._source_available.get('push2', True):
-            return None
-        try:
-            market = 1 if str(code).zfill(6).startswith(('6', '9')) else 0
-            url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-            params = {
-                "secid": f"{market}.{str(code).zfill(6)}",
-                "fields1": "f1,f2,f3,f7",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57",
-                "lmt": str(max(days, 120)),
-            }
-            headers = {
-                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                               "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"),
-                "Referer": "https://quote.eastmoney.com/",
-            }
-            r = _session.get(url, params=params, headers=headers, timeout=3)
-            data = r.json()
-            klines = data.get("data", {}).get("klines", [])
-            if klines:
-                total = 0.0
-                count = 0
-                for line in klines[-days:]:
-                    parts = line.split(",")
-                    if len(parts) >= 2 and parts[1] != "-":
-                        total += float(parts[1])
-                        count += 1
-                if count > 0:
-                    return total
-        except Exception as e:
-            logger.warning(f"push2资金流失败 {code}: {str(e)[:60]}")
-            self._source_available['push2'] = False
-        return None
 
     def get_north_flow_accumulated(self, code: str, days: int = 10) -> Optional[float]:
         """

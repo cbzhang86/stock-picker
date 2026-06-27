@@ -5,9 +5,10 @@
   尾盘（14:50-15:00）全市场扫描 → 多因子评分 → 推荐Top N
   如果市场赚钱效应差，自动跳过推荐。
 
-权重分配：
-  主力资金流 27% + 北向资金 10% + RPS动量 15%
-  + 技术形态 15% + 量价配合 10% + 风险 10% + 热点题材 8% + 龙虎榜 5%
+权重分配（config.yml 实际权重）：
+  主力资金流 25% + 动量 25% + 技术形态 15% + 量价配合 10%
+  + 北向资金 10% + 热点题材 10% + 龙虎榜 5%
+  （risk 是过滤层，不占权重）
 
 卖出规则：
   - 止盈：T+1 开盘+2% 以上分批止盈
@@ -41,7 +42,8 @@ class ShortTermStrategy(BaseStrategy):
         # 修复：从 config.yml 的 weights 键加载，而非不存在的 weights_model
         weights_cfg = config.get('weights', config.get('weights_model'))
         self.scoring_model = ScoringModel(
-            weights=weights_cfg if weights_cfg else None
+            weights=weights_cfg if weights_cfg else None,
+            sell_config=config.get('sell', {})
         )
         # 从嵌套的 buy 段读取参数
         buy_cfg = config.get('buy', {})
@@ -156,8 +158,8 @@ class ShortTermStrategy(BaseStrategy):
                 if north_summary:
                     for rec in recommendations:
                         rec['market_data'] = {'north_flow': north_summary}
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"北向数据补充失败: {e}")
 
         # 对推荐结果补充板块归属和龙虎榜（仅对 top N 做，走 em_get 限流）
         for rec in recommendations:
@@ -166,12 +168,13 @@ class ShortTermStrategy(BaseStrategy):
                 blocks = self.data_engine.get_stock_blocks(code)
                 rec['blocks'] = blocks
             except Exception:
+                logger.warning(f"板块获取失败 {code}")
                 rec['blocks'] = {"total": 0, "boards": [], "concept_tags": []}
             try:
                 dt = self.data_engine.get_dragon_tiger(code)
                 rec['dragon_tiger'] = dt
             except Exception:
-                rec['dragon_tiger'] = {"records": [], "seats": {"buy": [], "sell": []}, "institution": {}}
+                logger.warning(f"龙虎榜获取失败 {code}")
             # 板块和龙虎榜数据已补全，重新计算 hot_theme 和 dragon_tiger 评分
             updated_factors = self.scoring_model.factor_lib.compute_all_factors(rec, 'short')
             if 'hot_theme' in updated_factors and rec.get('breakdown', {}).get('hot_theme'):
@@ -457,8 +460,8 @@ class ShortTermStrategy(BaseStrategy):
         for stock in top_candidates:
             code = stock['code']
             if is_backtest:
-                stock['main_fund_accumulated'] = 0
-                stock['north_flow_accumulated'] = 0
+                stock['main_fund_accumulated'] = None
+                stock['north_flow_accumulated'] = None
                 stock['tail_end_stats'] = {'available': False}
             else:
                 try:
@@ -482,7 +485,6 @@ class ShortTermStrategy(BaseStrategy):
 
         # K线 + 技术指标（并行拉取，每只独立线程）
         # 缓存命中的毫秒级返回，未命中的走baostock
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         from threading import Lock
         enrich_lock = Lock()
 
@@ -517,24 +519,24 @@ class ShortTermStrategy(BaseStrategy):
                     asharehub_tech = self.data_engine.get_technical_factors_asharehub(code)
                     if asharehub_tech is not None:
                         stock['asharehub_tech'] = asharehub_tech
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"{code} AShareHub技术因子失败: {e}")
 
                 # AShareHub 概念板块（hot_theme 增强，独立熔断）
                 try:
                     concepts = self.data_engine.get_concept_members(code)
                     if concepts is not None:
                         stock['concept_names'] = concepts
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"{code} AShareHub概念板块失败: {e}")
 
                 # AShareHub 财务指标（长线策略，独立熔断）
                 try:
                     fin = self.data_engine.get_financial_indicators(code)
                     if fin is not None:
                         stock['financial_indicators'] = fin
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"{code} AShareHub财务指标失败: {e}")
             except Exception as e:
                 logger.warning(f"{code} 技术面失败: {str(e)[:60]}")
                 stock['macd_status'] = {'score': 50, 'status': 'unknown'}
@@ -584,6 +586,6 @@ class ShortTermStrategy(BaseStrategy):
 
     def describe(self) -> str:
         return (f"短线尾盘策略: T+0尾盘选股 → T+1开盘卖出。"
-                f"主力资金(27%)+动量(15%)+技术(15%)+量价(10%)+风控(10%)"
-                f"+北向(10%)+热点(8%)+龙虎榜(5%)。"
+                f"资金流(25%)+动量(25%)+技术(15%)+量价(10%)"
+                f"+北向(10%)+热点(10%)+龙虎榜(5%)。"
                 f"含市场环境评估，极差市自动跳过。")

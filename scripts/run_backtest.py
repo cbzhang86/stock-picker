@@ -50,8 +50,8 @@ def main():
     parser = argparse.ArgumentParser(description='A股选股策略回测')
     parser.add_argument('--mode', choices=['short', 'long', 'kfactor'], default='short',
                         help='策略模式: short(短线) / long(长线) / kfactor(K线因子回测)')
-    parser.add_argument('--start', default='2025-06-01', help='开始日期')
-    parser.add_argument('--end', default='2026-06-11', help='结束日期')
+    parser.add_argument('--start', default='2026-04-01', help='开始日期')
+    parser.add_argument('--end', default='2026-06-27', help='结束日期')
     parser.add_argument('--out', help='输出文件路径')
     parser.add_argument('--config', default='config.yml', help='配置文件')
     parser.add_argument('--list', action='store_true', help='查看历史回测记录')

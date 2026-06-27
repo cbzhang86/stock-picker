@@ -56,6 +56,9 @@ class BacktestResult:
     equity_curve: List[float] = field(default_factory=list)
     factor_performance: Dict = field(default_factory=dict)
     trade_details: List[Dict] = field(default_factory=list)
+    mode: str = ''        # 'kfactor' / 'full' — 回测类型标记
+    factors_tested: List[str] = field(default_factory=list)
+    codes_count: int = 0
 
 
 class BacktestEngine:

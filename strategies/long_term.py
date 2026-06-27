@@ -38,7 +38,8 @@ class LongTermStrategy(BaseStrategy):
         # 修复：从 config.yml 的 weights 键加载
         weights_cfg = config.get('weights', config.get('weights_model'))
         self.scoring_model = ScoringModel(
-            weights=weights_cfg if weights_cfg else None
+            weights=weights_cfg if weights_cfg else None,
+            sell_config=config.get('sell', {})
         )
         # 从嵌套的 buy 段读取参数
         buy_cfg = config.get('buy', {})
@@ -89,7 +90,7 @@ class LongTermStrategy(BaseStrategy):
             recommendations = PortfolioOptimizer.allocate(recommendations)
 
         # 暴露详评数据供因子采集
-        self._last_enriched = enriched if 'enriched' in dir() else []
+        self._last_enriched = enriched
 
         return recommendations
 
@@ -179,8 +180,8 @@ class LongTermStrategy(BaseStrategy):
                         stock['profit'] = fin.get('profit')
                         stock['income'] = fin.get('income')
                         stock['fin_report_date'] = fin.get('report_date', '')
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"{code} 财务快照获取失败: {e}")
 
             # 去掉内联 PE/PB 硬编码评分 — 已移至 FactorLibrary 统一计算
             # compute_all_factors(mode='long') 自动调用 calc_fundamental_score / calc_valuation_score

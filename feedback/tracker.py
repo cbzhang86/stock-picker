@@ -99,7 +99,7 @@ class PredictionTracker:
                (date, code, name, mode, score, rating, buy_price, model_version, factor_scores)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (date, code, name, mode, score, rating, buy_price,
-             model_version, json.dumps(factor_scores, ensure_ascii=False))
+             model_version, json.dumps(factor_scores, ensure_ascii=False, default=str))
         )
         conn.commit()
         prediction_id = c.lastrowid
