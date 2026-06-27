@@ -1,25 +1,25 @@
 # Stock-Picker 使用备忘录（给 AI 助手）
 
-## 1. 数据源优先级（最关键）
-
-系统的数据源按优先级排列，**不要倒过来用**：
-
-| 优先级 | 数据源 | 用途 | 为什么 |
-|:-----:|--------|------|--------|
-| **🥇 首选** | **mootdx (TCP 7709)** | K线 + 财务快照 | **永不封 IP**，复用连接后 ~0.1s/只 |
-| **🥇 首选** | **腾讯财经 (HTTP)** | 实时行情 5205 只 | **不封 IP**，~46s 全市场 |
-| 🥈 | 同花顺热点 10jqka | 强势股 + 题材归因 | 零鉴权 73ms |
-| 🥈 | hexin.cn | 北向资金汇总 | 零鉴权 |
-| 🥈 | asharehub (需免费API Key) | 个股北向持仓 | HTTP |
-| 🥉 | **东财 (em_get 限流)** | 板块归属/龙虎榜 | 有风控，必须经 `em_get()` 串行限流 |
-
-**铁律：K 线不要走 baostock！** baostock 是全局单例，线程不安全，且 ~8s/只。mootdx TCP ~0.1s/只，复用连接更快。
+数据源优先级速查、熔断机制、编码铁律、常见陷阱。每次操作前快速过一遍。
 
 ---
 
-## 2. `em_get()` 限流 — 东财数据的唯一入口
+**数据源优先级（从高到低）**
 
-所有 `eastmoney.com` 的请求**必须**走 `core/data_engine.py` 里的 `em_get()`：
+1. **mootdx (TCP 7709)** — K线 + 财务快照，永不封 IP，复用连接后 ~0.1s/只
+2. **腾讯财经 (HTTP)** — 实时行情 5205 只，不封 IP，~46s 全市场
+3. **同花顺 10jqka** — 强势股 + 题材归因，零鉴权 73ms
+4. **hexin.cn** — 北向资金汇总，零鉴权
+5. **ASHareHub (免费 API Key)** — 个股北向持仓 / 个股资金流 / 技术因子 / 概念板块 / 财务指标，4 端共享 100次/天
+6. **东财 (em_get 限流)** — 板块归属 / 龙虎榜，有 WAF 风控，必须经 `em_get()` 串行限流
+
+铁律：K 线不要走 baostock！baostock 是全局单例线程不安全，~8s/只。mootdx TCP ~0.1s/只。
+
+---
+
+**em_get() 限流 — 东财数据的唯一入口**
+
+所有 `eastmoney.com` 的请求必须走 `core/data_engine.py` 里的 `em_get()`：
 
 ```python
 # 正确
@@ -29,173 +29,124 @@ r = em_get("https://push2.eastmoney.com/api/qt/slist/get", params=params, timeou
 r = requests.get("https://push2.eastmoney.com/...")  # 会被封 IP
 ```
 
-`em_get` 内置了：
-- 串行执行（不并发）
-- 最小间隔 0.5s + 随机抖动 0.1-0.5s
-- 复用 Keep-Alive 会话
-- 默认浏览器 UA
+`em_get` 内置了串行执行（不并发）、最小间隔 0.5s + 随机抖动 0.1-0.5s、复用 Keep-Alive 会话、默认浏览器 UA。
 
 ---
 
-## 3. Config 权重传递 — 踩过坑的
+**ASHareHub 日配额管理**
+
+4 个 ASHareHub endpoint 共享 **100 次/天** 的日预算计数器：
+
+- `moneyflow` → capital_flow 因子优先源
+- `technical_factors` → 双源技术评分校验
+- `concept_members` → hot_theme 三源融合增强
+- `financial_indicators` → 长线基本面优先源
+
+配额耗尽后静默返回 None，等同于该源不可用。第二天自动重置。三闸齐下：`check_src_available()` → `check_budget()` → `call_api()`。
+
+---
+
+**熔断机制 + 10 分钟自动恢复**
+
+系统用 `_source_available` 字典实现数据源级别的独立熔断，各 endpoint 互不影响：
+
+```python
+_source_available = {
+    'big_deal': True,               # akshare 大单
+    'ths_fund_flow': True,          # 同花顺全市场资金流
+    'north_flow': True,             # ASHareHub 北向持仓
+    'lockup': True,                 # 限售解禁
+    'asharehub_moneyflow': True,    # ASHareHub 个股资金流
+    'asharehub_tech_factors': True, # ASHareHub 技术因子
+    'asharehub_concepts': True,     # ASHareHub 概念板块
+    'asharehub_financial': True,    # ASHareHub 财务指标
+}
+```
+
+熔断每 10 分钟自动恢复一次（`_recover_sources()`），网络抖动不会永久禁用源。`big_deal` 和 `north_flow` 的熔断完全独立。
+
+大单缓存只包含当日有大单交易的股票（约 685 只），不是全市场 5205 只。未命中 → 返回 None → 因子降权中性 50 分→ 权重自动分配给其他因子。不需要手动处理。
+
+---
+
+**三大编码铁律**
+
+1. **except 必须 log** — 禁止 `except: pass`，必须 `logger.warning(f"...: {e}")`。已修复 12 处。
+2. **SQLite 必须 try/finally** — `conn = None` → `try:` → `finally: if conn: conn.close()`。已修复 4 处。
+3. **import 必须文件顶部** — 禁止方法体内 `import`，统一放文件顶部。已修复（`ThreadPoolExecutor` / `as_completed`）。
+
+---
+
+**仓库纪律：API Key 安全**
+
+- ASHareHub API Key 通过环境变量 `ASHAREHUB_API_KEY` 传入
+- 禁止写死在代码或配置文件中
+- `config.yml` 不存储任何密钥
+
+---
+
+**权重加载顺序**
 
 ```python
 # 正确 — 从 config.yml 的 weights 段加载
 weights_cfg = config.get('weights', config.get('weights_model'))
-ScoringModel(weights=weights_cfg if weights_cfg else None)
+ScoringModel(weights=weights_cfg if weights_cfg else None, sell_config=config.get('sell', {}))
 
-# 错误 — 永远读不到
-ScoringModel(weights=config.get('weights_model'))  # config.yml 里没有这个键
+# 错误 — weights_model 在 config.yml 里不存在
+ScoringModel(weights=config.get('weights_model'))
 ```
 
-ScoringModel 的权重加载顺序：
-```
-① 构造参数 weights（来自 config.yml 的 weights 段）
-② data/weights/v1.json（优化器写入的）
-③ DEFAULT_WEIGHTS（代码硬编码）
+ScoringModel 权重加载优先级：
+1. `data/weights/v1.json`（优化器写入的，优先于 config 传入）
+2. 构造参数 `weights`（来自 config.yml 的 weights 段）
+3. `DEFAULT_WEIGHTS`（代码硬编码）
 
+如果 v1.json 与 config 不一致，config 权重会被忽略并记录 warning。
 
-请求 K 线 → ① SQLite 缓存查询 (data/cache/kline_cache.db)
-
-## 4. 数据源失效保护 + 熔断机制
-
-### 失效保护
-
-系统已经内置：某个数据源不通时，对应因子中性化为 50 分，权重重分配给其他活跃因子。
-
-**不需要手动处理数据源失败。** 如果看到状态里有 "主力资金流(东方财富): 不可用"，这是正常的——东财在境外网络下被 WAF 挡了，系统会自动降权。
-
-当前确实不通的有：
-- ~~北向资金个股(东财)~~ → ✅ **已解决**：接入 asharehub northbound_holdings，基于持股量变化计算北向增减仓
-- 直连东财 push2 API → 保留代码待以后启用
-
-### 独立数据源级熔断 + 自动恢复
-
-系统使用 `_source_available` 字典实现**数据源级别的独立熔断**，各 endpoint 互不影响。**熔断每 10 分钟自动恢复一次**（`_recover_sources()`），网络抖动不会永久禁用源：
-
-```python
-_source_available = {
-    'big_deal': True,      # stock_fund_flow_big_deal — ✅ 通
-    'capital_flow': True,  # stock_individual_fund_flow — ❌ 不通
-    'north_flow': True,    # northbound_holdings (asharehub) — ✅ 通
-    'push2': True,         # push2 直连 — ❌ 不通
-    'asharehub_moneyflow': True,    # AShareHub 个股资金流
-    'asharehub_tech_factors': True, # AShareHub 技术因子
-    'asharehub_concepts': True,     # AShareHub 概念板块
-    'asharehub_financial': True,    # AShareHub 财务指标
-}
-```
-
-**关键设计：** `big_deal` 和 `north_flow` 的熔断完全独立。北向数据不可用不影响大单缓存。
-
-### 大单缓存覆盖范围
-
-`stock_fund_flow_big_deal()` 只包含**当日有大单交易**的股票（约 685 只），不是全市场 5205 只。如果一只票今天没有大单交易，它就不在缓存里，`get_main_fund_accumulated()` 返回 `None`，`capital_flow` 因子得 50 分中性值。
-
-降级路径：
-1. **大单缓存命中**（685 只）→ 返回真实净流入 → capital_flow 正常评分
-2. **大单缓存未命中**（其余 4520+ 只）→ 返回 None → 因子降权中性 50 分，权重分配给其他因子
-
-**不需要处理——这是正常行为，没有大单交易不意味着没有主力资金，系统会通过权重分配自动补偿。**
+止盈止损值从 `sell_config` 读取（即 `config.yml` 的 `short_term.sell` 段），不再硬编码 2%/2%。
 
 ---
 
-## 5. ASHareHub 日配额管理
+**常见陷阱**
 
-ASHareHub 有 **100 次/天** 的 API 调用上限。4 个 AShareHub endpoint 共享同一个日预算计数器：
-
-| Endpoint | 调用位置 | 用途 |
-|----------|---------|------|
-| `moneyflow` | `_get_capital_flow_asharehub()` | capital_flow 因子优先源 |
-| `technical_factors` | `get_technical_factors_asharehub()` | 双源技术评分校验 |
-| `concept_members` | `get_concept_members()` | hot_theme 三源融合增强 |
-| `financial_indicators` | `get_financial_indicators()` | 长线基本面优先源 |
-
-**消费耗尽后静默返回 None**，等同于该源不可用（独立熔断单元）。第二天自动重置计数器。
-
-三闸齐下：`check_src_available()` → `check_budget()` → `call_api()`。
-
----
-
-## 6. Mootdx 客户端要复用
-
-```python
-# 正确 — 懒加载，复用TCP连接
-if self._mootdx_client is None:
-    self._mootdx_client = Quotes.factory(market='std')
-client = self._mootdx_client
-# 后续调用 ~0.1s/只
-
-# 错误 — 每次都新建连接
-client = Quotes.factory(market='std')  # 每次 ~1.2s TCP握手
-```
+1. **json.loads 不能 ast.literal_eval** — JSON 里的 `true`/`false` 不是 Python 字面量。`optimizer._load_history()` 已修复。
+2. **Optimizer 列缺失填充 0.5** — Ridge 回归时新因子列（如 hot_theme）在旧记录中不存在，自动填 0.5。
+3. **权重坍缩保护** — 单因子 ≥ 80% 跳过优化，防止单一因子主导。
+4. **不要多线程并发东财** — `em_get` 已经是串行的，外层再开线程会被封 IP。
+5. **不要手动改 predictions.db** — SQLite 结构固定，改坏影响权重优化。
+6. **回测不要用 np.random** — 回测引擎已全部用真实 K 线。
+7. **不要同时跑多个策略实例** — mootdx TCP 连接和 SQLite 缓存有状态。
+8. **不要直接调 akshare 东财接口** — 境外网络不通，走大单缓存。
+9. **Config 权重字段名是 `short_term.weights`** — 不是 `short_term.weights_model`。
+10. **Baostock 复权参数** — 回测用 `adjustflag='1'`（后复权），不是 `'2'`（前复权）。
+11. **北向语义** — 回测中北向因子恒定为 50（中性值），因为北向数据不可回溯。
+12. **两状态同步** — 策略退出前调用 `self._save_state()` 保存运行状态。
+13. **CLI 默认日期** — `run_backtest.py --start` 默认 `2026-04-01`，`--end` 默认 `2026-06-27`，与当前季度对齐。
+14. **push2 直连已删除** — 原 `_get_capital_flow_push2()` 方法已移除，不要引用。
+15. **ModelRegistry 已删除** — `core/model_registry.py` 整文件移除（144 行死代码），版本管理通过带时间戳的权重文件实现。
+16. **Optimizer 三段式工作流** — `check_and_report()` 只产出报告不写入 → 审批 → `apply_from_report()` 写入。`maybe_optimize()` 保留但不自动写。
+17. **Optimizer 缓存目录** — `.last_optimize_short` 计数文件在 `data/cache/`，不在 `data/weights/`。
+18. **Tracker UNIQUE 约束** — `predictions(date, code, mode)` 有 UNIQUE 索引，重复插入会抛异常，需用 INSERT OR REPLACE。
+19. **factor_scores JSON 序列化** — `json.dumps(factor_scores, default=str)` 处理 numpy 类型。
+20. **backtest_engine SQLite** — `_load_factor_data()` 连接无 try/finally，需注意（已知遗留，低风险）。
 
 ---
 
-## 7. K 线数据流
-
-```
-请求 K 线 → ① SQLite 缓存查询 (data/kline_cache.db)
-         → ② mootdx TCP 拉取（命中缓存则跳过）
-         → ③ 新浪 HTTP（mootdx 失败时）
-         → ④ baostock（最后降级）
-```
-
-缓存 key 是 `(code, date)`，WAL 模式支持并发读。
-
----
-
-## 8. 运行全流程
+**快速调试命令**
 
 ```bash
 # 完整策略（~4分钟）
 python scripts/eod_stock_picker.py --mode short
 
-# 只看状态
+# 查看状态和近期表现
 python scripts/eod_stock_picker.py --status
 
-# 回测
-python scripts/run_backtest.py --mode short --start 2025-06-01 --end 2026-06-11
+# 回测验证（默认近 3 个月）
+python scripts/run_backtest.py --mode short
+
+# 健康检查（23 项）
+python scripts/verify.py
 ```
-
-全流程耗时分布：
-- 行情拉取 ~46s（腾讯 API 200只/批，不可并行）
-- ASHareHub 配额 ~100 次（约 30s，含 0.3s 间隔限流）
-- 大单缓存 ~0s（首次 ~25s，后续毫秒）
-- K 线 200只 ~25s（mootdx 3线程并行）
-- 板块+龙虎榜 ~15s（em_get 限流）
-- **总计 ~4-5 分钟**，可以在 14:50-15:00 窗口内完成
-
----
-
-## 9. 文件操作规范
-
-| 操作 | 路径 | 说明 |
-|------|------|------|
-| 每日报告 | `data/reports/{mode}_{日期}.md` | 自动生成 |
-| 简报 | `data/reports/{mode}_{日期}_briefing.md` | 带市场概览的完整版 |
-| K 线缓存 | `data/cache/kline_cache.db` | SQLite WAL，可安全删除重建 |
-| 预测追踪 | `data/db/predictions.db` | **保留**，存历史推荐和 T+1 结果。`(date,code,mode)` 唯一约束 |
-| 代码缓存 | `data/cache/codes_cache.json` | 每天刷新一次 |
-| 模型权重 | `data/weights/v1.json` | 优化器输出，自动加载 |
-| 文档 | `docs/` | 参考文档，不影响运行 |
-
----
-
-## 10. 不要做的
-
-- ❌ 不要对东财开多线程/协程并发请求（`em_get` 已经是串行的）
-- ❌ 不要手动改 `data/db/predictions.db`（SQLite 结构固定，改坏会影响权重优化）
-- ❌ 不要在回测里用 `np.random`（回测引擎已全部用真实 K 线）
-- ❌ 不要直接调 `akshare.stock_individual_fund_flow()`（境外网络不通，走大单缓存）
-- ❌ 不要同时跑多个策略实例（mootdx TCP 连接和 SQLite 缓存有状态）
-- ❌ 不要用 `except: pass` 吞异常（必须 `logger.warning` 记录）
-- ❌ 不要内联 `import` 在方法体里（统一放文件顶部）
-- ❌ 不要用 `ast.literal_eval` 解析 JSON（用 `json.loads`，JSON 有 `true`/`false` 不是 Python 字面量）
-
----
-
-## 11. 如果需要调试
 
 ```python
 # 检查所有数据源状态
@@ -204,7 +155,7 @@ de = DataEngine()
 print(de.get_data_source_summary())
 
 # 测试 mootdx K 线
-df = de._fetch_kline_mootdx('600519', '2025-01-01', '2026-06-11')
+df = de._fetch_kline_mootdx('600519', '2026-01-01', '2026-06-27')
 print(f"{len(df)} 条 K 线")
 
 # 测试同花顺热点
@@ -217,12 +168,27 @@ sm = ScoringModel()
 print(sm.get_weights('short'))
 ```
 
-## 12. 已落地的速度优化
+---
 
-| 优化项 | 节省时间 | 状态 |
-|--------|:-------:|:----:|
-| akshare 代码列表本地 JSON 缓存 | 省 ~4s | ✅ 已落地（`data/cache/codes_cache.json`，每天刷新一次） |
-| em_get 限流间隔 1.0s → 0.5s | 板块+龙虎榜省 ~15s | ✅ 已落地（`EM_MIN_INTERVAL = 0.5`） |
-| mootdx TCP 连接复用 | 每只 K 线省 ~1s | ✅ 已落地（`_mootdx_client` 懒加载） |
-| SQLite WAL 模式 | 并发读不阻塞 | ✅ 已落地（`PRAGMA journal_mode=WAL`） |
-| 大单缓存 | 199 次调用毫秒级 | ✅ 已落地（全量加载一次，后续查询 O(1)） |
+**K 线数据流**
+
+```
+请求 K 线 → ① SQLite 缓存查询（data/cache/kline_cache.db）
+         → ② mootdx TCP 拉取（命中缓存则跳过）
+         → ③ 新浪 HTTP（mootdx 失败时）
+         → ④ baostock（最后降级）
+```
+
+缓存 key 是 `(code, date)`，WAL 模式支持并发读。
+
+---
+
+**速度优化已落地**
+
+- akshare 代码列表本地 JSON 缓存（省 ~4s）
+- em_get 限流间隔 1.0s → 0.5s（板块+龙虎榜省 ~15s）
+- mootdx TCP 连接复用（每只 K 线省 ~1s）
+- SQLite WAL 模式（并发读不阻塞）
+- 大单缓存（199 次调用毫秒级）
+
+全流程耗时：行情 ~46s + ASHareHub ~30s + 大单 ~25s（首次） + K 线 ~25s + 板块+龙虎榜 ~15s。总计约 4-5 分钟，可在 14:50-15:00 窗口内完成。

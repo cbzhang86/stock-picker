@@ -1,66 +1,30 @@
 ---
 name: stock-picker
-description: 全栈多因子量化选股系统 — 13直连数据源/30+因子/短线尾盘+长线持股/历史快照回测/自学习权重
+description: 全栈多因子量化选股系统 — 14直连数据源/30+因子/短线尾盘+长线持股/历史快照回测/自学习权重/Ridge三段式优化
 origin: custom
-version: 4.1
+version: 4.2
 ---
 
-# A股智能选股系统 V4.1
+# A股智能选股系统 V4.2
 
-13 个直连数据源 · 30+ 量化因子 · 短线/长线双策略 · 回测引擎（历史快照） · 自学习权重 · 市场环境评估
+14 个直连数据源 · 30+ 量化因子 · 短线/长线双策略 · 回测引擎（历史快照） · Ridge 自学习权重三段式 · 数据源级独立熔断
 
-兼容 [Claude Code](https://github.com/anthropics/claude-code) · [OpenClaw](https://github.com/anthropics/openclaw) · [Codex](https://github.com/openai/codex) · [Hermes](https://github.com/nez/pericles)
-
----
-
-## When to Activate
-
-| 用户说什么 | 触发内容 |
-|-----------|---------|
-| "看一下今天的行情/大盘" | `DataEngine.get_all_quotes()` — 5205只实时快照 |
-| "今天有什么推荐/短线/尾盘" | `ShortTermStrategy.run()` — 7因子评分+仓位分配 |
-| "长线/基本面/中线推荐" | `LongTermStrategy.run()` — ROE+PE基本面评分 |
-| "简报/市场/今天整体怎么样" | `generate_market_briefing()` — 5维度全景简报 |
-| "热点/题材/今天哪些板块走强" | `get_ths_hot_stocks()` — 同花顺强势股+人工标注题材 |
-| "北向/外资流入流出" | `get_north_flow_summary()` — 沪/深实时外资 |
-| "龙虎榜/席位" | `get_dragon_tiger(code)` — 上榜记录+买卖席位TOP5+机构动向 |
-| "板块/概念归属" | `get_stock_blocks(code)` — 行业/概念/地域 |
-| "K线/技术/评分" | `TechnicalScorer.score()` — 6维100分制技术评分 |
-| "财务/ROE/EPS" | `get_financial_snapshot(code)` — mootdx 37字段 |
-| "基本面/估值" | `FactorLibrary.calc_fundamental_score()` / `calc_valuation_score()` |
-| "回测/验证/历史表现" | `BacktestEngine.run()` — 真实K线逐日模拟 |
-| "回测历史/对比回测" | `BacktestStore.list_runs()` / `compare_runs()` — 版本对比 |
-| "状态/模型/权重" | `scripts/eod_stock_picker.py --status` |
+兼容 Claude Code · OpenClaw · Codex · Hermes
 
 ---
 
-## Prerequisites
+**项目路径**
+
+- 工作目录：`C:\Users\Administrator\Documents\stock-picker`
+- Python 执行路径：`C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python.exe`
+- 配置文件：`config.yml`
+- AI 技能文件：`SKILL.md`
+- 使用备忘录：`CHEATSHEET.md`
+
+**快速命令表**
 
 ```bash
-pip install mootdx requests pandas numpy scikit-learn cachetools akshare pyyaml asharehub
-```
-
-| 依赖 | 用途 |
-|------|------|
-| mootdx >= 0.10 | 通达信TCP行情（K线+财务快照，永不封IP） |
-| asharehub | 个股北向持仓数据（需免费API key） |
-| scikit-learn | Ridge回归权重自学习 |
-| akshare | 仅用于A股代码列表和大单数据 |
-| 其余 | HTTP请求/数据处理/缓存/配置 |
-
-### 环境变量
-
-```bash
-# AShareHub API key（免费申请：https://asharehub.com/console/register）
-export ASHAREHUB_API_KEY="ash_your_key_here"
-```
-
----
-
-## 快速使用
-
-```bash
-# 短线策略（含完整数据源简报）
+# 短线策略（全流程 ~4 分钟）
 python scripts/eod_stock_picker.py --mode short
 
 # 查看状态和近期表现
@@ -69,295 +33,215 @@ python scripts/eod_stock_picker.py --status
 # 长线策略
 python scripts/eod_stock_picker.py --mode long
 
-# 回测
-python scripts/run_backtest.py --mode short --start 2026-01-01 --end 2026-06-11
+# 回测验证（默认近 3 个月 2026-04-01 ~ 2026-06-27）
+python scripts/run_backtest.py --mode short
 
-# 回测版本对比
+# 指定区间回测
+python scripts/run_backtest.py --mode short --start 2026-01-01 --end 2026-06-27
+
+# 回测版本查看 / 对比
 python scripts/run_backtest.py --list
 python scripts/run_backtest.py --compare 1 2
-```
 
-```python
-# 一键调用（给AI助手用）
-import sys; sys.path.insert(0, '/path/to/stock-picker')
-from core.data_engine import DataEngine
-from strategies.short_term import ShortTermStrategy
-from reports.market_briefing import generate_market_briefing
-from core.technical_scorer import TechnicalScorer
+# K 线因子专项回测（仅量价+动量+技术）
+python scripts/run_backtest.py --mode kfactor --start 2026-01-01 --end 2026-06-27
 
-de = DataEngine()
-quotes = de.get_all_quotes()
-hot = de.get_ths_hot_stocks()
-north = de.get_north_flow_summary()
-blocks = de.get_stock_blocks('600519')
-dt = de.get_dragon_tiger('002475')
-fin = de.get_financial_snapshot('600519')
-kline = de.get_kline('600519')
-tech = TechnicalScorer().score(kline)
-recs = ShortTermStrategy({'buy': {'max_candidates': 3}}).run()
-briefing = generate_market_briefing(recs)
+# 健康检查 23 项
+python scripts/verify.py
+
+# 权重优化（仅报告，不写入）
+python -c "from feedback.optimizer import WeightsOptimizer; from feedback.tracker import PredictionTracker; import yaml; cfg = yaml.safe_load(open('config.yml')); t = PredictionTracker(); o = WeightsOptimizer(); r = o.check_and_report(t, cfg.get('weights',{}), 'short'); print(r['summary'])"
 ```
 
 ---
 
-## 系统架构
+**飞书格式铁律（每条消息前自检）**
+
+1. **禁止 `|` 符号** — 飞书表格降级成纯文本，不用表格线
+2. **禁止 `###` `####` 标题** — 用 `**粗体**` 替代
+3. **禁止报告体开头** — 不要 "以下是..." / "下面展示..." / "为您生成..."，直接输出内容
+4. **每段 emoji 不超过 2 个** — 保持克制
+5. **段落用 `---` 分隔** — 保持阅读节奏
+6. **列表用数字 / 无序列表** — 不用表格
+7. **代码块用 ` ``` ` 包裹**
+
+---
+
+**因子架构表（7 因子 + risk）**
+
+- **capital_flow 主力资金流 25%** — ASHareHub moneyflow → 大单缓存 → 同花顺全市场。独立熔断，日配额共享。评分方式：净流入横截面百分位排名。
+- **momentum 动量/RPS 25%** — 全市场涨幅排位计算，20 日百分位映射 0-100。无数据源依赖，从 K 线计算。
+- **technical 技术形态 15%** — mootdx K 线 6 维评分（趋势 30 + 乖离 20 + 量能 15 + 支撑 10 + MACD 15 + RSI 10）。ASHareHub technical 双源校验。
+- **volume_price 量价配合 10%** — 量比 + 尾盘成交结构，0.8~2.0 = 80 分。
+- **north_flow 北向资金 10%** — ASHareHub northbound_holdings，持股量变化（股数）计算增减仓方向。独立熔断，日配额共享。回测中恒定为 50 分。
+- **hot_theme 同花顺热点 10%** — 10jqka 强势股 + 题材归因（列格式 "算力租赁+Token工厂+AI政务"）。三源融合（同花顺 + 东财 + ASHareHub concepts）。
+- **dragon_tiger 龙虎榜 5%** — 东财 datacenter，上榜 + 机构净买入为正。em_get 限流。
+- **risk 风险（过滤层，不占权重）** — risk_filter.py 前置拦截 ST / 涨跌停封死 / 流动性不足 / 换手率异常。剩余软风险由 scoring_model 的 penalty 路径在总分上额外扣减。
+
+**数据源熔断状态（当前）**
+
+- `big_deal` — 通
+- `ths_fund_flow` — 通
+- `north_flow` — 通（asharehub）
+- `lockup` — 通
+- `asharehub_moneyflow` — 通
+- `asharehub_tech_factors` — 通
+- `asharehub_concepts` — 通
+- `asharehub_financial` — 通
+
+**ASHareHub 4 端共享日配额 100 次**，用满静默降级，独立熔断。熔断每 10 分钟自动恢复。
+
+---
+
+**审计框架**
+
+**业务 4 层**
+
+1. **数据层** — 14 源统一接入 → 独立熔断 → SQLite WAL 缓存 → 失效降级
+   - 检查点：mootdx TCP 连接是否复用、em_get 是否串行、ASHareHub 配额是否监控、缓存是否命中
+2. **策略层** — 初筛 → 预评分 → 详评 → 评分 → 仓位分配
+   - 检查点：市场评估是否跳过、预过滤条件是否合理、防凑数是否生效、极差市是否输出简报
+3. **回测层** — 历史快照 → 逐日回放 → 真实 K 线收益 → 仓位模拟 → 因子 IC
+   - 检查点：是否用真实 K 线而非 np.random、是否用历史当日行情而非今日数据、sell_config 是否从 config 读取
+4. **反馈层** — 推荐入库 → 回填收益 → Ridge 优化 → 审批写入
+   - 检查点：三段式是否合规（只报告不自动写）、坍缩保护是否触发、新鲜度检查是否通过、ast.literal_eval 是否已替换为 json.loads
+
+**工程 3 维**
+
+1. **代码规范** — except 必须 log / SQLite 必须 try/finally / import 必须文件顶部 / 禁止方法体内 import
+2. **配置规范** — config.yml 权重段必须 `short_term.weights` / API Key 必须环境变量 / sell 参数必须从 config 读取而非硬编码
+3. **文档规范** — 飞书格式铁律 / 文档与代码同步更新 / 陷阱编号可追溯
+
+---
+
+**回测与优化器的关系**
+
+**回测能验证的（量价 + 动量 + 技术因子）**
+
+- `volume_price` / `momentum` / `technical` 从历史 K 线重新计算，在回测中有真实方差
+- IC 信息系数 > 0.03 视为有效信号
+- 仓位模拟：按 PortfolioOptimizer 分配比例，T+1 开盘买 / 收盘卖，含滑点万十 + 佣金万三
+
+**回测不能验证的（资金流 + 北向 + 热点 + 龙虎榜）**
+
+- 这些因子在回测期间没有真实历史数据，恒定为中性 50 分
+- 赢单/输单分差趋近于零，IC 接近零——这不代表因子无效，是数据条件下的必然
+- 这些因子的有效性通过优化器从实盘收益学习验证
+
+**优化器的工作**
+
+- 积累 >= 60 条有 T+1 结果的推荐后触发
+- 用 Ridge 回归将因子原始得分映射到实际收益率
+- RI 系数 → 归一化新权重（负系数截断为 0）
+- 三段式：`check_and_report()` → 审批 → `apply_from_report()`
+- 不自动写入，只产出报告供人工审批
+
+**最佳实践**：先用默认权重跑实盘积累记录 → 让 Ridge 回归纳一化调整 → 审批后 apply → 下次回测对比效果。
+
+---
+
+**代码改动纪律（三步走）**
+
+1. **审** — 先读目标文件全文，理解现有逻辑和数据流，搜索相关引用
+2. **改** — 最小改动原则：改函数不改架构，除非有明确重构需求
+3. **验** — 改后跑一次完整流程验证不报错
+
+**禁止的改动模式**
+
+- 不要修改 `predictions.db` 的 SQLite 结构——那是优化器的数据来源
+- 不要给东财开多线程/协程并发——`em_get` 已经是串行的
+- 不要在策略层硬编码止盈止损值——必须从 `config.yml sell` 段读取
+- 不要在回测里用 `np.random`——必须用真实 K 线
+- 不要手动改权重文件——通过优化器三段式流程
+- 不要在方法体内写 `import`——统一放文件顶部
+
+---
+
+**所有常见陷阱（编号 1-22）**
+
+1. **json.loads 不能 ast.literal_eval** — JSON 的 `true`/`false` 不是 Python 字面量。`optimizer._load_history()` 已修复。
+2. **Optimizer 列缺失填充 0.5** — Ridge 回归时新因子列（如 hot_theme）在旧记录中不存在，自动填 0.5。
+3. **权重坍缩保护** — 单因子 ≥ 80% 跳过优化，防止单一因子主导。
+4. **不要多线程并发东财** — `em_get` 已经是串行的。
+5. **不要手动改 predictions.db** — SQLite 结构固定。
+6. **回测不要用 np.random** — 必须用真实 K 线。
+7. **不要同时跑多个策略实例** — mootdx TCP 和 SQLite 缓存有状态。
+8. **不要直接调 akshare 东财接口** — 境外网络不通，走大单缓存。
+9. **Config 权重字段名** — `short_term.weights`，不是 `short_term.weights_model`。
+10. **Baostock 复权参数** — 回测用 `adjustflag='1'`（后复权），不是 `'2'`（前复权）。
+11. **北向回测语义** — 回测中北向因子恒定为 50（中性值），因北向数据不可回溯。
+12. **两状态同步** — 策略退出前调用 `self._save_state()` 保存运行状态。
+13. **CLI 默认日期** — `run_backtest.py --start` 默认 `2026-04-01`，`--end` 默认 `2026-06-27`。
+14. **push2 直连已删除** — `_get_capital_flow_push2()` 方法已移除。`push2.eastmoney.com` 仅存在于板块归属 URL 中（走 em_get 限流），不是数据源。
+15. **ModelRegistry 已删除** — `core/model_registry.py` 整文件移除（144 行死代码），版本管理通过带时间戳的权重文件实现。
+16. **Optimizer 三段式工作流** — `check_and_report()` 只产出报告不写入 → 审批 → `apply_from_report()` 写入。`maybe_optimize()` 保留原签名但降级为只报告。
+17. **Optimizer 缓存目录** — `.last_optimize_short` 计数文件在 `data/cache/`，不在 `data/weights/`。
+18. **Tracker UNIQUE 约束** — `predictions(date, code, mode)` 有 UNIQUE 索引，重复插入会抛异常。
+19. **factor_scores JSON 序列化** — `json.dumps(factor_scores, default=str)` 处理 numpy 类型。
+20. **backtest_engine SQLite** — `_load_factor_data()` 连接无 try/finally（已知遗留，低风险）。
+21. **ScoringModel 权重加载顺序** — v1.json > config 传入 > DEFAULT_WEIGHTS。v1.json 存在时 config 权重被忽略并记录 warning。
+22. **止盈止损从 config 读取** — `sell_config` 参数传入 ScoringModel，`short_term.sell.take_profit` / `stop_loss`，不再硬编码。
+
+---
+
+**数据状态（截至 2026-06-27）**
+
+**最新回测成绩（2026-04-01 ~ 2026-06-27）**
+
+- 总交易次数：95 次
+- 胜率：57.9%
+- 平均收益 T+1：+1.63%
+- 平均收益 T+5：+5.87%
+- 最大回撤：-13.93%
+- 夏普比率：4.36
+- 策略收益：+62.50%（vs 沪深 300 +7.56%）
+- 超额收益：+54.94%
+
+**因子 IC（近 3 个月回测）**
+
+- `volume_price` — IC +0.1202 / 强有效
+- `technical` — IC +0.0916 / 强有效
+- `hot_theme` — IC -0.0394 / 反向
+- `momentum` — IC -0.0382 / 反向
+- `dragon_tiger` — IC -0.0076 / 噪声
+
+**系统运行状态**
+
+- K 线缓存：4483 只股票，2025-06 至 2026-06
+- 大单缓存：685 只每日更新
+- 同花顺资金流：5189 只全量缓存
+- 代码列表缓存：5205 只
+- 回测版本：最新为 `backtest_final_audit.md`（95 笔，57.9% 胜率）
+
+---
+
+**策略运行时序**
 
 ```
-stock-picker/                13个数据源 · 30+因子 · 短线/长线双策略
-├── core/                    核心引擎
-│   ├── data_engine.py       多源数据融合 (mootdx/腾讯/同花顺/东财)
-│   ├── factor_library.py    30+量化因子计算
-│   ├── scoring_model.py     加权评分 + 评级 + 权重自学习
-│   ├── technical_scorer.py  6维系统化技术评分 (100分制)
-│   ├── risk_filter.py       风险过滤器
-│   ├── backtest_engine.py   回测引擎 (历史快照+真实K线)
-│   ├── backtest_store.py    回测结果持久化+版本对比
-│   └── portfolio_optimizer.py  仓位分配 (评分加权)
-├── strategies/
-│   ├── short_term.py        短线尾盘策略 (7因子+市场评估)
-│   ├── long_term.py         长线持股策略 (ROE+PE基本面)
-│   ├── sequoia_patterns.py  9种K线形态识别
-│   └── base.py
-├── reports/
-│   ├── market_briefing.py   每日市场简报
-│   ├── backtest_report.py   回测报告 + 每日报告
-│   └── daily_report.py      报告存储
-├── feedback/
-│   ├── tracker.py           预测追踪 (SQLite)
-│   └── optimizer.py         权重优化 (Ridge+常数列跳过)
-├── scripts/
-│   ├── eod_stock_picker.py  用户入口
-│   └── run_backtest.py      回测入口 (含--list/--compare)
-├── config.yml               核心配置
-├── SKILL.md                 AI助手技能文件
-└── data/                    运行时数据 (自动创建)
+14:50 启动
+  ├── get_all_codes()        0.001s
+  ├── get_all_quotes()       ~46s
+  ├── get_ths_hot_stocks()   ~0.22s
+  ├── _prefilter()           ~0.5s
+  ├── 5维预评分              ~0.3s
+  ├── get_main_fund()        ~25s（首次）/ 毫秒（有缓存）
+  ├── get_kline() × 200      ~25s（3线程并行）
+  ├── RPS 排名               ~0.1s
+  ├── scoring_model.score()  ~0.2s
+  ├── portfolio_optimizer    ~0.05s
+  ├── 板块 + 龙虎榜（Top 3） ~8s（em_get 限流）
+  └── 输出简报               15:00 前完成
 ```
 
 ---
 
-## 数据层
+**数据源优先级速查**
 
-### 全市场实时行情（5205只）
+1. **mootdx TCP 7709** — K线 + 财务，永不封 IP，~0.1s/只
+2. **腾讯财经 HTTP** — 实时行情 5205 只，不封 IP，~46s
+3. **同花顺 10jqka** — 强势股 + 题材，零鉴权 73ms
+4. **hexin.cn** — 北向汇总，零鉴权
+5. **ASHareHub** — 北向持仓 / 资金流 / 技术 / 概念 / 财务，100次/天
+6. **东财 em_get** — 板块归属 / 龙虎榜，限流
 
-```python
-de = DataEngine()
-quotes = de.get_all_quotes()
-up = (quotes['pct_chg'] > 0).sum()
-top_volume = quotes.nlargest(10, 'amount')[['code','name','price','pct_chg','amount']]
-```
-
-**耗时**: ~7s（腾讯财经 HTTP，不封IP）
-
-### 个股日K线
-
-```python
-kline = de.get_kline('600519')  # 自动缓存到 SQLite
-```
-
-**数据源**: mootdx TCP ~0.007s/只 → Sina HTTP ~0.2s/只 → baostock ~8s/只（降级）
-首次拉取约 0.1s，缓存命中后 0.007s。
-
-### 同花顺强势股 + 题材归因
-
-```python
-hot_df = de.get_ths_hot_stocks()         # ~0.3秒, 零鉴权
-themes = de.extract_hot_themes(hot_df)   # 词频统计
-# 题材列格式: "算力租赁+Token工厂+AI政务"
-```
-
-### 主力资金流（同花顺全市场5189只）
-
-```python
-val = de.get_main_fund_accumulated('600519')
-# 首次调用拉取全量5189只（~19s），后续毫秒级查询
-```
-
-### 其他数据
-
-| 接口 | 函数 | 来源 | 耗时 |
-|------|------|------|------|
-| 北向资金汇总 | `get_north_flow_summary()` | hexin.cn | ~2.3s |
-| 板块归属 | `get_stock_blocks(code)` | 东财slist（限流） | ~2.3s/只 |
-| 龙虎榜 | `get_dragon_tiger(code)` | 东财datacenter（限流） | ~6s/只 |
-| 财务快照 | `get_financial_snapshot(code)` | mootdx | ~0.1s/只 |
-| 数据源状态 | `get_data_source_summary()` | 自追踪 | 立即 |
-| 尾盘成交信号 | `get_tail_end_stats(code)` | 大单缓存 | 立即（0额外API） |
-
----
-
-## 策略层
-
-### 短线尾盘（7因子，评分加权）
-
-```
-5205只 → 市场评估 → 初筛 → 预评分 → Top200详评 → 评分 → 仓位分配 → 板块/龙虎榜补充
-```
-
-| 因子 | 权重 | 数据源 | 评分方式 |
-|------|:----:|--------|---------|
-| 主力资金流 | 25% | 同花顺全市场 | 横截面百分位排名（避免全员满分） |
-| 动量/RPS | 25% | 全市场涨幅排位 | 20日百分位 |
-| 技术形态 | 15% | mootdx K线 | 6维100分制: 趋势30+乖离20+量能15+支撑10+MACD15+RSI10 |
-| 量价配合 | 10% | 量比+尾盘结构 | 连续分段线性评分 |
-| 题材热度 | 10% | 同花顺热点 | 强势股+题材归因标签 |
-| 北向资金 | 10% | asharehub个股持仓 | 持股量变化（正=加仓） |
-| 龙虎榜 | 5% | 东财datacenter | 上榜+机构净买入 |
-
-**市场环境评估**: 涨跌比(30%)+涨停跌停比(25%)+中位数涨幅(20%)+强势股数(15%)+北向(10%) → 极差市(<40)/弱市(40-55)/中性/强市。极差市跳过推荐输出简报，弱市最多推荐2只、min_score提至65。
-
-```python
-from strategies.short_term import ShortTermStrategy
-st = ShortTermStrategy({'buy': {'max_candidates': 3, 'min_score': 60}})
-recs = st.run()
-for r in recs:
-    print(f"{r['code']} {r['name']}: {r['score']}/100 | 仓位{r.get('allocation_pct',0)}%")
-    print(f"  因子: {r['breakdown']}")
-    print(f"  板块: {r.get('blocks',{}).get('concept_tags',[])}")
-```
-
-### 长线持股（5因子）
-
-```python
-from strategies.long_term import LongTermStrategy
-st = LongTermStrategy({'buy': {'max_candidates': 5, 'min_score': 50}})
-recs = st.run()
-for r in recs:
-    print(f"{r['code']} {r['name']}: {r['score']}/100 | 仓位{r.get('allocation_pct',0)}%")
-    if r.get('roe'): print(f"  ROE={r['roe']:.1f}% EPS={r['eps']:.2f}")
-```
-
-**因子**: 基本面(ROE+PE+市值)30% + 北向20% + 估值(PE分位+PB)20% + 机构关注度15% + 动量15%
-
----
-
-## 因子库
-
-### 基本面因子
-
-```python
-from core.factor_library import FactorLibrary
-fl = FactorLibrary()
-
-# 基本面评分 (0-100)
-fs = fl.calc_fundamental_score(pe=12, pb=1.5, roe=18, eps=2.5, mcap=1e11)
-# ROE≥20 +20, 15-20 +15; PE<15+PB<3 +10; 千亿+5
-
-# 估值评分 (0-100)
-vs = fl.calc_valuation_score(pe=12, pb=1.5, roe=18)
-# PE<10 +30, <15 +20; PB合理+PE低 +10; 高ROE+低PE +10
-
-# 机构关注度 (0-100) — 无数据返回50
-inst = fl.calc_institutional_score(
-    {'institution': {'net_amt': 8000}, 'records': [{}]}, main_fund=1e7)
-```
-
-### 技术评分
-
-```python
-from core.technical_scorer import TechnicalScorer
-result = TechnicalScorer().score(kline)
-# result.total: 0-100
-# result.signal: STRONG_BUY / BUY / HOLD / WAIT / SELL
-```
-
----
-
-## 组合优化
-
-```python
-from core.portfolio_optimizer import PortfolioOptimizer
-recs = [{'code': 'A', 'name': 'A', 'score': 85},
-        {'code': 'B', 'name': 'B', 'score': 72}]
-result = PortfolioOptimizer.allocate(recs)
-# 每只增加 allocation_pct 字段，单只上限40%/保底10%，总和100%
-```
-
----
-
-## 回测
-
-### 核心做法
-
-1. 用 mootdx 真实 K 线构建每交易日的**历史行情快照**（非今日实时数据）
-2. 逐日回放：取历史快照 → 跑策略 → 记录推荐
-3. 每条推荐查询 T+1/T+5 真实 K 线收益
-
-**与前视偏差的关键区别**：快照数据来自历史当日收盘价，不是今天的数据。
-
-### 限制
-
-- 资金流/北向不可回溯（当日大单不可用），回测仅用量价+技术因子
-- mootdx 提供约 600 交易日（约 2.5 年）
-- 以次日开盘价成交，无法模拟盘中即时
-
-```python
-from core.backtest_engine import BacktestEngine
-from reports.backtest_report import generate_backtest_report
-
-result = BacktestEngine({
-    'initial_capital': 1_000_000,
-    'commission_rate': 0.0003,
-    'slippage': 0.001,
-}).run(mode='short', start_date='2026-01-01', end_date='2026-06-11')
-
-print(generate_backtest_report(result))
-# 胜率/平均收益/夏普/回撤/权益曲线/月度表现/因子IC归因/交易明细
-```
-
-### 版本对比
-
-```python
-from core.backtest_store import BacktestStore
-store = BacktestStore()
-runs = store.list_runs(10)    # 查看历史记录
-diff = store.compare_runs(1, 2)  # 对比两次结果
-```
-
----
-
-## 数据源
-
-| 数据 | 来源 | 协议 | 封IP风险 | 熔断 |
-|------|------|:----:|:--------:|:----:|
-| K线+财务 | mootdx | TCP 7709 | 永不封 | — |
-| 实时行情 | 腾讯财经 | HTTP | 不封 | — |
-| 同花顺热点 | 10jqka | HTTP | 极低 | — |
-| 北向资金 | hexin.cn | HTTP | 极低 | — |
-| 主力资金流 | 同花顺 | HTTP | 低 | 独立 |
-| 板块归属 | 东财slist | HTTP(限流) | 低 | — |
-| 龙虎榜 | 东财datacenter | HTTP(限流) | 低 | — |
-| 个股北向 | asharehub | HTTPS | ✅ 已通（需ASHAREHUB_API_KEY） | 独立 |
-
-**独立熔断机制**：每个数据源互不影响。个股北向不通不影响大单缓存，东财不通不影响同花顺。被熔断的因子自动中性化为50分，权重重分配给其他因子。
-
----
-
-## FAQ
-
-**全流程要多久？**  
-当前约7分钟：行情~7s + 同花顺资金流~19s + K线并行~25s + 其他。缓存预热后二次运行更快。
-
-**数据源被封怎么办？**  
-系统自动降权。数据源级别独立熔断，互不影响。因子自动中性化为50分，权重分配给其他因子，评分不压缩。
-
-**回测可信吗？**  
-回测已消除前视偏差（使用历史当日快照而非今日数据），T+1收益用真实K线计算。但资金流/北向不可回溯，回测中这些因子恒定为50分。回测与实盘可能有偏差。
-
-**权重怎么调？**  
-先用默认权重跑实盘积累记录（当前已有93条），让Ridge回归自动优化。手动调权重后通过`--compare`对比效果。
-
-**历史快照包含哪些股票？**  
-kline_cache.db缓存了4483只股票、2025-06-03至2026-06-25的K线数据。5205只中约800只新股/退市/无数据，回测中自动跳过。
-
----
-
-## 数据状态（截至2026-06-25）
-
-| 指标 | 数据 |
-|------|------|
-| 实盘推荐记录 | 93条（短线88条，长线5条） |
-| K线缓存 | 4483只，2025-06至2026-06 |
-| 同花顺资金流 | 5189只全量缓存 |
-| 大单缓存 | 685只每日更新 |
-| 熔断状态 | big_deal✅ ths_fund_flow✅ north_flow✅ |
-| 权重优化触发 | 需30条（当前88短线）→ **已满足触发条件** |
+铁律：K 线不要走 baostock（~8s/只），用 mootdx TCP（~0.1s/只）。
