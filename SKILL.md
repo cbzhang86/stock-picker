@@ -211,7 +211,7 @@ python -c "from feedback.optimizer import WeightsOptimizer; from feedback.tracke
 - 大单缓存：685 只每日更新
 - 同花顺资金流：5189 只全量缓存
 - 代码列表缓存：5205 只
-- 回测版本：最新为 `backtest_final_audit.md`（95 笔，57.9% 胜率）
+- 回测版本：最新为 v2（95 笔，57.9% 胜率）
 
 ---
 

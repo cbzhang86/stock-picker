@@ -1,26 +1,40 @@
-<div align="center">
-
 # 🏛️ A-Share Stock Picker
+
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Compatible with](https://img.shields.io/badge/Claude%20Code-Skill-8A2BE2)](SKILL.md)
 
 **Stock-Picker V4 — Full-Stack Multi-Factor Quantitative Stock Selection Framework**
 
 14 Direct Data Sources · 30+ Factors · Short-Term + Long-Term Strategies · Real K-Line Backtest Engine · Ridge Self-Learning Weight Optimization
 
-**English** · [简体中文](README.md)
-
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/) [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE) [![Compatible with](https://img.shields.io/badge/Claude%20Code-OpenClaw-Hermes-8A2BE2)](SKILL.md)
-
-</div>
+[简体中文](README.md) · [English](README.en.md)
 
 ---
 
-**Introduction**
+## Table of Contents
+
+- [Introduction](#introduction)
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Short-Term Strategy](#short-term-strategy)
+- [Backtest Engine](#backtest-engine)
+- [Weight Self-Learning](#weight-self-learning)
+- [System Architecture](#system-architecture)
+- [Data Sources](#data-sources)
+- [AI Assistant Integration](#ai-assistant-integration)
+- [Acknowledgments](#acknowledgments)
+- [License](#license)
+
+---
+
+## Introduction
 
 Stock-Picker is a full-stack quantitative stock selection system for the Chinese A-share market, covering the complete closed loop from data acquisition, factor computation, strategy scoring to backtest validation.
 
 Three core problems of A-share quantitative investing:
 
-- **Scattered data sources** — quotes, capital flow, dragon-tiger list, north-bound flow are on different platforms
+- **Scattered data sources** — quotes, capital flow, dragon-tiger list, north-bound flow are on 14 different platforms
 - **API blocking** — East Money's WAF blocks non-browser HTTP requests
 - **Hard to validate** — lack of real historical data for proper backtesting
 
@@ -32,9 +46,9 @@ Solved by:
 
 ---
 
-**Features**
+## Features
 
-**📊 Data — 14 Sources Unified**
+### 📊 Data — 14 Sources Unified
 
 - **mootdx TCP** — K-line + financial snapshots (37 fields), never banned, ~0.1s/stock
 - **Tencent Finance HTTP** — 5205 stocks real-time quotes, never banned, ~46s
@@ -45,9 +59,9 @@ Solved by:
 - **akshare** — big-deal capital flow / stock code list
 - **Independent fuses** — per-source, auto-recover after 10 minutes
 
-**🧠 Strategy**
+### 🧠 Strategy
 
-1. **Short-Term EOD** — 7-factor scoring + market assessment → prefilter → Top 200 deep evaluation → position allocation. Auto-skip on extremely weak markets.
+1. **Short-Term EOD** — 7-factor scoring + market assessment → prefilter → Top 200 deep evaluation → position allocation. Auto-skip on extremely weak markets
 2. **Long-Term Holding** — ROE + PE + PB fundamental scoring, 3-6 month holding period
 3. **Market Environment** — advance/decline ratio / limit-up-down ratio / median gain / hot stock count / north-bound flow → composite score
 4. **Technical Scoring** — 6-dimension: Trend 30 + Bias 20 + Volume 15 + Support 10 + MACD 15 + RSI 10
@@ -55,7 +69,7 @@ Solved by:
 6. **Portfolio Optimization** — score-weighted position allocation, max 40% per stock, min 10% floor
 7. **Anti-Overfitting** — trims tail if 3rd-place is 20+ points below 1st
 
-**🔄 Self-Learning Feedback Loop**
+### 🔄 Self-Learning Feedback Loop
 
 1. SQLite persists every recommendation with 7-factor breakdown
 2. Auto backfill T+1/T+5/T+20 realized returns
@@ -67,14 +81,14 @@ Solved by:
 
 ---
 
-**Quick Start**
+## Quick Start
 
-**Requirements**
+### Requirements
 
 - Python 3.10+, Windows / Linux / macOS
 - Network: works both inside and outside China (mootdx TCP and Tencent API are globally accessible)
 
-**Installation**
+### Installation
 
 ```bash
 git clone https://github.com/cbzhang86/stock-picker.git
@@ -85,7 +99,7 @@ pip install -r requirements.txt
 export ASHAREHUB_API_KEY="ash_your_key_here"
 ```
 
-**First Run**
+### First Run
 
 ```bash
 python scripts/eod_stock_picker.py --mode short
@@ -93,7 +107,7 @@ python scripts/eod_stock_picker.py --mode short
 
 You'll see: 5205 stock codes → full market quotes → Tonghuashun hot stocks → prefilter → preliminary scoring → Top 200 deep evaluation → big-deal cache → final recommendations. About 4 minutes later, the daily briefing is output with market overview, theme heat TOP10, short-term rankings, long-term picks.
 
-**Other Commands**
+### Other Commands
 
 ```bash
 # View model status
@@ -115,7 +129,92 @@ python scripts/verify.py
 
 ---
 
-**System Architecture**
+## Short-Term Strategy
+
+### Pipeline
+
+| Step | Operation | Time |
+|------|-----------|------|
+| 1 | `get_all_codes()` — read code cache | 0.001s |
+| 2 | `get_all_quotes()` — Tencent API 5205 stocks | ~46s |
+| 3 | `get_ths_hot_stocks()` — Tonghuashun hot stocks + themes | ~0.22s |
+| 4 | `_prefilter()` — remove ST/low-volume/limit-up-down | ~0.5s |
+| 5 | 5-dim preliminary → Top 200 | ~0.3s |
+| 6 | `get_main_fund()` — big-deal fund flow cache | ~25s |
+| 7 | `get_kline()` × 200 — mootdx TCP 3-thread parallel | ~25s |
+| 8 | Cross-sectional RPS ranking | ~0.1s |
+| 9 | `scoring_model.score()` — 7-factor weighted + gap check | ~0.2s |
+| 10 | `portfolio_optimizer` — score-weighted allocation | ~0.05s |
+| 11 | Sector + dragon-tiger for Top 3 | ~8s |
+| 12 | Output briefing + save report | before 15:00 |
+
+### Factor Weights
+
+| Factor | Weight | Data Source | Logic |
+|--------|--------|-------------|-------|
+| Capital Flow | 25% | Big deal / ASHareHub / THS | Cross-sectional percentile ranking |
+| Momentum/RPS | 25% | Market-wide percentile | 20-day return → 0-100 |
+| Technical | 15% | mootdx K-line 6-dim | Trend 30 + Bias 20 + Volume 15 + Support 10 + MACD 15 + RSI 10 |
+| Volume-Price | 10% | Volume ratio + tail structure | 0.8~2.0 = 80pt |
+| North-bound | 10% | hexin.cn / asharehub | Shareholding volume change direction |
+| Hot Theme | 10% | 10jqka hot stocks | In hot list + has theme tags |
+| Dragon-Tiger | 5% | East Money datacenter | Listed + institution net buy > 0 |
+| Risk | filter | risk_filter.py | Blocks severe risks, no weight |
+
+---
+
+## Backtest Engine
+
+### Core Characteristics
+
+1. **Data** — mootdx real K-line, zero `np.random`, no look-ahead bias
+2. **Execution** — next day open price
+3. **Slippage** — 0.1% (configurable)
+4. **Commission** — 0.03% (configurable)
+5. **Trading Rules** — T+1 take-profit +2%, stop-loss -2% (from `config.yml sell`), T+3 time stop
+6. **Position Simulation** — by `allocation_pct`, daily T+1 buy open / sell close
+7. **Benchmark** — CSI 300
+
+### Latest Backtest (2026-04-01 ~ 2026-06-27)
+
+| Metric | Value |
+|--------|-------|
+| Total trades | 95 |
+| Win rate | 57.9% |
+| Avg T+1 return | +1.63% |
+| Avg T+5 return | +5.87% |
+| Max drawdown | -13.93% |
+| Sharpe ratio | 4.36 |
+| Strategy return | +62.50% |
+| CSI 300 | +7.56% |
+| Excess return | +54.94% |
+
+### Known Limitations
+
+- Capital flow / themes / dragon-tiger / north-bound data are not available in backtest (no historical snapshots)
+- mootdx covers ~600 trading days (~2.5 years)
+- Uses next-day open price, cannot simulate intraday fills
+
+---
+
+## Weight Self-Learning
+
+Live run → auto backfill T+1 → 60+ records → Ridge regression → factor variance audit → collapse check → new weights → `v1.json`
+
+### Optimizer (`feedback/optimizer.py`)
+
+- **Algorithm**: `sklearn.linear_model.Ridge(alpha=1.0)`
+- **Input**: factor raw scores → actual T+1 returns
+- **Output**: normalized weights (negative → 0, positive → sum 1)
+- **Trigger**: win rate < 50% or 50+ new records since last optimization
+- **Collapse protection**: skip if single factor ≥ 80%
+- **Missing columns**: auto-fill 0.5
+- **3-stage workflow**: `check_and_report()` → approval → `apply_from_report()`
+- **Version tracking**: old versions in `data/weights/` (timestamped)
+
+---
+
+## System Architecture
 
 ```
 stock-picker/
@@ -136,24 +235,22 @@ stock-picker/
 │   └── base.py                    Abstract strategy base class
 │
 ├── reports/                       Report Layer
-│   ├── market_briefing.py         Daily market briefing generator (5 sections)
+│   ├── market_briefing.py         Daily market briefing generator
 │   ├── backtest_report.py         Backtest report + daily recommendation rendering
 │   └── daily_report.py            Markdown report file I/O
 │
 ├── feedback/                      Feedback Loop
-│   ├── tracker.py                 SQLite prediction tracking (predictions + outcomes)
-│   ├── optimizer.py               Ridge regression weight optimizer (3-stage workflow)
+│   ├── tracker.py                 SQLite prediction tracking
+│   ├── optimizer.py               Ridge regression weight optimizer
 │   └── data_collector.py          Factor warehouse (daily snapshots)
 │
 ├── scripts/                       User Entry Points
-│   ├── eod_stock_picker.py        Main entry (strategy/status/briefing/collector)
-│   ├── run_backtest.py            Backtest entry (--list/--compare)
+│   ├── eod_stock_picker.py        Main entry
+│   ├── run_backtest.py            Backtest entry
 │   └── verify.py                  23-item health check
 │
 ├── config.yml                     Central configuration
 ├── SKILL.md                       AI assistant skill definition
-├── README.md                      Project documentation (Chinese)
-├── README.en.md                   Project documentation (English)
 ├── CHEATSHEET.md                  Quick reference
 ├── requirements.txt               Python dependencies
 │
@@ -166,88 +263,23 @@ stock-picker/
 
 ---
 
-**Short-Term Strategy Details**
+## Data Sources
 
-**Full Pipeline**
+| Source | Purpose | Protocol | Notes |
+|--------|---------|----------|-------|
+| mootdx TCP | K-line + financials | TCP 7709 | Never banned, ~0.1s/stock |
+| Tencent Finance | Real-time quotes | HTTP | 5205 stocks, never banned, ~46s |
+| Tonghuashun 10jqka | Hot stocks + themes | HTTP | Zero auth, 73ms |
+| hexin.cn | North-bound summary | HTTP | Real-time, zero auth |
+| ASHareHub | Holdings/flow/tech/concepts/financials | HTTP | 100 calls/day shared across 4 endpoints |
+| East Money em_get | Sector membership / dragon-tiger | HTTP | Serial throttled, WAF protected |
+| akshare | Big-deal flow / stock codes | HTTP | Independent fuse |
 
-1. `get_all_codes()` — read code cache (0.001s)
-2. `get_all_quotes()` — Tencent API 5205 stocks (~46s)
-3. `get_ths_hot_stocks()` — Tonghuashun hot stocks + themes (~0.22s)
-4. `_prefilter()` — remove ST/low-volume/limit-up-down (~4900 remain)
-5. 5-dim preliminary: liquidity 30 + activity 20 + momentum 15 + risk 20 + PE 15 → Top 200
-6. `get_main_fund()` — big-deal fund flow cache (~25s, subsequent 199 calls in ms)
-7. `get_kline()` × 200 — mootdx TCP 3-thread parallel (~25s)
-8. Cross-sectional RPS ranking
-9. `scoring_model.score()` — 7-factor weighted + gap check
-10. `portfolio_optimizer` — score-weighted position allocation (max 40%/min 10%)
-11. `get_stock_blocks()` + `get_dragon_tiger()` — sector and dragon-tiger for Top 3
-12. Output briefing + save report — complete before 15:00
-
-**Factor Weights**
-
-| Factor | Weight | Data Source | Logic |
-|--------|--------|-------------|-------|
-| Capital Flow | 25% | Big deal / ASHareHub / THS | Cross-sectional percentile ranking |
-| Momentum/RPS | 25% | Market-wide percentile | 20-day return → 0-100 |
-| Technical | 15% | mootdx K-line 6-dim | Trend 30 + Bias 20 + Volume 15 + Support 10 + MACD 15 + RSI 10 |
-| Volume-Price | 10% | Volume ratio + tail structure | 0.8~2.0 = 80pt |
-| North-bound | 10% | hexin.cn / asharehub | Shareholding volume change direction |
-| Hot Theme | 10% | 10jqka hot stocks | In hot list + has theme tags |
-| Dragon-Tiger | 5% | East Money datacenter | Listed + institution net buy > 0 |
-| Risk | filter | risk_filter.py | Blocks severe risks, no weight |
+Each data source has an **independent fuse** — failures are isolated to their source. All fuses auto-recover every 10 minutes (`_recover_sources()`). A fused factor is neutralized to 50 points, with its weight redistributed to active factors.
 
 ---
 
-**Backtest Engine**
-
-**Core Characteristics**
-
-1. **Data** — mootdx real K-line, zero `np.random`, no look-ahead bias
-2. **Execution** — next day open price
-3. **Slippage** — 0.1% (configurable)
-4. **Commission** — 0.03% (configurable)
-5. **Trading Rules** — T+1 take-profit +2%, stop-loss -2% (from `config.yml sell`), T+3 time stop
-6. **Position Simulation** — by `allocation_pct`, daily T+1 buy open / sell close
-7. **Benchmark** — CSI 300
-
-**Known Limitations**
-
-- Capital flow / themes / dragon-tiger / north-bound data are not available in backtest
-- mootdx covers ~600 trading days (~2.5 years)
-- Uses next-day open price, cannot simulate intraday fills
-
----
-
-**Weight Self-Learning**
-
-Live run → auto backfill T+1 → 60+ records → Ridge regression → factor variance audit → collapse check → new weights → `v1.json`
-
-**Optimizer (`feedback/optimizer.py`)**
-
-- **Algorithm** — `sklearn.linear_model.Ridge(alpha=1.0)`
-- **Input** — factor raw scores → actual T+1 returns
-- **Output** — normalized weights (negative → 0, positive → sum 1)
-- **Trigger** — win rate < 50% or 50+ new records since last optimization
-- **Collapse protection** — skip if single factor ≥ 80%
-- **Missing columns** — auto-fill 0.5
-- **3-stage workflow** — `check_and_report()` → approval → `apply_from_report()`
-- **Version tracking** — old versions in `data/weights/` (timestamped)
-
-**Latest Backtest (2026-04-01 ~ 2026-06-27)**
-
-- Total trades: 95
-- Win rate: 57.9%
-- Avg T+1 return: +1.63%
-- Avg T+5 return: +5.87%
-- Max drawdown: -13.93%
-- Sharpe ratio: 4.36
-- Strategy return: +62.50%
-- CSI 300: +7.56%
-- Excess return: +54.94%
-
----
-
-**AI Assistant Integration**
+## AI Assistant Integration
 
 Supported via `SKILL.md`:
 
@@ -265,20 +297,26 @@ Example prompts:
 
 ---
 
-**Acknowledgments**
+## Acknowledgments
 
-- **a-stock-data (Simon Lin)** — data source architecture, em_get rate limiter, THS hot/block/dragon API reference
-- **Sequoia-X** — pattern recognition strategies, RPS ranking
-- **daily-stock-analysis** — StockTrendAnalyzer technical scoring system
-- **mootdx** — Tongdaxin TCP protocol Python wrapper
-- **akshare** — A-share data API standard
+This project draws inspiration and design patterns from the following open-source projects:
+
+- **[a-stock-data](https://github.com/simonlin1212/a-stock-data)** (Simon Lin) — data source architecture, `em_get` rate limiter, THS hot/block/dragon API reference
+- **[Sequoia-X](https://github.com/sngyai/Sequoia-X)** — pattern recognition strategies (golden cross, turtle breakout, high-tight flag), RPS ranking
+- **[daily-stock-analysis](https://github.com/ZhuLinsen/daily_stock_analysis)** — StockTrendAnalyzer technical scoring system
+- **[mootdx](https://github.com/mootdx/mootdx)** — Tongdaxin TCP protocol Python wrapper, providing stable K-line + financial data
+- **[akshare](https://github.com/akfamily/akshare)** — A-share data interface standard, providing big-deal data and stock code list
 
 ---
 
-**License**
+## License
 
 [MIT](LICENSE)
 
 ---
 
-Maintained by [cbzhang86](https://github.com/cbzhang86) · Developed with Claude Code
+<div align="center">
+Maintained by <a href="https://github.com/cbzhang86">cbzhang86</a> · Built with <a href="https://claude.ai/code">Claude Code</a>
+
+If you find this project helpful, please ⭐
+</div>
