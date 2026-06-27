@@ -18,9 +18,6 @@ import os
 import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
-from datetime import datetime
-
-import numpy as np
 
 
 from core.factor_library import FactorLibrary

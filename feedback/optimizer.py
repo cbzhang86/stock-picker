@@ -396,20 +396,24 @@ class WeightsOptimizer:
         """从追踪器加载带因子得分的推荐记录"""
         import sqlite3
 
-        conn = sqlite3.connect(tracker.db_path)
+        conn = None
+        try:
+            conn = sqlite3.connect(tracker.db_path)
 
-        query = """
-            SELECT p.id, p.date, p.score, p.rating, p.factor_scores,
-                   o.t1_return, o.t5_return
-            FROM predictions p
-            JOIN outcomes o ON p.id = o.prediction_id
-            WHERE p.mode = ? AND o.t1_return IS NOT NULL
-            ORDER BY p.id
-            LIMIT 500
-        """
+            query = """
+                SELECT p.id, p.date, p.score, p.rating, p.factor_scores,
+                       o.t1_return, o.t5_return
+                FROM predictions p
+                JOIN outcomes o ON p.id = o.prediction_id
+                WHERE p.mode = ? AND o.t1_return IS NOT NULL
+                ORDER BY p.id
+                LIMIT 500
+            """
 
-        df = pd.read_sql_query(query, conn, params=(mode,))
-        conn.close()
+            df = pd.read_sql_query(query, conn, params=(mode,))
+        finally:
+            if conn:
+                conn.close()
 
         if df.empty:
             return None

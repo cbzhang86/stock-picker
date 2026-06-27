@@ -9,11 +9,10 @@
   collector.collect(data_engine, enriched_stocks, hot_df, recommendations)
 """
 
-import json
 import logging
 import os
 import sqlite3
-from datetime import date, datetime
+from datetime import date
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -223,58 +222,78 @@ class FactorDataCollector:
 
     def load_capital_flow(self, date_str: str, code: str) -> Optional[float]:
         """读取某日某股的主力资金数据"""
-        conn = sqlite3.connect(self.db_path)
-        row = conn.execute(
-            "SELECT accumulated_net FROM capital_flow WHERE date=? AND code=?",
-            (date_str, code)
-        ).fetchone()
-        conn.close()
-        return float(row[0]) if row else None
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                "SELECT accumulated_net FROM capital_flow WHERE date=? AND code=?",
+                (date_str, code)
+            ).fetchone()
+            return float(row[0]) if row else None
+        finally:
+            if conn:
+                conn.close()
 
     def load_north_flow(self, date_str: str, code: str) -> Optional[float]:
         """读取某日某股的北向数据"""
-        conn = sqlite3.connect(self.db_path)
-        row = conn.execute(
-            "SELECT holding_change FROM north_flow WHERE date=? AND code=?",
-            (date_str, code)
-        ).fetchone()
-        conn.close()
-        return float(row[0]) if row else None
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                "SELECT holding_change FROM north_flow WHERE date=? AND code=?",
+                (date_str, code)
+            ).fetchone()
+            return float(row[0]) if row else None
+        finally:
+            if conn:
+                conn.close()
 
     def load_hot_stocks(self, date_str: str) -> set:
         """读取某日的强势股列表"""
-        conn = sqlite3.connect(self.db_path)
-        rows = conn.execute(
-            "SELECT code FROM hot_stocks WHERE date=?", (date_str,)
-        ).fetchall()
-        conn.close()
-        return set(r[0] for r in rows)
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            rows = conn.execute(
+                "SELECT code FROM hot_stocks WHERE date=?", (date_str,)
+            ).fetchall()
+            return set(r[0] for r in rows)
+        finally:
+            if conn:
+                conn.close()
 
     def load_dragon_tiger(self, date_str: str, code: str) -> Optional[Dict]:
         """读取某日某股的龙虎榜数据"""
-        conn = sqlite3.connect(self.db_path)
-        row = conn.execute(
-            "SELECT net_buy_wan, institution_net_wan, has_record "
-            "FROM dragon_tiger WHERE date=? AND code=?",
-            (date_str, code)
-        ).fetchone()
-        conn.close()
-        if row:
-            return {
-                'net_buy_wan': row[0],
-                'institution_net_wan': row[1],
-                'has_record': bool(row[2]),
-            }
-        return None
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                "SELECT net_buy_wan, institution_net_wan, has_record "
+                "FROM dragon_tiger WHERE date=? AND code=?",
+                (date_str, code)
+            ).fetchone()
+            if row:
+                return {
+                    'net_buy_wan': row[0],
+                    'institution_net_wan': row[1],
+                    'has_record': bool(row[2]),
+                }
+            return None
+        finally:
+            if conn:
+                conn.close()
 
     def get_stats(self) -> Dict:
         """返回仓库统计信息"""
-        conn = sqlite3.connect(self.db_path)
-        stats = {}
-        for table in ['capital_flow', 'north_flow', 'hot_stocks', 'dragon_tiger']:
-            row = conn.execute(
-                f"SELECT COUNT(DISTINCT date), COUNT(*) FROM {table}"
-            ).fetchone()
-            stats[table] = {'days': row[0], 'rows': row[1]}
-        conn.close()
-        return stats
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            stats = {}
+            for table in ['capital_flow', 'north_flow', 'hot_stocks', 'dragon_tiger']:
+                row = conn.execute(
+                    f"SELECT COUNT(DISTINCT date), COUNT(*) FROM {table}"
+                ).fetchone()
+                stats[table] = {'days': row[0], 'rows': row[1]}
+            return stats
+        finally:
+            if conn:
+                conn.close()

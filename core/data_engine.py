@@ -109,6 +109,7 @@ class DataEngine:
 
     def _init_kline_cache(self):
         """初始化K线本地缓存表"""
+        conn = None
         try:
             import sqlite3
             conn = sqlite3.connect(self._kline_cache_path)
@@ -132,9 +133,11 @@ class DataEngine:
                 )
             """)
             conn.commit()
-            conn.close()
         except Exception as e:
             logger.warning(f"K线缓存初始化失败: {e}")
+        finally:
+            if conn:
+                conn.close()
 
     def _get_kline_from_cache(self, code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
         """从本地缓存读取K线"""

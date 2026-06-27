@@ -16,10 +16,7 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime
 from typing import Dict, List, Optional
-
-import pandas as pd
 
 from core.backtest_engine import BacktestResult
 
@@ -41,46 +38,50 @@ class BacktestStore:
     def _init_db(self):
         """初始化数据库表"""
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS backtest_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                strategy_name TEXT NOT NULL,
-                mode TEXT NOT NULL,
-                start_date TEXT NOT NULL,
-                end_date TEXT NOT NULL,
-                weight_snapshot TEXT,
-                config_snapshot TEXT,
-                total_trading_days INTEGER,
-                total_trades INTEGER,
-                win_rate REAL,
-                avg_return_t1 REAL,
-                avg_return_t5 REAL,
-                max_drawdown REAL,
-                sharpe_ratio REAL,
-                benchmark_return REAL,
-                strategy_return REAL,
-                excess_return REAL,
-                factor_performance TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS backtest_trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id INTEGER NOT NULL,
-                date TEXT NOT NULL,
-                code TEXT NOT NULL,
-                name TEXT,
-                score REAL,
-                buy_price REAL,
-                return_t1 REAL,
-                FOREIGN KEY (run_id) REFERENCES backtest_runs(id)
-            )
-        """)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.commit()
-        conn.close()
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS backtest_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_name TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    weight_snapshot TEXT,
+                    config_snapshot TEXT,
+                    total_trading_days INTEGER,
+                    total_trades INTEGER,
+                    win_rate REAL,
+                    avg_return_t1 REAL,
+                    avg_return_t5 REAL,
+                    max_drawdown REAL,
+                    sharpe_ratio REAL,
+                    benchmark_return REAL,
+                    strategy_return REAL,
+                    excess_return REAL,
+                    factor_performance TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS backtest_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    name TEXT,
+                    score REAL,
+                    buy_price REAL,
+                    return_t1 REAL,
+                    FOREIGN KEY (run_id) REFERENCES backtest_runs(id)
+                )
+            """)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.commit()
+        finally:
+            if conn:
+                conn.close()
 
     def save_run(self, result: BacktestResult, config: dict) -> int:
         """保存一次回测结果，返回 run_id"""
@@ -104,67 +105,75 @@ class BacktestStore:
             ensure_ascii=False, default=str
         )
 
-        conn = sqlite3.connect(self.db_path)
-        # 从 strategy_name 提取 mode（如 "short_strategy" → "short"）
-        mode = result.strategy_name.replace('_strategy', '') if result.strategy_name else ''
-        cur = conn.execute(
-            """INSERT INTO backtest_runs
-               (strategy_name, mode, start_date, end_date,
-                weight_snapshot, config_snapshot,
-                total_trading_days, total_trades,
-                win_rate, avg_return_t1, avg_return_t5,
-                max_drawdown, sharpe_ratio,
-                benchmark_return, strategy_return, excess_return,
-                factor_performance)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                result.strategy_name,
-                mode,
-                str(result.period[0]) if hasattr(result, 'period') and result.period else '',
-                str(result.period[1]) if hasattr(result, 'period') and result.period else '',
-                json.dumps(weight_snapshot, ensure_ascii=False),
-                json.dumps(config_snapshot, ensure_ascii=False),
-                result.total_trading_days,
-                result.total_trades,
-                result.win_rate,
-                result.avg_return_t1,
-                result.avg_return_t5,
-                result.max_drawdown,
-                result.sharpe_ratio,
-                result.benchmark_return,
-                result.strategy_return,
-                result.excess_return,
-                factor_perf_json,
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            # 从 strategy_name 提取 mode（如 "short_strategy" → "short"）
+            mode = result.strategy_name.replace('_strategy', '') if result.strategy_name else ''
+            cur = conn.execute(
+                """INSERT INTO backtest_runs
+                   (strategy_name, mode, start_date, end_date,
+                    weight_snapshot, config_snapshot,
+                    total_trading_days, total_trades,
+                    win_rate, avg_return_t1, avg_return_t5,
+                    max_drawdown, sharpe_ratio,
+                    benchmark_return, strategy_return, excess_return,
+                    factor_performance)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    result.strategy_name,
+                    mode,
+                    str(result.period[0]) if hasattr(result, 'period') and result.period else '',
+                    str(result.period[1]) if hasattr(result, 'period') and result.period else '',
+                    json.dumps(weight_snapshot, ensure_ascii=False),
+                    json.dumps(config_snapshot, ensure_ascii=False),
+                    result.total_trading_days,
+                    result.total_trades,
+                    result.win_rate,
+                    result.avg_return_t1,
+                    result.avg_return_t5,
+                    result.max_drawdown,
+                    result.sharpe_ratio,
+                    result.benchmark_return,
+                    result.strategy_return,
+                    result.excess_return,
+                    factor_perf_json,
+                )
             )
-        )
-        run_id = cur.lastrowid
+            run_id = cur.lastrowid
 
-        # 存储交易明细（仅前 50 条）
-        for td in result.trade_details[:50]:
-            conn.execute(
-                "INSERT INTO backtest_trades (run_id, date, code, name, score, buy_price, return_t1) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (run_id, td.get('date', ''), td.get('code', ''), td.get('name', ''),
-                 td.get('score', 0), td.get('buy_price', 0), td.get('return_t1'))
-            )
+            # 存储交易明细（仅前 50 条）
+            for td in result.trade_details[:50]:
+                conn.execute(
+                    "INSERT INTO backtest_trades (run_id, date, code, name, score, buy_price, return_t1) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (run_id, td.get('date', ''), td.get('code', ''), td.get('name', ''),
+                     td.get('score', 0), td.get('buy_price', 0), td.get('return_t1'))
+                )
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            if conn:
+                conn.close()
         logger.info(f"回测结果已保存: run_id={run_id}")
         return run_id
 
     def list_runs(self, limit: int = 20) -> List[Dict]:
         """列出最近的回测运行记录"""
-        conn = sqlite3.connect(self.db_path)
-        rows = conn.execute(
-            """SELECT id, strategy_name, mode, start_date, end_date,
-                      total_trades, win_rate, avg_return_t1, sharpe_ratio,
-                      max_drawdown, created_at
-               FROM backtest_runs
-               ORDER BY id DESC LIMIT ?""",
-            (limit,)
-        ).fetchall()
-        conn.close()
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            rows = conn.execute(
+                """SELECT id, strategy_name, mode, start_date, end_date,
+                          total_trades, win_rate, avg_return_t1, sharpe_ratio,
+                          max_drawdown, created_at
+                   FROM backtest_runs
+                   ORDER BY id DESC LIMIT ?""",
+                (limit,)
+            ).fetchall()
+        finally:
+            if conn:
+                conn.close()
         return [
             {
                 'id': r[0], 'strategy': r[1], 'mode': r[2],
@@ -178,15 +187,18 @@ class BacktestStore:
 
     def get_run(self, run_id: int) -> Optional[Dict]:
         """获取单次回测详情"""
-        conn = sqlite3.connect(self.db_path)
-        row = conn.execute(
-            "SELECT * FROM backtest_runs WHERE id=?", (run_id,)
-        ).fetchone()
-        if not row:
-            conn.close()
-            return None
-        cols = [d[0] for d in conn.execute("PRAGMA table_info(backtest_runs)").fetchall()]
-        conn.close()
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                "SELECT * FROM backtest_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if not row:
+                return None
+            cols = [d[0] for d in conn.execute("PRAGMA table_info(backtest_runs)").fetchall()]
+        finally:
+            if conn:
+                conn.close()
         result = dict(zip(cols, row))
         # 解析 JSON 字段
         if result.get('weight_snapshot'):

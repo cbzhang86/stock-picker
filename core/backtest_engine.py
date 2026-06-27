@@ -20,7 +20,6 @@
 import logging
 import os
 import sqlite3
-import sys
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field

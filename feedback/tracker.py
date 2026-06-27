@@ -11,8 +11,6 @@ import sqlite3
 import json
 import os
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -29,59 +27,63 @@ class PredictionTracker:
 
     def _init_db(self):
         """初始化SQLite数据库表结构"""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
 
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS predictions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                code TEXT NOT NULL,
-                name TEXT,
-                mode TEXT NOT NULL,
-                score REAL,
-                rating TEXT,
-                buy_price REAL,
-                model_version TEXT,
-                factor_scores TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS predictions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    name TEXT,
+                    mode TEXT NOT NULL,
+                    score REAL,
+                    rating TEXT,
+                    buy_price REAL,
+                    model_version TEXT,
+                    factor_scores TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS outcomes (
-                prediction_id INTEGER PRIMARY KEY,
-                t1_date TEXT,
-                t1_close REAL,
-                t1_return REAL,
-                t5_date TEXT,
-                t5_close REAL,
-                t5_return REAL,
-                t20_date TEXT,
-                t20_close REAL,
-                t20_return REAL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (prediction_id) REFERENCES predictions(id)
-            )
-        """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS outcomes (
+                    prediction_id INTEGER PRIMARY KEY,
+                    t1_date TEXT,
+                    t1_close REAL,
+                    t1_return REAL,
+                    t5_date TEXT,
+                    t5_close REAL,
+                    t5_return REAL,
+                    t20_date TEXT,
+                    t20_close REAL,
+                    t20_return REAL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (prediction_id) REFERENCES predictions(id)
+                )
+            """)
 
-        c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_predictions_date
-            ON predictions(date)
-        """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_predictions_date
+                ON predictions(date)
+            """)
 
-        c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_predictions_mode
-            ON predictions(mode)
-        """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_predictions_mode
+                ON predictions(mode)
+            """)
 
-        c.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_predictions_unique
-            ON predictions(date, code, mode)
-        """)
+            c.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_predictions_unique
+                ON predictions(date, code, mode)
+            """)
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            if conn:
+                conn.close()
 
     def log_prediction(self, date: str, code: str, name: str, mode: str,
                        score: float, rating: str, buy_price: float,

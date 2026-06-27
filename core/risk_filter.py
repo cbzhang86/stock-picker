@@ -10,7 +10,6 @@
   - PE 为负且尚未盈利（长线过滤）
 """
 
-import re
 import logging
 from typing import Dict, List
 

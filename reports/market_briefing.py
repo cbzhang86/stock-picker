@@ -14,9 +14,7 @@
 
 import logging
 from datetime import date, datetime
-from typing import Dict, List, Optional
-
-import pandas as pd
+from typing import Dict, List
 
 from core.data_engine import DataEngine
 
