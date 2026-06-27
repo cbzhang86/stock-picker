@@ -72,7 +72,7 @@ _source_available = {
 **三大编码铁律**
 
 1. **except 必须 log** — 禁止 `except: pass`，必须 `logger.warning(f"...: {e}")`。已修复 12 处。
-2. **SQLite 必须 try/finally** — `conn = None` → `try:` → `finally: if conn: conn.close()`。已修复 4 处。
+2. **SQLite 必须 try/finally** — `conn = None` → `try:` → `finally: if conn: conn.close()`。已修复 5 处（backtest_engine + tracker）。
 3. **import 必须文件顶部** — 禁止方法体内 `import`，统一放文件顶部。已修复（`ThreadPoolExecutor` / `as_completed`）。
 
 ---
@@ -102,14 +102,15 @@ ScoringModel 权重加载优先级：
 3. `DEFAULT_WEIGHTS`（代码硬编码）
 
 如果 v1.json 与 config 不一致，config 权重会被忽略并记录 warning。
+ScoringModel 不再写入 v1.json（仅优化器三段式写入）。
 
 止盈止损值从 `sell_config` 读取（即 `config.yml` 的 `short_term.sell` 段），不再硬编码 2%/2%。
 
 ---
 
-**常见陷阱**
+**常见陷阱（编号 1-22）**
 
-1. **json.loads 不能 ast.literal_eval** — JSON 里的 `true`/`false` 不是 Python 字面量。`optimizer._load_history()` 已修复。
+1. **json.loads 不能 ast.literal_eval** — JSON 的 `true`/`false` 不是 Python 字面量。`optimizer._load_history()` 已修复。
 2. **Optimizer 列缺失填充 0.5** — Ridge 回归时新因子列（如 hot_theme）在旧记录中不存在，自动填 0.5。
 3. **权重坍缩保护** — 单因子 ≥ 80% 跳过优化，防止单一因子主导。
 4. **不要多线程并发东财** — `em_get` 已经是串行的，外层再开线程会被封 IP。
@@ -119,16 +120,18 @@ ScoringModel 权重加载优先级：
 8. **不要直接调 akshare 东财接口** — 境外网络不通，走大单缓存。
 9. **Config 权重字段名是 `short_term.weights`** — 不是 `short_term.weights_model`。
 10. **Baostock 复权参数** — 回测用 `adjustflag='1'`（后复权），不是 `'2'`（前复权）。
-11. **北向语义** — 回测中北向因子恒定为 50（中性值），因为北向数据不可回溯。
+11. **北向回测语义** — 回测中北向因子恒定为 50（中性值），因北向数据不可回溯。
 12. **两状态同步** — 策略退出前调用 `self._save_state()` 保存运行状态。
 13. **CLI 默认日期** — `run_backtest.py --start` 默认 `2026-04-01`，`--end` 默认 `2026-06-27`，与当前季度对齐。
 14. **push2 直连已删除** — 原 `_get_capital_flow_push2()` 方法已移除，不要引用。
 15. **ModelRegistry 已删除** — `core/model_registry.py` 整文件移除（144 行死代码），版本管理通过带时间戳的权重文件实现。
-16. **Optimizer 三段式工作流** — `check_and_report()` 只产出报告不写入 → 审批 → `apply_from_report()` 写入。`maybe_optimize()` 保留但不自动写。
+16. **Optimizer 三段式工作流** — `check_and_report()` 只产出报告不写入 → 审批 → `apply_from_report()` 写入。`maybe_optimize()` 保留原签名但降级为只报告。
 17. **Optimizer 缓存目录** — `.last_optimize_short` 计数文件在 `data/cache/`，不在 `data/weights/`。
 18. **Tracker UNIQUE 约束** — `predictions(date, code, mode)` 有 UNIQUE 索引，重复插入会抛异常，需用 INSERT OR REPLACE。
 19. **factor_scores JSON 序列化** — `json.dumps(factor_scores, default=str)` 处理 numpy 类型。
-20. **backtest_engine SQLite** — `_load_factor_data()` 连接无 try/finally，需注意（已知遗留，低风险）。
+20. **backtest_engine SQLite** — `_load_factor_data()` 连接无 try/finally（已知遗留，低风险）。
+21. **ScoringModel 权重加载顺序** — v1.json > config 传入 > DEFAULT_WEIGHTS。v1.json 存在时 config 权重被忽略并记录 warning。
+22. **止盈止损从 config 读取** — `sell_config` 参数传入 ScoringModel，`short_term.sell.take_profit` / `stop_loss`，不再硬编码。
 
 ---
 

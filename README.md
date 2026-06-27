@@ -154,56 +154,6 @@ stock-picker/
     └── weights/                   优化器输出的权重文件
 ```
 
-**数据流**
-
-```
-数据采集层               因子计算层              策略层               输出层
-─────────               ─────────              ──────               ──────
-腾讯API ──→ 行情        FactorLibrary          ShortTermStrategy    market_briefing
-mootdx  ──→ K线/财务     ├─ calc_main_fund      ├─ prefilter()       generate_daily_report
-同花顺  ──→ 热点        ├─ calc_macd           ├─ enrich_data()     generate_backtest_report
-东财    ──→ 板块/龙虎    ├─ calc_rps            ├─ rank_stocks()     因子仓库采集
-hexin   ──→ 北向        ├─ calc_rsi            └─ allocate()        data_collector.collect()
-AKShare ──→ 大单/代码   ├─ calc_bollinger
-ASHareHub─→ 技术/概念    └─ calc_fundamental
-                                    │
-                                    ▼
-                              scoring_model
-                              ├─ 权重求和
-                              ├─ 评级映射
-                              └─ 理由生成
-                                    │
-                                    ▼
-                              feedback/tracker
-                              ├─ predictions.db
-                              └─ JOIN outcomes
-                                    │
-                                    ▼
-                              feedback/optimizer
-                              └─ Ridge回归 → v1.json
-```
-
----
-
-**数据源详表**
-
-- **K线 + 财务（Mootdx TCP）** — 优先级首选，永不封 IP，~0.1s/只
-- **实时行情（腾讯财经）** — 5205 只，不封 IP，~46s
-- **强势股 + 题材归因（10jqka）** — 零鉴权 73ms
-- **北向资金汇总（hexin.cn）** — 实时，零鉴权
-- **大单资金流（akshare big_deal）** — 全量加载一次后毫秒级查询，独立熔断
-- **个股资金流（ASHareHub moneyflow）** — 日配额 100 次，配额用满静默降级，独立熔断
-- **技术因子（ASHareHub technical）** — 双源校验（一致加分/分歧保守），独立熔断
-- **概念板块（ASHareHub concepts）** — 三源融合（同花顺+东财+ASHareHub），独立熔断
-- **财务指标（ASHareHub financial）** — 长线基本面优先源，baostock 回退，独立熔断
-- **个股北向持仓（asharehub）** — 需免费 API Key，持股量变化计算增减仓，独立熔断
-- **板块归属（东财 push2）** — em_get 限流
-- **龙虎榜（东财 datacenter）** — em_get 限流
-- **个股资金流（akshare）** — 境外不通，独立熔断不影响其他源
-- **限售解禁（akshare）** — 辅助数据
-
-每个数据源有**独立熔断**，互不影响。熔断每 10 分钟自动恢复（`_recover_sources()`），网络抖动不会永久禁用源。被熔断的因子自动中性化为 50 分，权重自动分配给其他活跃因子。
-
 ---
 
 **短线策略评分详解**
@@ -225,14 +175,16 @@ ASHareHub─→ 技术/概念    └─ calc_fundamental
 
 **因子权重表**
 
-- **主力资金流 25%** — 大单交易汇总，净流入 > 300 万 = 高分
-- **动量/RPS 25%** — 全市场涨幅排位，百分位排名映射 0-100
-- **技术形态 15%** — 6 维技术评分（趋势 30 + 乖离 20 + 量能 15 + 支撑 10 + MACD 15 + RSI 10）
-- **量价配合 10%** — 量比 + 尾盘成交结构，0.8~2.0 = 80 分
-- **北向资金 10%** — hexin.cn 汇总 / asharehub 个股持仓，持股量变化方向评分
-- **同花顺热点 10%** — 在强势股列表中且有题材标签 = 加分
-- **龙虎榜 5%** — 上榜 + 机构净买入为正 = 加分
-- 风险（risk）是过滤层，不占权重
+| 因子 | 权重 | 数据源 | 计算方式 |
+|------|------|--------|---------|
+| 主力资金流 | 25% | 大单交易汇总 / ASHareHub / 同花顺 | 横截面百分位排名，净流入 > 300 万 = 高分 |
+| 动量/RPS | 25% | 全市场涨幅排位 | 百分位排名映射 0-100 |
+| 技术形态 | 15% | mootdx K 线 6 维评分 | 趋势 30 + 乖离 20 + 量能 15 + 支撑 10 + MACD 15 + RSI 10 |
+| 量价配合 | 10% | 量比 + 尾盘成交结构 | 0.8~2.0 = 80 分，尾盘资金集中度增强 |
+| 北向资金 | 10% | hexin.cn 汇总 / asharehub 个股持仓 | 持股量变化方向评分 |
+| 同花顺热点 | 10% | 10jqka 强势股 + 题材归因 | 在强势股列表中且有题材标签 = 加分 |
+| 龙虎榜 | 5% | 东财 datacenter | 上榜 + 机构净买入为正 = 加分 |
+| 风险 | 过滤层 | risk_filter.py | 前置拦截严重风险，不占权重 |
 
 ---
 
@@ -252,23 +204,10 @@ ASHareHub─→ 技术/概念    └─ calc_fundamental
 
 总交易次数 / 胜率 / 平均收益 T+1/T+5 / 最大单笔盈利 / 最大单笔亏损 / 最大回撤 / 夏普比率 / 策略总收益 / 超额收益 / 权益曲线 / 月度收益表 / 因子 IC 信息系数 / 因子赢输分差 / 交易明细 / 优化建议
 
-**因子 IC 示例（2026-04-01 ~ 2026-06-27 回测）**
-
-- **volume_price** — 赢单 55.0 / 输单 54.5 / 分差 +0.4 / IC +0.1202 / 强有效
-- **technical** — 赢单 77.2 / 输单 75.9 / 分差 +1.3 / IC +0.0916 / 强有效
-- **hot_theme** — 赢单 64.3 / 输单 64.8 / 分差 -0.4 / IC -0.0394 / 反向（建议检查）
-- **momentum** — 赢单 96.7 / 输单 97.4 / 分差 -0.7 / IC -0.0382 / 反向（建议检查）
-
-IC > 0.03 视为有效信号，IC < -0.03 为反向信号。
-
-**因子仓库积累**
-
-`feedback/data_collector.py` 每日收盘后自动采集资金流、北向、热点、龙虎榜数据到 `factor_daily.db`。因子数据从采集当天开始积累，第 30 天后最近 1 个月的因子回测就有完整数据。不需要批量回填。
-
 **已知限制**
 
 - 资金流 / 题材 / 龙虎榜 / 北向数据在回测中不可用（当日大单不可回溯），回测仅验证量价 + 动量 + 技术因子的逻辑有效性
-- 收益因子（资金流/北向等）的最终权重验证通过优化器从实盘收益学习，这正是回测和优化器互补的定位
+- 收益因子（资金流/北向等）的最终权重验证通过优化器从实盘收益学习
 - mootdx 提供约 600 个交易日（约 2.5 年），无法回测 2019 年以前的策略
 - 以次日开盘价成交，无法模拟盘中即时成交
 
@@ -305,29 +244,24 @@ IC > 0.03 视为有效信号，IC < -0.03 为反向信号。
 
 ---
 
-**文件说明**
+**数据源详表**
 
-- `core/data_engine.py` — 数据融合引擎，14 个数据源统一接入、缓存、状态追踪、失效降级
-- `core/factor_library.py` — 因子计算库，30+ 量化因子 0-100 评分映射
-- `core/scoring_model.py` — 评分模型，加权求和 → 评级映射 → 理由生成，支持权重重分配；止盈止损从 config 读取
-- `core/technical_scorer.py` — 技术评分，6 维度 100 分制系统化技术分析
-- `core/risk_filter.py` — 风控，6 道检查、惩罚系数、跳过判定
-- `core/backtest_engine.py` — 回测引擎，历史 K 线快照逐日模拟、真实 K 线收益、因子 IC 归因
-- `core/backtest_store.py` — 回测存储，SQLite 持久化回测结果，支持 `--list` / `--compare` 版本对比
-- `core/portfolio_optimizer.py` — 组合优化，评分加权 / 等权仓位分配
-- `strategies/short_term.py` — 短线策略，7 因子全市场扫描 + 市场评估
-- `strategies/long_term.py` — 长线策略，6 因子基本面 + 北向 + 动量
-- `reports/market_briefing.py` — 市场简报，5 板块全景报告生成
-- `reports/backtest_report.py` — 报告渲染，回测报告 + 每日推荐 Markdown
-- `feedback/tracker.py` — 预测追踪，SQLite 持久化推荐 + 收益，UNIQUE(date, code, mode)
-- `feedback/optimizer.py` — 权重优化，Ridge 回归三段式工作流
-- `feedback/data_collector.py` — 因子仓库，逐日资金流/北向/热点/龙虎榜快照
-- `scripts/eod_stock_picker.py` — 唯一入口，策略运行 + 简报 + 回填 + 优化 + 因子采集
-- `scripts/run_backtest.py` — 回测入口，全量回测 + `--list` + `--compare`
-- `scripts/verify.py` — 健康检查，23 项综合检查
-- `config.yml` — 配置中心，权重 / 风控 / 回测 / 模型参数
-- `SKILL.md` — AI 助手技能文件，Claude Code / OpenClaw / Hermes 接口定义
-- `CHEATSHEET.md` — 使用备忘录，数据源 / 熔断 / 配额 / 编码规范速查
+- **K线 + 财务（Mootdx TCP）** — 优先级首选，永不封 IP，~0.1s/只
+- **实时行情（腾讯财经）** — 5205 只，不封 IP，~46s
+- **强势股 + 题材归因（10jqka）** — 零鉴权 73ms
+- **北向资金汇总（hexin.cn）** — 实时，零鉴权
+- **大单资金流（akshare big_deal）** — 全量加载一次后毫秒级查询，独立熔断
+- **个股资金流（ASHareHub moneyflow）** — 日配额 100 次，配额用满静默降级，独立熔断
+- **技术因子（ASHareHub technical）** — 双源校验（一致加分/分歧保守），独立熔断
+- **概念板块（ASHareHub concepts）** — 三源融合（同花顺+东财+ASHareHub），独立熔断
+- **财务指标（ASHareHub financial）** — 长线基本面优先源，baostock 回退，独立熔断
+- **个股北向持仓（asharehub）** — 需免费 API Key，持股量变化计算增减仓，独立熔断
+- **板块归属（东财 push2）** — em_get 限流
+- **龙虎榜（东财 datacenter）** — em_get 限流
+- **个股资金流（akshare）** — 境外不通，独立熔断不影响其他源
+- **限售解禁（akshare）** — 辅助数据
+
+每个数据源有**独立熔断**，互不影响。熔断每 10 分钟自动恢复（`_recover_sources()`），网络抖动不会永久禁用源。被熔断的因子自动中性化为 50 分，权重自动分配给其他活跃因子。
 
 ---
 
