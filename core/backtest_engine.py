@@ -369,6 +369,7 @@ class BacktestEngine:
         if not os.path.exists(factor_db):
             return result
 
+        conn = None
         try:
             conn = sqlite3.connect(factor_db)
 
@@ -392,15 +393,17 @@ class BacktestEngine:
                 "WHERE date>=? AND date<=?", (start_date, end_date)
             ):
                 result['hot_stocks'].add((row[0], row[1]))
-
-            conn.close()
-            cf = len(result['capital_flow'])
-            nf = len(result['north_flow'])
-            hs = len(result['hot_stocks'])
-            if cf or nf or hs:
-                logger.info(f"因子仓库加载: 资金流{cf}条, 北向{nf}条, 热点{hs}条")
         except Exception as e:
             logger.warning(f"因子仓库加载失败: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+        cf = len(result['capital_flow'])
+        nf = len(result['north_flow'])
+        hs = len(result['hot_stocks'])
+        if cf or nf or hs:
+            logger.info(f"因子仓库加载: 资金流{cf}条, 北向{nf}条, 热点{hs}条")
 
         return result
 

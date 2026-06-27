@@ -92,21 +92,24 @@ class PredictionTracker:
 
         返回 prediction_id
         """
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute(
-            """INSERT INTO predictions
-               (date, code, name, mode, score, rating, buy_price, model_version, factor_scores)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (date, code, name, mode, score, rating, buy_price,
-             model_version, json.dumps(factor_scores, ensure_ascii=False, default=str))
-        )
-        conn.commit()
-        prediction_id = c.lastrowid
-        conn.close()
-
-        logger.debug(f"记录推荐: {code} {name} 评分{score} ID={prediction_id}")
-        return prediction_id
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute(
+                """INSERT INTO predictions
+                   (date, code, name, mode, score, rating, buy_price, model_version, factor_scores)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (date, code, name, mode, score, rating, buy_price,
+                 model_version, json.dumps(factor_scores, ensure_ascii=False, default=str))
+            )
+            conn.commit()
+            prediction_id = c.lastrowid
+            logger.debug(f"记录推荐: {code} {name} 评分{score} ID={prediction_id}")
+            return prediction_id
+        finally:
+            if conn:
+                conn.close()
 
     def update_outcomes(self, prediction_id: int, kline: pd.DataFrame):
         """
@@ -169,49 +172,52 @@ class PredictionTracker:
         返回：
           {win_rate_t1, win_rate_t5, avg_return_t1, avg_return_t5, total_records}
         """
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
 
-        # 构建查询
-        date_filter = ""
-        params = [mode]
-        if days:
-            date_filter = "AND p.date >= date('now', ?)"
-            params.append(f"-{days} days")
+            # 构建查询
+            date_filter = ""
+            params = [mode]
+            if days:
+                date_filter = "AND p.date >= date('now', ?)"
+                params.append(f"-{days} days")
 
-        # T+1 统计
-        c.execute(
-            f"""SELECT COUNT(*),
-                       SUM(CASE WHEN o.t1_return > 0 THEN 1 ELSE 0 END),
-                       AVG(o.t1_return)
-                FROM predictions p
-                JOIN outcomes o ON p.id = o.prediction_id
-                WHERE p.mode = ? AND o.t1_return IS NOT NULL
-                {date_filter}""",
-            params
-        )
-        row = c.fetchone()
-        total_t1 = row[0] or 0
-        win_t1 = row[1] or 0
-        avg_t1 = row[2] or 0.0
+            # T+1 统计
+            c.execute(
+                f"""SELECT COUNT(*),
+                           SUM(CASE WHEN o.t1_return > 0 THEN 1 ELSE 0 END),
+                           AVG(o.t1_return)
+                    FROM predictions p
+                    JOIN outcomes o ON p.id = o.prediction_id
+                    WHERE p.mode = ? AND o.t1_return IS NOT NULL
+                    {date_filter}""",
+                params
+            )
+            row = c.fetchone()
+            total_t1 = row[0] or 0
+            win_t1 = row[1] or 0
+            avg_t1 = row[2] or 0.0
 
-        # T+5 统计
-        c.execute(
-            f"""SELECT COUNT(*),
-                       SUM(CASE WHEN o.t5_return > 0 THEN 1 ELSE 0 END),
-                       AVG(o.t5_return)
-                FROM predictions p
-                JOIN outcomes o ON p.id = o.prediction_id
-                WHERE p.mode = ? AND o.t5_return IS NOT NULL
-                {date_filter}""",
-            params
-        )
-        row = c.fetchone()
-        total_t5 = row[0] or 0
-        win_t5 = row[1] or 0
-        avg_t5 = row[2] or 0.0
-
-        conn.close()
+            # T+5 统计
+            c.execute(
+                f"""SELECT COUNT(*),
+                           SUM(CASE WHEN o.t5_return > 0 THEN 1 ELSE 0 END),
+                           AVG(o.t5_return)
+                    FROM predictions p
+                    JOIN outcomes o ON p.id = o.prediction_id
+                    WHERE p.mode = ? AND o.t5_return IS NOT NULL
+                    {date_filter}""",
+                params
+            )
+            row = c.fetchone()
+            total_t5 = row[0] or 0
+            win_t5 = row[1] or 0
+            avg_t5 = row[2] or 0.0
+        finally:
+            if conn:
+                conn.close()
 
         return {
             'win_rate_t1': round(win_t1 / total_t1 * 100, 2) if total_t1 else 0,
@@ -223,17 +229,21 @@ class PredictionTracker:
 
     def get_pending_outcomes(self) -> List[Dict]:
         """获取还没有T+1结果的推荐"""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute(
-            """SELECT p.id, p.date, p.code, p.buy_price
-               FROM predictions p
-               LEFT JOIN outcomes o ON p.id = o.prediction_id
-               WHERE o.t1_close IS NULL
-               ORDER BY p.date"""
-        )
-        rows = c.fetchall()
-        conn.close()
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute(
+                """SELECT p.id, p.date, p.code, p.buy_price
+                   FROM predictions p
+                   LEFT JOIN outcomes o ON p.id = o.prediction_id
+                   WHERE o.t1_close IS NULL
+                   ORDER BY p.date"""
+            )
+            rows = c.fetchall()
+        finally:
+            if conn:
+                conn.close()
 
         return [
             {'id': r[0], 'date': r[1], 'code': r[2], 'buy_price': r[3]}
@@ -242,16 +252,20 @@ class PredictionTracker:
 
     def get_recent_predictions(self, limit: int = 20) -> pd.DataFrame:
         """获取最近N条推荐记录（含结果）"""
-        conn = sqlite3.connect(self.db_path)
-        query = """
-            SELECT p.date, p.code, p.name, p.mode, p.score, p.rating,
-                   p.buy_price,
-                   o.t1_return, o.t5_return, o.t20_return
-            FROM predictions p
-            LEFT JOIN outcomes o ON p.id = o.prediction_id
-            ORDER BY p.id DESC
-            LIMIT ?
-        """
-        df = pd.read_sql_query(query, conn, params=(limit,))
-        conn.close()
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            query = """
+                SELECT p.date, p.code, p.name, p.mode, p.score, p.rating,
+                       p.buy_price,
+                       o.t1_return, o.t5_return, o.t20_return
+                FROM predictions p
+                LEFT JOIN outcomes o ON p.id = o.prediction_id
+                ORDER BY p.id DESC
+                LIMIT ?
+            """
+            df = pd.read_sql_query(query, conn, params=(limit,))
+        finally:
+            if conn:
+                conn.close()
         return df
