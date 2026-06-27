@@ -40,7 +40,9 @@ from reports.daily_report import DailyReportGenerator
 from reports.market_briefing import generate_market_briefing
 from feedback.tracker import PredictionTracker
 from feedback.optimizer import WeightsOptimizer
+from feedback.data_collector import FactorDataCollector
 from core.data_engine import DataEngine
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,6 +111,21 @@ def run_short_term(config: dict) -> list:
             factor_scores=rec.get('breakdown', {})
         )
 
+    # 采集当日因子数据供回测使用
+    try:
+        enriched = getattr(strategy, '_last_enriched', None)
+        if enriched:
+            collector = FactorDataCollector()
+            collector.collect(
+                data_engine=strategy.data_engine,
+                enriched_stocks=enriched,
+                hot_df=strategy.data_engine.get_ths_hot_stocks(),
+                recommendations=recommendations,
+                trade_date=today,
+            )
+    except Exception as e:
+        logger.warning(f"因子数据采集失败: {e}")
+
     return recommendations
 
 
@@ -123,6 +140,8 @@ def run_long_term(config: dict) -> list:
     today = date.today().isoformat()
 
     for rec in recommendations:
+        if rec.get('skip_reason') or rec.get('market_assessment'):
+            continue
         tracker.log_prediction(
             date=today,
             code=rec.get('code', ''),
@@ -135,44 +154,23 @@ def run_long_term(config: dict) -> list:
             factor_scores=rec.get('breakdown', {})
         )
 
+    # 采集当日因子数据
+    try:
+        enriched = getattr(strategy, '_last_enriched', None)
+        if enriched:
+            collector = FactorDataCollector()
+            collector.collect(
+                data_engine=strategy.data_engine,
+                enriched_stocks=enriched,
+                hot_df=strategy.data_engine.get_ths_hot_stocks(),
+                recommendations=recommendations,
+                trade_date=today,
+            )
+    except Exception as e:
+        logger.warning(f"因子数据采集失败: {e}")
+
     return recommendations
 
-
-def maybe_sync_weights(config: dict, mode: str):
-    """如果优化器写入了新权重，同步到 v1.json"""
-    weights_dir = 'data/weights'
-    v1_path = os.path.join(weights_dir, 'v1.json')
-
-    # 找最新的权重文件（按时间排序）
-    try:
-        wfiles = sorted([f for f in os.listdir(weights_dir)
-                        if f.endswith('.json') and f != 'v1.json' and mode in f])
-    except (FileNotFoundError, OSError):
-        return
-
-    if not wfiles:
-        return
-
-    latest = os.path.join(weights_dir, wfiles[-1])
-    try:
-        with open(latest) as f:
-            new_weights_data = json.load(f)
-
-        # 读取或创建 v1.json
-        existing = {}
-        if os.path.exists(v1_path):
-            with open(v1_path) as f:
-                existing = json.load(f)
-
-        # 合并该 mode 的新权重
-        existing[mode] = new_weights_data.get(mode, new_weights_data)
-
-        with open(v1_path, 'w', encoding='utf-8') as f:
-            json.dump(existing, f, indent=2, ensure_ascii=False)
-
-        logger.info(f"权重同步到 v1.json（来源: {wfiles[-1]}）")
-    except Exception as e:
-        logger.warning(f"权重同步失败: {e}")
 
 
 def show_status(config: dict):
@@ -249,19 +247,79 @@ def main():
     print(f"\n📝 报告已保存: {path}")
     print(f"📊 简报已保存: {briefing_path}")
 
-    # 5. 检查是否触发优化
-    if recommendations:
+    # 5. 检查优化器是否触发（仅产报告，不自动写入）
+    if recommendations and args.mode == 'short':
         tracker = PredictionTracker()
-        optimizer = WeightsOptimizer()
-        optimizer.maybe_optimize(
+        optimizer = WeightsOptimizer(
+            min_records=config.get('model', {}).get('min_records_for_optimize', 60)
+        )
+        report = optimizer.check_and_report(
             tracker,
             {'short': config.get('short_term', {}).get('weights', {}),
              'long': config.get('long_term', {}).get('weights', {})},
             mode=args.mode
         )
 
-        # 同步权重到 v1.json
-        maybe_sync_weights(config, args.mode)
+        if report and report.get('triggered'):
+            _print_optimizer_report(report)
+            # 将报告写入文件供后续审批
+            report_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                      'data', 'reports')
+            os.makedirs(report_dir, exist_ok=True)
+            report_path = os.path.join(
+                report_dir,
+                f"optimizer_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            )
+            with open(report_path, 'w', encoding='utf-8') as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
+            print(f"📄 优化器报告已保存: {report_path}")
+            print(f"⚠️  新权重未自动生效，需要审批后执行 apply_from_report()")
+
+
+def _print_optimizer_report(report: dict):
+    """打印优化器报告摘要到控制台"""
+    print("\n" + "=" * 55)
+    print("📊 权重优化报告")
+    print("=" * 55)
+
+    d = report.get('data_diagnostics', {})
+    print(f"  训练数据: {d.get('total_records', '?')} 条 | "
+          f"胜率 {d.get('win_rate', '?'):.1f}% | "
+          f"平均收益 {d.get('avg_return_t1', 0):+.2f}%")
+    print(f"  时间范围: {d.get('date_range', '?')}")
+    print(f"  数据新鲜度: {d.get('fresh_ratio', 0)*100:.0f}%")
+
+    print(f"\n  因子信号诊断:")
+    for fname, stats in d.get('factor_stats', {}).items():
+        sig = "✅" if stats.get('unique_values', 0) >= 3 else "❌"
+        print(f"    {sig} {fname}: {stats.get('n_samples', 0)}条, "
+              f"{stats.get('unique_values', 0)}个唯一值, "
+              f"范围 {stats.get('min', '?')}~{stats.get('max', '?')}")
+
+    old = report.get('old_weights', {})
+    new = report.get('proposed_weights', {})
+    deltas = report.get('factor_deltas', {})
+
+    if new:
+        print(f"\n  权重对比:")
+        print(f"  {'因子':<18} {'当前':>6} {'建议':>6} {'变化':>6}")
+        print(f"  {'-'*18} {'-'*6} {'-'*6} {'-'*6}")
+        for fname in sorted(set(list(old.keys()) + list(new.keys()))):
+            o = old.get(fname, 0)
+            n = new.get(fname, 0)
+            d = deltas.get(fname, {}).get('delta', n - o)
+            mark = " ⚠️" if abs(d) >= 0.05 else ""
+            print(f"  {fname:<18} {o:>6.0%} {n:>6.0%} {d:>+6.0%}{mark}")
+    else:
+        print(f"\n  ⚠️ Ridge 未产出有效权重")
+
+    rd = report.get('ridge_detail', {})
+    if rd.get('coefficients'):
+        print(f"\n  Ridge 回归系数 (R²={rd.get('r2_score', '?'):})")
+        for f, c in rd['coefficients'].items():
+            print(f"    {f}: {c:+.6f}")
+
+    print("=" * 55)
 
 
 if __name__ == '__main__':

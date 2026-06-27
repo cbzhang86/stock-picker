@@ -62,6 +62,10 @@ class ShortTermStrategy(BaseStrategy):
         logger.info("=" * 50)
         logger.info("短线尾盘策略运行中...")
 
+        # 回测模式标志（从 market_data 传入，非回测时为 False）
+        is_backtest = market_data and market_data.get('backtest_mode', False)
+        backtest_date = market_data.get('backtest_date') if is_backtest else None
+
         # 1. 获取全市场行情
         if market_data:
             quotes_df = market_data.get('quotes_df')
@@ -75,12 +79,18 @@ class ShortTermStrategy(BaseStrategy):
         logger.info(f"全市场共 {len(quotes_df)} 只股票")
 
         # 1.5 市场环境评估（0额外API成本，从行情数据计算）
-        hot_df = self.data_engine.get_ths_hot_stocks()
-        hot_codes = set()
-        if not hot_df.empty:
-            hot_codes = set(str(c).zfill(6) for c in hot_df['代码'].tolist() if pd.notna(c))
-            logger.info(f"同花顺强势股: {len(hot_codes)} 只有题材归因标签")
-        market_assessment = self._assess_market(quotes_df, hot_df)
+        # 同花顺强势股（回测模式下跳过实时API）
+        if is_backtest:
+            hot_codes = set()
+            hot_df = pd.DataFrame()
+            logger.info("回测模式：热点数据跳过（hot_theme 因子中性化）")
+        else:
+            hot_df = self.data_engine.get_ths_hot_stocks()
+            hot_codes = set()
+            if not hot_df.empty:
+                hot_codes = set(str(c).zfill(6) for c in hot_df['代码'].tolist() if pd.notna(c))
+                logger.info(f"同花顺强势股: {len(hot_codes)} 只有题材归因标签")
+        market_assessment = self._assess_market(quotes_df, hot_df, is_backtest=is_backtest)
         logger.info(f"市场环境综合评分: {market_assessment['total']}/100 "
                      f"({market_assessment['level']})")
 
@@ -93,12 +103,13 @@ class ShortTermStrategy(BaseStrategy):
                 'skip_reason': f"市场赚钱效应较差({market_assessment['level']})，建议空仓观望或减仓",
             }]
 
-        # 根据市场环境调整参数
+        # 根据市场环境调整参数（使用局部变量，不修改实例属性）
         if market_assessment['level'] == '弱市':
-            self.top_n = min(self.top_n, 2)   # 弱市最多推荐2只
+            effective_top_n = min(self.top_n, 2)   # 弱市最多推荐2只
             effective_min_score = max(self.min_score, 65)  # 提高评分门槛
-            logger.info(f"弱市模式: 最多推荐{self.top_n}只, 最低评分{effective_min_score}")
+            logger.info(f"弱市模式: 最多推荐{effective_top_n}只, 最低评分{effective_min_score}")
         else:
+            effective_top_n = self.top_n
             effective_min_score = self.min_score
 
         # 2. 批量过滤 + 预评分
@@ -115,12 +126,10 @@ class ShortTermStrategy(BaseStrategy):
             logger.info("今日尾盘策略跳过：没有足够合格的标的")
             return []
 
-        # 3. 获取详细数据
-        enriched = self._enrich_data(candidates, hot_codes)
+        # 3. 获取详细数据（回测模式传入日期限制）
+        enriched = self._enrich_data(candidates, hot_codes, is_backtest=is_backtest, backtest_date=backtest_date)
 
         # 4. 评分 + 排序
-        # 弱市纪律：强制顶部不超过 2 只，避免推荐过密
-        effective_top_n = min(self.top_n, 2) if market_assessment['level'] == '弱市' else self.top_n
         recommendations = self.scoring_model.rank_stocks(
             enriched, mode='short',
             top_n=effective_top_n, min_score=effective_min_score
@@ -137,14 +146,18 @@ class ShortTermStrategy(BaseStrategy):
             rec['data_source_status'] = source_status
             rec['market_data'] = {}
 
-        # 附加市场级数据
-        try:
-            north_summary = self.data_engine.get_north_flow_summary()
-            if north_summary:
-                for rec in recommendations:
-                    rec['market_data'] = {'north_flow': north_summary}
-        except Exception:
-            pass
+        # 暴露详评数据给外部（用于因子采集）
+        self._last_enriched = enriched
+
+        # 附加市场级数据（回测模式下跳过实时北向API）
+        if not is_backtest:
+            try:
+                north_summary = self.data_engine.get_north_flow_summary()
+                if north_summary:
+                    for rec in recommendations:
+                        rec['market_data'] = {'north_flow': north_summary}
+            except Exception:
+                pass
 
         # 对推荐结果补充板块归属和龙虎榜（仅对 top N 做，走 em_get 限流）
         for rec in recommendations:
@@ -214,7 +227,8 @@ class ShortTermStrategy(BaseStrategy):
 
         return candidates
 
-    def _assess_market(self, quotes_df: pd.DataFrame, hot_df: pd.DataFrame) -> Dict:
+    def _assess_market(self, quotes_df: pd.DataFrame, hot_df: pd.DataFrame,
+                       is_backtest: bool = False) -> Dict:
         """
         市场环境评估 — 判断今日是否适合短线操作
 
@@ -246,13 +260,14 @@ class ShortTermStrategy(BaseStrategy):
         pct_up_3 = int((pct >= 3).sum())
         hot_count = len(hot_df) if hot_df is not None and not hot_df.empty else 0
 
-        # 北向资金
-        north = None
-        try:
-            north = self.data_engine.get_north_flow_summary()
-        except Exception:
-            pass
-        north_total = north['total'] if north else 0
+        # 北向资金（回测模式下跳过实时API）
+        north_total = 0
+        if not is_backtest:
+            try:
+                north = self.data_engine.get_north_flow_summary()
+                north_total = north['total'] if north else 0
+            except Exception:
+                pass
 
         # 各维度评分（0-100）
         def scale(value, thresholds):
@@ -341,7 +356,8 @@ class ShortTermStrategy(BaseStrategy):
             },
         }
 
-    def _enrich_data(self, candidates: list, hot_codes: set = None) -> list:
+    def _enrich_data(self, candidates: list, hot_codes: set = None,
+                     is_backtest: bool = False, backtest_date: str = None) -> list:
         """
         获取详细数据 — 多维度初筛后取前 200 只拉取完整数据
 
@@ -437,27 +453,32 @@ class ShortTermStrategy(BaseStrategy):
 
         # 预加载大单缓存 — 跳过（境外网络akshare可能超时，各股票单独调用时自动降权）
 
-        # 先集中获取所有资金的流（前200只全部是毫秒级，因为大单已缓存）
+        # 先集中获取所有资金流（回测模式下跳过实时API，设默认值）
         for stock in top_candidates:
             code = stock['code']
-            try:
-                main_accum = self.data_engine.get_main_fund_accumulated(code, days=10)
-            except Exception:
-                main_accum = None
-            stock['main_fund_accumulated'] = main_accum
-
-            try:
-                north_accum = self.data_engine.get_north_flow_accumulated(code, days=10)
-            except Exception:
-                north_accum = None
-            stock['north_flow_accumulated'] = north_accum
-
-            # 尾盘成交结构（从已缓存的大单数据提取，不走额外API）
-            try:
-                tail_end = self.data_engine.get_tail_end_stats(code)
-                stock['tail_end_stats'] = tail_end
-            except Exception:
+            if is_backtest:
+                stock['main_fund_accumulated'] = 0
+                stock['north_flow_accumulated'] = 0
                 stock['tail_end_stats'] = {'available': False}
+            else:
+                try:
+                    main_accum = self.data_engine.get_main_fund_accumulated(code, days=10)
+                except Exception:
+                    main_accum = None
+                stock['main_fund_accumulated'] = main_accum
+
+                try:
+                    north_accum = self.data_engine.get_north_flow_accumulated(code, days=10)
+                except Exception:
+                    north_accum = None
+                stock['north_flow_accumulated'] = north_accum
+
+                # 尾盘成交结构（从已缓存的大单数据提取，不走额外API）
+                try:
+                    tail_end = self.data_engine.get_tail_end_stats(code)
+                    stock['tail_end_stats'] = tail_end
+                except Exception:
+                    stock['tail_end_stats'] = {'available': False}
 
         # K线 + 技术指标（并行拉取，每只独立线程）
         # 缓存命中的毫秒级返回，未命中的走baostock
@@ -468,7 +489,14 @@ class ShortTermStrategy(BaseStrategy):
         def fetch_kline(stock):
             code = stock['code']
             try:
-                kline = self.data_engine.get_kline(code)
+                # 回测模式：只取回测日期之前的K线，防止前瞻偏差
+                if is_backtest and backtest_date:
+                    from datetime import datetime, timedelta
+                    bt_end = datetime.strptime(backtest_date, '%Y-%m-%d').strftime('%Y-%m-%d')
+                    bt_start = (datetime.strptime(backtest_date, '%Y-%m-%d') - timedelta(days=120)).strftime('%Y-%m-%d')
+                    kline = self.data_engine.get_kline(code, start_date=bt_start, end_date=bt_end)
+                else:
+                    kline = self.data_engine.get_kline(code)
                 if kline is not None and not kline.empty and len(kline) >= 20:
                     close = kline['close']
                     high = kline.get('high', close)
@@ -483,6 +511,30 @@ class ShortTermStrategy(BaseStrategy):
                 else:
                     stock['macd_status'] = {'score': 50, 'status': 'unknown'}
                     stock['raw_return_20'] = 0
+
+                # 双源技术校验：AShareHub 技术因子（独立熔断，失败不影响 K 线）
+                try:
+                    asharehub_tech = self.data_engine.get_technical_factors_asharehub(code)
+                    if asharehub_tech is not None:
+                        stock['asharehub_tech'] = asharehub_tech
+                except Exception:
+                    pass
+
+                # AShareHub 概念板块（hot_theme 增强，独立熔断）
+                try:
+                    concepts = self.data_engine.get_concept_members(code)
+                    if concepts is not None:
+                        stock['concept_names'] = concepts
+                except Exception:
+                    pass
+
+                # AShareHub 财务指标（长线策略，独立熔断）
+                try:
+                    fin = self.data_engine.get_financial_indicators(code)
+                    if fin is not None:
+                        stock['financial_indicators'] = fin
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning(f"{code} 技术面失败: {str(e)[:60]}")
                 stock['macd_status'] = {'score': 50, 'status': 'unknown'}

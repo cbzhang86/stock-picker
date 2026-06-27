@@ -34,7 +34,7 @@ data_sources:
 short_term:
   weights:
     capital_flow: 0.25         # 主力资金流（近10日累计流入）
-    north_flow: 0.10           # 北向资金（短期信号权重上调，熔断自动降权50）
+    north_flow: 0.10           # 北向资金（asharehub 个股持仓，2026-06-26 修复）
     momentum: 0.25             # 动量/RPS排位（A 股最强 cross-sectional 因子）
     technical: 0.15            # 技术形态（均线/MACD）
     volume_price: 0.10         # 量价配合
@@ -49,7 +49,7 @@ short_term:
     # 风控通过 risk_filter 前置拦截（ST/涨停封死/解禁压力等），
     # 剩余软风险由 scoring_model 的 penalty 路径在总分上额外扣减。
 
-  # 游资本组总权重：capital_flow + hot_theme + dragon_tiger = 0.43（2026-06-16 调整）
+  # 游资本组总权重：capital_flow + hot_theme + dragon_tiger = 0.40（2026-06-16 调整）
   # 游资线作为短线核心驱动力；north_flow 通过 asharehub 接入已通
 
   # 买入条件

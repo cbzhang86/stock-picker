@@ -56,6 +56,11 @@ class LongTermStrategy(BaseStrategy):
         logger.info("=" * 50)
         logger.info("长线持股策略运行中...")
 
+        # 回测模式标志
+        is_backtest = market_data and market_data.get('backtest_mode', False)
+        backtest_date = market_data.get('backtest_date') if is_backtest else None
+        self._backtest_mode = is_backtest
+
         if market_data and 'quotes_df' in market_data:
             quotes_df = market_data['quotes_df']
         else:
@@ -82,6 +87,10 @@ class LongTermStrategy(BaseStrategy):
             logger.info(f"推荐 {len(recommendations)} 只长线标的")
             # 组合优化：评分加权仓位分配
             recommendations = PortfolioOptimizer.allocate(recommendations)
+
+        # 暴露详评数据供因子采集
+        self._last_enriched = enriched if 'enriched' in dir() else []
+
         return recommendations
 
     def _prefilter_long(self, quotes_df: pd.DataFrame) -> list:
@@ -104,7 +113,7 @@ class LongTermStrategy(BaseStrategy):
                 'name_raw': row.get('name', ''),
             }
 
-            risk_result = self.risk_filter.check_stock(stock)
+            risk_result = self.risk_filter.check_stock(stock, data_engine=self.data_engine)
             stock['risk_check'] = risk_result
 
             if risk_result['passed'] or risk_result['score_penalty'] < 0.5:
@@ -120,16 +129,20 @@ class LongTermStrategy(BaseStrategy):
         """获取长线所需详细数据（基本面+北向+中期RPS+财务快照）"""
         enriched = []
         total = min(len(candidates), 50)
+        is_backtest = getattr(self, '_backtest_mode', False)
 
         for i, stock in enumerate(candidates[:50]):
             code = stock['code']
 
-            # 北向资金（长线更看重）
-            try:
-                north_30d = self.data_engine.get_north_flow_accumulated(code, days=30)
-            except Exception:
-                north_30d = None
-            stock['north_flow_accumulated'] = north_30d
+            # 北向资金（回测模式下跳过实时API）
+            if not is_backtest:
+                try:
+                    north_30d = self.data_engine.get_north_flow_accumulated(code, days=30)
+                except Exception:
+                    north_30d = None
+                stock['north_flow_accumulated'] = north_30d
+            else:
+                stock['north_flow_accumulated'] = None
 
             # K线
             try:
@@ -155,18 +168,19 @@ class LongTermStrategy(BaseStrategy):
                 stock['macd_status'] = {'score': 50, 'status': 'unknown'}
                 stock['rps_20'] = 50
 
-            # 基本面财务快照（mootdx finance 37字段）
-            try:
-                fin = self.data_engine.get_financial_snapshot(code)
-                if fin:
-                    stock['roe'] = fin.get('roe')
-                    stock['eps'] = fin.get('eps')
-                    # profit/income 供报告引用，不直接参与评分
-                    stock['profit'] = fin.get('profit')
-                    stock['income'] = fin.get('income')
-                    stock['fin_report_date'] = fin.get('report_date', '')
-            except Exception:
-                pass
+            # 基本面财务快照（回测模式下跳过实时API）
+            if not is_backtest:
+                try:
+                    fin = self.data_engine.get_financial_snapshot(code)
+                    if fin:
+                        stock['roe'] = fin.get('roe')
+                        stock['eps'] = fin.get('eps')
+                        # profit/income 供报告引用，不直接参与评分
+                        stock['profit'] = fin.get('profit')
+                        stock['income'] = fin.get('income')
+                        stock['fin_report_date'] = fin.get('report_date', '')
+                except Exception:
+                    pass
 
             # 去掉内联 PE/PB 硬编码评分 — 已移至 FactorLibrary 统一计算
             # compute_all_factors(mode='long') 自动调用 calc_fundamental_score / calc_valuation_score

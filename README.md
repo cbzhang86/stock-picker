@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Compatible with](https://img.shields.io/badge/Claude%20Code-OpenClaw-Hermes-8A2BE2)](SKILL.md)
 
-13 个直连数据源 · 30+ 因子 · 短线尾盘 + 长线持股双策略 · 回测引擎 · 自学习权重优化
+14 个直连数据源 · 30+ 因子 · 短线尾盘 + 长线持股双策略 · 回测引擎 · 自学习权重优化
 
 **简体中文** · [English](README.en.md) 
 
@@ -46,11 +46,11 @@ A 股量化投资面临的核心问题是：数据源分散（行情、资金流
 
 | 维度             | 说明                                                                                        |
 | ---------------- | ------------------------------------------------------------------------------------------- |
-| **数据**   | 13 个直连数据源，mootdx TCP 永不封 IP 优先，东财接口统一限流                                |
+| **数据**   | 14 个直连数据源，mootdx TCP 永不封 IP 优先，东财接口统一限流，ASHareHub 日配额 100 次 |
 | **策略**   | 短线尾盘（7 因子）+ 长线持股（5 因子）+ 市场环境评估自动跳过                                |
 | **风控**   | 6 道风险过滤（ST/涨跌停/流动性/换手率），防凑数评分截断                                     |
-| **回测**   | 全真实 K 线数据（零 `np.random`），含历史行情快照回放，计入滑点佣金，输出权益曲线/夏普/IC |
-| **自学习** | Ridge 回归自动优化因子权重 + 因子 IC 归因，积累 30 条推荐后触发                             |
+| **回测**   | 全真实 K 线数据（零 `np.random`），含历史行情快照重放，计入滑点佣金，输出权益曲线/夏普/IC |
+| **自学习** | Ridge 回归自动优化因子权重 + 因子 IC 归因，积累 60 条有 outcome 的推荐后触发                             |
 | **可集成** | 兼容 Claude Code / OpenClaw / Hermes，通过 SKILL.md 对话式调用                              |
 
 ---
@@ -93,7 +93,7 @@ A 股量化投资面临的核心问题是：数据源分散（行情、资金流
 - SQLite 持久化存储每次推荐及因子分解
 - 自动回填 T+1/T+5/T+20 真实收益
 - Ridge 回归将因子得分映射到实际收益率
-- 积累 30 条推荐后自动触发优化
+- 积累 60 条有 T+1 结果的推荐后每 50 条自动触发优化（`(date, code, mode)` 唯一约束防重复）
 - 新权重持久化到 `v1.json`，下次启动自动加载
 
 </details>
@@ -181,7 +181,7 @@ python scripts/eod_stock_picker.py --status
 python scripts/eod_stock_picker.py --mode long
 
 # 回测验证
-python scripts/run_backtest.py --mode short --start 2025-06-01 --end 2026-06-11
+python scripts/run_backtest.py --mode short --start 2025-06-01 --end 2026-06-27
 ```
 
 ---
@@ -238,35 +238,31 @@ if dt['records']:
 ### 示例 3：回测并查看报告
 
 ```bash
-python scripts/run_backtest.py --mode short --start 2026-01-01 --end 2026-06-11
+python scripts/run_backtest.py --mode short --start 2026-04-01 --end 2026-06-27
 ```
 
 输出：
 
 ```
 # 回测报告：short_strategy
-**区间**: 2026-01-01 ~ 2026-06-11
+**区间**: 2026-04-01 ~ 2026-06-27
 
 ## 📊 基本统计
-- **总交易次数**: 156 次
-- **胜率**: 63.5%
-- **平均收益(T+1)**: +1.2%
-- **最大回撤**: -8.3%
-- **夏普比率**: 1.35
+- **总交易次数**: 95 次
+- **胜率**: 57.9%
+- **平均收益(T+1)**: +1.63%
+- **最大回撤**: -13.93%
+- **夏普比率**: 4.36
 
 ### 收益对比
-- **沪深300**: +5.2%
-- **策略收益**: +18.7%
-- **超额收益**: +13.5%
+- **沪深300**: +7.56%
+- **策略收益**: +62.50%
+- **超额收益**: +54.94%
 
 ## 📈 权益曲线
 ```
-
-▁▂▃▃▄▅▆▇██▇▆▅▆▇▇██▇▇▆▅▆▇▇██▇▆▅▅▆▇▇████
-¥980000 ~ ¥1187000 (最终: ¥1187000)
-
-```
-
+▁▁▁▁▁▁▁▂▃▂▂▂▃▄▅▅▅▅▄▄▄▄▄▅▅▅▅▄▄▄▄▅▅▅█▆▆▆▄▄
+¥1000000 ~ ¥1339783 (最终: ¥1625008)
 ```
 
 ---
@@ -277,12 +273,13 @@ python scripts/run_backtest.py --mode short --start 2026-01-01 --end 2026-06-11
 stock-picker/
 │
 ├── core/                          # 核心引擎层
-│   ├── data_engine.py             多源数据融合（13个数据源统一接入）
+│   ├── data_engine.py             多源数据融合（14个数据源统一接入）
 │   ├── factor_library.py          30+量化因子计算（资金/动量/技术/量价/估值/风险）
 │   ├── scoring_model.py           多因子加权评分 + 评级映射 + 权重加载
 │   ├── technical_scorer.py        系统化技术评分（6维度100分制）
 │   ├── risk_filter.py             6道风险检查（ST/流动性/涨跌停/换手率）
 │   ├── backtest_engine.py         回测引擎（mootdx真实K线，零随机数）
+│   ├── backtest_store.py          回测结果 SQLite 持久化，版本对比
 │   └── portfolio_optimizer.py     仓位分配（评分加权/等权）
 │
 ├── strategies/                    # 策略层
@@ -298,22 +295,31 @@ stock-picker/
 │
 ├── feedback/                      # 反馈循环
 │   ├── tracker.py                 SQLite预测追踪（predictions + outcomes）
-│   └── optimizer.py               Ridge回归权重优化器
+│   ├── optimizer.py               Ridge回归权重优化器
+│   └── data_collector.py          因子仓库（每日资金流/北向/热点/龙虎榜采集）
 │
 ├── scripts/                       # 用户入口
-│   ├── eod_stock_picker.py        唯一主入口（策略/状态/简报）
-│   └── run_backtest.py            全量回测入口
+│   ├── eod_stock_picker.py        唯一主入口（策略/状态/简报/因子采集）
+│   ├── run_backtest.py            全量回测入口
+│   └── verify.py                  23 项综合健康检查
 │
 ├── config.yml                     核心配置（权重/风控/回测参数）
 ├── SKILL.md                        AI 助手技能文件
 ├── README.md                       项目自述（本文档）
+├── README.en.md                    英文自述
 ├── requirements.txt                Python 依赖清单
+├── CHEATSHEET.md                   使用备忘录（给 AI 助手）
 │
 └── data/                          运行时数据（自动创建）
-    ├── kline_cache.db              K 线缓存 (SQLite WAL)
-    ├── predictions.db              推荐记录 + 收益结果 (SQLite)
-    ├── codes_cache.json            A 股代码列表缓存
-    └── model_weights/              优化器输出的权重文件
+    ├── cache/                      K 线 / 代码 / 回测 / 因子缓存
+    │   ├── kline_cache.db          K 线缓存 (SQLite WAL)
+    │   ├── codes_cache.json        A 股代码列表缓存
+    │   ├── backtest_cache.db       回测结果缓存
+    │   └── factor_daily.db         因子仓库（资金流/北向/热点/龙虎榜逐日快照）
+    ├── db/                         数据库
+    │   └── predictions.db          推荐记录 + 收益结果 (SQLite)
+    ├── reports/                    每日报告 + 简报
+    └── weights/                    优化器输出的权重文件
 ```
 
 ### 数据流
@@ -324,12 +330,12 @@ stock-picker/
 腾讯API ──→ 行情        FactorLibrary          ShortTermStrategy    market_briefing
 mootdx  ──→ K线/财务     ├─ calc_main_fund     ├─ prefilter()       generate_daily_report
 同花顺  ──→ 热点        ├─ calc_macd          ├─ enrich_data()     generate_backtest_report
-东财    ──→ 板块/龙虎    ├─ calc_rps           ├─ rank_stocks()
-hexin   ──→ 北向        ├─ calc_rsi           └─ allocate()
-akshare ──→ 大单/代码   ├─ calc_bollinger
-                        └─ calc_fundamental
-                               │
-                               ▼
+东财    ──→ 板块/龙虎    ├─ calc_rps           ├─ rank_stocks()     因子仓库采集
+hexin   ──→ 北向        ├─ calc_rsi           └─ allocate()        data_collector.collect()
+akshare ──→ 大单/代码   ├─ calc_bollinger                           ├─ capital_flow
+asharehub─→ 技术/概念    └─ calc_fundamental                        ├─ north_flow
+                               │                                    ├─ hot_theme
+                               ▼                                    └─ dragon_tiger
                           scoring_model
                           ├─ 权重求和
                           ├─ 评级映射
@@ -338,7 +344,7 @@ akshare ──→ 大单/代码   ├─ calc_bollinger
                                ▼
                           feedback/tracker
                           ├─ predictions.db
-                          └─ outcomes.db
+                          └─ JOIN outcomes
                                │
                                ▼
                           feedback/optimizer
@@ -399,9 +405,9 @@ akshare ──→ 大单/代码   ├─ calc_bollinger
 | 主力资金流 | **27%** | 大单交易汇总    | 净流入 > 300万 = 高分，净流出 = 低分               |
 | 动量/RPS   | **15%** | 全市场涨幅排位  | 百分位排名映射 0-100                               |
 | 技术形态   | **15%** | 6维技术评分     | 趋势30 + 乖离20 + 量能15 + 支撑10 + MACD15 + RSI10 |
-| 量价配合   | **10%** | 量比            | 0.8~2.0 = 80分，> 5 或 < 0.5 = 低分                |
+| 量价配合   | **10%** | 量比 + 尾盘成交结构 | 0.8~2.0 = 80 分，> 5 或 < 0.5 = 低分。量比×0.7 + 尾盘×0.3 |
 | 风险过滤   | **10%** | 风控检查        | 通过 = 100，每项违规累计扣分                       |
-| 北向资金   | **10%** | hexin.cn 汇总   | 当日净流向方向评分                                 |
+| 北向资金   | **10%** | hexin.cn 汇总 / asharehub 个股持仓 | 当日净流向方向评分 / 持股量变化 |
 | 同花顺热点 | **8%** | 题材归因标签    | 在强势股列表中 + 有题材标签 = 加分                 |
 | 龙虎榜     | **5%** | 东财 datacenter | 上榜 + 机构净买入为正 = 加分                       |
 
@@ -416,9 +422,13 @@ akshare ──→ 大单/代码   ├─ calc_bollinger
 | 同花顺强势股         | 10jqka           |        🥈        | HTTP     | 零鉴权 73ms                         |  ✅  |
 | 北向资金实时汇总     | hexin.cn         |        🥈        | HTTP     | 零鉴权                              |  ✅  |
 | 大单资金流（685 只） | akshare big_deal |        🥈        | HTTP     | 独立熔断，不与其他源共享            |  ✅  |
+| 个股资金流           | ASHareHub moneyflow |     🥈        | HTTP     | 日配额 100 次，静默降级，独立熔断   |  ✅  |
+| 个股技术因子         | ASHareHub technical |     🥈        | HTTP     | 双源校验（一致加分/分歧保守）     |  ✅  |
+| 个股概念板块         | ASHareHub concepts  |     🥈        | HTTP     | 三源融合（同花顺+东财+AShareHub） |  ✅  |
+| 个股财务指标         | ASHareHub financial |     🥈        | HTTP     | 长线基本面优先源，baostock回退    |  ✅  |
+| 个股北向             | asharehub（API Key） |        🥈        | HTTP     | 需免费注册，基于持股量变化计算增减仓 |  ✅  |
 | 板块归属             | 东财 push2       |        🥉        | HTTP     | em_get 限流                         |  ✅  |
 | 龙虎榜               | 东财 datacenter  |        🥉        | HTTP     | em_get 限流                         |  ✅  |
-| 个股北向             | asharehub（API Key） |        🥈        | HTTP     | 需免费注册，基于持股量变化计算增减仓 |  ✅  |
 | 个股资金流           | akshare          |        —        | HTTP     | ❌ 境外不通，独立熔断，不影响其他源 |  ⛔  |
 
 ### 独立数据源级熔断
@@ -429,18 +439,16 @@ akshare ──→ 大单/代码   ├─ calc_bollinger
 _source_available = {
     'big_deal': True,      # stock_fund_flow_big_deal — 通的
     'capital_flow': True,  # stock_individual_fund_flow — 不通
-    'north_flow': True,    # northbound_holdings — ✅ 通
+    'north_flow': True,    # asharehub northbound_holdings — ✅ 通
     'push2': True,         # push2 直连 — 不通
+    'asharehub_moneyflow': True,
+    'asharehub_tech_factors': True,
+    'asharehub_concepts': True,
+    'asharehub_financial': True,
 }
 ```
 
-`big_deal` 和 `north_flow` 的熔断完全独立。
-
-### 大单缓存覆盖范围
-
-`stock_fund_flow_big_deal()` 只包含**当日有大单交易**的股票（约 685 只），不是全市场 5205 只。没有大单交易的股票 `capital_flow` 因子取中性 50 分，权重自动分配给其他因子。这是正常行为，无需处理。
-
-### 失效保护
+**熔断每 10 分钟自动恢复**（`_recover_sources()`），网络抖动不会永久禁用源。
 
 ---
 
@@ -455,6 +463,7 @@ _source_available = {
 | 滑点     | 0.1%（可配置）                               |
 | 佣金     | 万三（可配置）                               |
 | 交易周期 | T+1 止盈 +2%，止损 -2%，T+3 时间止损         |
+| 仓位模拟 | 按 `allocation_pct` 分配资金，逐日 T+1 开盘买/收盘卖 |
 | 基准     | 沪深 300                                     |
 
 ### 输出指标
@@ -463,13 +472,27 @@ _source_available = {
 ✓ 总交易次数      ✓ 胜率            ✓ 平均收益(T+1/T+5)
 ✓ 最大单笔盈利     ✓ 最大单笔亏损     ✓ 最大回撤
 ✓ 夏普比率        ✓ 策略总收益       ✓ 超额收益
-✓ 权益曲线        ✓ 月度收益表       ✓ 因子归因
+✓ 权益曲线        ✓ 月度收益表       ✓ 因子归因(IC/spread)
 ✓ 交易明细        ✓ 优化建议
 ```
 
+### 因子 IC 信息系数示例
+
+| 因子 | 赢单平均分 | 输单平均分 | 分差 | IC | 判定 |
+|------|-----------|-----------|------|------|------|
+| volume_price | 55.0 | 54.5 | +0.4 | +0.1202 | 强有效 ✅ |
+| technical | 77.2 | 75.9 | +1.3 | +0.0916 | 强有效 ✅ |
+| hot_theme | 64.3 | 64.8 | -0.4 | -0.0394 | 反向（建议检查） |
+| momentum | 96.7 | 97.4 | -0.7 | -0.0382 | 反向（建议检查） |
+
+### 因子仓库积累
+
+`feedback/data_collector.py` 每日收盘后自动采集资金流、北向、热点、龙虎榜数据到 `factor_daily.db`。因子数据从采集当天开始积累——第一天回测用不上，第 30 天后最近 1 个月的因子回测就有完整数据。这是一个自然积累过程，不需要批量回填。
+
 ### 已知限制
 
-- 资金流 / 北向数据在回测中不可用（当日大单不可回溯），回测仅用量价 + 技术因子
+- 资金流 / 题材 / 龙虎榜 / 北向数据在回测中不可用（当日大单不可回溯），回测仅验证量价 + 动量 + 技术因子的逻辑有效性
+- 收益因子（资金流/北向等）的最终权重验证通过优化器从实盘收益学习，这正是回测和优化器互补的定位
 - mootdx 提供约 600 个交易日（约 2.5 年），无法回测 2019 年以前的策略
 - 以次日开盘价成交，无法模拟盘中即时成交
 
@@ -478,9 +501,10 @@ _source_available = {
 ## 🔄 权重自学习
 
 ```
-实盘推荐 → 自动回填 T+1 → 积累 30 条 → Ridge 回归 → 新权重 → v1.json
-                                                                ↓
-                                                         下次启动自动加载
+实盘推荐 → 自动回填 T+1 → 积累 60 条有 outcome 的记录
+  → Ridge 回归 → 因子方差审计 → 坍缩检查 → 新权重 → v1.json
+                                                          ↓
+                                                   下次启动自动加载
 ```
 
 权重优化器（`feedback/optimizer.py`）：
@@ -488,8 +512,10 @@ _source_available = {
 - **算法**：`sklearn.linear_model.Ridge(alpha=1.0)`
 - **输入**：各因子原始得分 → 实际 T+1 收益率
 - **输出**：归一化新权重（负系数截断为 0，正系数归一化到总和 1）
-- **触发**：胜率 < 50% 或每 50 条定期检查
-- **回滚**：旧版本保留在 `model_weights/`（带时间戳），可手动对比
+- **触发**：胜率 < 50% 或每 50 条定期检查，数据新鲜度（hot_theme/dragon_tiger 覆盖率 > 30%）
+- **保护**：坍缩保护（单因子 ≥ 80% 跳过）、列名不匹配因子自动填充 0.5
+- **工作流**：三段式 `check_and_report()` → 审批 → `apply_from_report()`，不自动写权重
+- **回滚**：旧版本保留在 `data/weights/`（带时间戳），可手动对比
 
 ---
 
@@ -497,7 +523,7 @@ _source_available = {
 
 | 文件                               | 角色         | 说明                                                 |
 | ---------------------------------- | ------------ | ---------------------------------------------------- |
-| `core/data_engine.py`            | 数据融合引擎 | 13 个数据源的统一接入、缓存、状态追踪、失效降级      |
+| `core/data_engine.py`            | 数据融合引擎 | 14 个数据源的统一接入、缓存、状态追踪、失效降级      |
 | `core/factor_library.py`         | 因子计算库   | 30+量化因子的 0-100 评分映射逻辑                     |
 | `core/scoring_model.py`          | 评分模型     | 加权求和 → 评级映射 → 理由生成，支持权重重分配     |
 | `core/technical_scorer.py`       | 技术评分     | 6 维度 100 分制系统化技术分析                        |
@@ -512,11 +538,14 @@ _source_available = {
 | `reports/backtest_report.py`     | 报告渲染     | 回测报告 + 每日推荐报告 Markdown 渲染                |
 | `reports/daily_report.py`        | 报告存储     | Markdown 文件读写                                    |
 | `feedback/tracker.py`            | 预测追踪     | SQLite 持久化推荐 + 收益                             |
-| `feedback/optimizer.py`          | 权重优化     | Ridge 回归自动调参                                   |
-| `scripts/eod_stock_picker.py`    | 唯一入口     | 策略运行 + 简报 + 回填 + 优化                        |
+| `feedback/optimizer.py`          | 权重优化     | Ridge 回归自动调参，三段式工作流                     |
+| `feedback/data_collector.py`     | 因子仓库     | 每日资金流/北向/热点/龙虎榜采集到 factor_daily.db    |
+| `scripts/eod_stock_picker.py`    | 唯一入口     | 策略运行 + 简报 + 回填 + 优化 + 因子采集             |
 | `scripts/run_backtest.py`        | 回测入口     | 全量回测 + --list 查看历史 + --compare 版本对比      |
+| `scripts/verify.py`              | 健康检查     | 23 项综合检查（模块/连通/评分/流水线/数据完整性）     |
 | `config.yml`                     | 配置中心     | 权重 / 风控 / 回测 / 模型参数                        |
 | `SKILL.md`                       | AI 技能      | Claude Code / OpenClaw / Hermes 接口定义             |
+| `CHEATSHEET.md`                  | 使用备忘录   | 数据源 / 熔断 / 配额 / 编码规范速查                  |
 
 ---
 
@@ -538,6 +567,7 @@ _source_available = {
 > "跑一下回测" → 执行回测引擎
 > "对比两次回测" → 查看历史回测记录对比
 > "查看回测历史" → 列出所有回测记录
+> "检查系统健康" → 运行 verify.py 23 项检查
 
 ---
 

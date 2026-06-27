@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
-import yaml
+
 
 from core.factor_library import FactorLibrary
 
@@ -93,14 +93,19 @@ class ScoringModel:
         self.factor_lib = FactorLibrary()
         self.model_version = model_version
         self.weights_dir = weights_dir
-
-        # 加载权重
-        if weights:
-            self.weights = weights
-        else:
-            self.weights = self._load_weights(model_version) or self.DEFAULT_WEIGHTS
-
         os.makedirs(self.weights_dir, exist_ok=True)
+
+        # 加载权重（优先级：v1.json > config传入 > DEFAULT_WEIGHTS）
+        loaded = self._load_weights(model_version)
+        if loaded:
+            self.weights = loaded
+            logger.info(f"权重从 {model_version}.json 加载")
+        elif weights:
+            self.weights = weights
+            logger.info(f"权重从 config 加载（v1.json 尚不存在）")
+        else:
+            self.weights = self.DEFAULT_WEIGHTS
+            logger.info("权重从 DEFAULT_WEIGHTS 加载")
 
     def _load_weights(self, version: str) -> Optional[Dict]:
         """从文件加载权重"""
@@ -124,7 +129,14 @@ class ScoringModel:
 
     def get_weights(self, mode: str = 'short') -> Dict:
         """获取指定模式的权重"""
-        return self.weights.get(mode, self.DEFAULT_WEIGHTS.get(mode, {}))
+        # 处理扁平权重 dict（从 config.yml 直接传入，无 'short'/'long' 嵌套）
+        # 例: {'capital_flow': 0.25, 'north_flow': 0.10, ...}
+        if mode in self.weights:
+            return self.weights[mode]
+        # 扁平 dict：检查是否有因子名作为 key（而非模式名）
+        if self.weights and any(k in self.weights for k in self.DEFAULT_WEIGHTS.get(mode, {})):
+            return self.weights
+        return self.DEFAULT_WEIGHTS.get(mode, {})
 
     def score_stock(self, stock_data: Dict, mode: str = 'short') -> Dict:
         """
@@ -239,15 +251,6 @@ class ScoringModel:
 
         risk_coeff = 0.2 if risk_penalty < 0.4 else 0.5
         score = weighted_score * (1 - risk_penalty * risk_coeff)
-
-        # breakdown 里记录 risk（不参与加权，但展示信息）
-        if 'risk' in weights:
-            breakdown['risk'] = {
-                'raw_score': round((1 - risk_penalty) * 100, 2),
-                'weight': 0,
-                'weighted': 0,
-                'note': risk_note + ' (已迁出权重表)'
-            }
 
         # 转百分制 + 截断
         final_score = round(min(max(score, 0), 100), 2)

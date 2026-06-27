@@ -86,6 +86,11 @@ class DataEngine:
         self.SZ_PREFIXES = ('000', '001', '002', '003', '300', '301')
 
         # 数据源状态追踪
+        self._latest_recovery_time = time.time()
+        self._last_asharehub_call = 0.0
+        self._asharehub_budget = 100  # 日配额
+        self._asharehub_budget_date = ""
+        self._asharehub_budget_used = 0
         self._source_status = {
             'akshare_codes':     {'available': True,  'last_error': None, 'label': 'A股代码列表'},
             'tencent_quote':     {'available': True,  'last_error': None, 'label': '腾讯实时行情'},
@@ -96,6 +101,10 @@ class DataEngine:
             'ths_hot':           {'available': True,  'last_error': None, 'label': '同花顺强势股'},
             'eastmoney_blocks':  {'available': True,  'last_error': None, 'label': '东财板块归属'},
             'dragon_tiger':      {'available': True,  'last_error': None, 'label': '龙虎榜'},
+            'asharehub_moneyflow':{'available': True,  'last_error': None, 'label': '个股资金流(AShareHub)'},
+            'asharehub_tech_factors':{'available': True, 'last_error': None, 'label': '技术因子(AShareHub)'},
+            'asharehub_concepts':   {'available': True, 'last_error': None, 'label': '概念板块(AShareHub)'},
+            'asharehub_financial':  {'available': True, 'last_error': None, 'label': '财务指标(AShareHub)'},
         }
 
     def _init_kline_cache(self):
@@ -144,7 +153,8 @@ class DataEngine:
                     df[c] = pd.to_numeric(df[c], errors='coerce')
                 return df
             return None
-        except Exception:
+        except Exception as e:
+            logger.warning(f"K线缓存读取失败 {code}: {str(e)[:80]}")
             return None
 
     def _save_kline_to_cache(self, code: str, df: pd.DataFrame):
@@ -311,7 +321,8 @@ class DataEngine:
                 if cached_date != datetime.now().strftime('%Y-%m-%d'):
                     return None  # 过期
             return data.get('codes', [])
-        except Exception:
+        except Exception as e:
+            logger.warning(f"代码缓存读取失败: {str(e)[:80]}")
             return None
 
     def _write_codes_cache(self, codes: list):
@@ -330,8 +341,43 @@ class DataEngine:
 
     # ========== 2. 全市场实时行情（腾讯API） ==========
 
+    def _recover_sources(self):
+        """每 10 分钟自动恢复所有已熔断数据源，避免网络抖动永久禁用一个源"""
+        now = time.time()
+        if now - self._latest_recovery_time < 600:
+            return
+        self._latest_recovery_time = now
+        for key in self._source_available:
+            if not self._source_available[key]:
+                self._source_available[key] = True
+                logger.info(f"数据源自动恢复: {key}")
+        for name, status in self._source_status.items():
+            if not status['available']:
+                status['available'] = True
+                status['last_error'] = None
+                logger.info(f"数据源自动恢复: {status.get('label', name)}")
+
+    def _rate_limit_asharehub(self):
+        """ASHareHub 节流：两次调用间隔不少于 0.3s，避免触发 429 限流"""
+        elapsed = time.time() - self._last_asharehub_call
+        if elapsed < 0.3:
+            time.sleep(0.3 - elapsed)
+        self._last_asharehub_call = time.time()
+
+    def _asharehub_budget_ok(self) -> bool:
+        """检查 ASHareHub 日配额是否还有余额，消耗一次"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        if self._asharehub_budget_date != today:
+            self._asharehub_budget_date = today
+            self._asharehub_budget_used = 0
+        if self._asharehub_budget_used >= self._asharehub_budget:
+            return False
+        self._asharehub_budget_used += 1
+        return True
+
     def get_all_quotes(self) -> pd.DataFrame:
         """全市场实时行情快照 — 腾讯API，每批200只，失败自动重试一次"""
+        self._recover_sources()
         cache_key = f"quotes_{datetime.now().strftime('%Y-%m-%d_%H:%M')}"
         if cache_key in self.cache:
             return self.cache[cache_key]
@@ -467,8 +513,8 @@ class DataEngine:
             logger.warning(f"baostock K线失败 {code}: {str(e)[:60]}")
             try:
                 bs.logout()
-            except:
-                pass
+            except Exception:
+                logger.warning("baostock logout 失败（可能未登录）")
         return pd.DataFrame()
 
     def _calc_kline_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -543,8 +589,8 @@ class DataEngine:
                     )
                     conn.commit()
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"fin_cache写入失败 {code}: {str(e)[:80]}")
                 return result
         except Exception as e:
             logger.warning(f"财务快照失败 {code}: {str(e)[:50]}")
@@ -570,8 +616,8 @@ class DataEngine:
                     'bvps': float(row[4] or 0),
                     'report_date': str(row[5] or ''),
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"fin_cache读取失败 {code}: {str(e)[:80]}")
         return None
 
     # ========== 5. 技术指标快捷版 ==========
@@ -624,25 +670,177 @@ class DataEngine:
         'north_flow': True,       # northbound_holdings — 北向（asharehub/通）
         'push2': True,            # push2 直连（不通）
         'lockup': True,           # stock_restricted_release_detail_em — 限售解禁（2026-06-16 新增）
+        'asharehub_moneyflow': True, # AShareHub个股资金流（独立熔断）
+        'asharehub_tech_factors': True, # AShareHub技术因子（独立熔断）
+        'asharehub_concepts': True,    # AShareHub概念板块（独立熔断）
+        'asharehub_financial': True,   # AShareHub财务指标（独立熔断）
     }
 
     def get_main_fund_accumulated(self, code: str, days: int = 10) -> Optional[float]:
         """
         主力资金近N日累计 — 多源回退链：
-        1. 大单交易汇总（今日大单净流向，最快，缓存685只）
-        2. 同花顺全市场资金流排行（全量5189只，独立熔断）
+        1. AShareHub moneyflow（优先，独立熔断）
+        2. 大单交易汇总（今日大单净流向，最快，缓存685只）
+        3. 同花顺全市场资金流排行（全量5189只，独立熔断）
         """
-        # 源1: 大单交易汇总（内存缓存，毫秒级）
+        # 源1: AShareHub moneyflow（优先，独立熔断）
+        result = self._get_capital_flow_asharehub(code)
+        if result is not None:
+            return result
+
+        # 源2: 大单交易汇总（内存缓存，毫秒级）
         result = self._get_capital_flow_big_deal(code)
         if result is not None:
             return result
 
-        # 源2: 同花顺全市场资金流（一次性拉取5189只，独立熔断）
+        # 源3: 同花顺全市场资金流（一次性拉取5189只，独立熔断）
         if self._source_available.get('ths_fund_flow', True):
             result = self._get_ths_fund_flow(code)
             if result is not None:
                 return result
 
+        return None
+
+    def _get_capital_flow_asharehub(self, code: str) -> Optional[float]:
+        """AShareHub 个股资金流（按订单规模），独立熔断
+
+        返回个股当日主力净流入（元），与 big_deal / ths_fund_flow 互不影响。
+        """
+        if not self._source_available.get('asharehub_moneyflow', True):
+            return None
+        if not self._asharehub_budget_ok():
+            return None
+        try:
+            from asharehub import AShareHub
+            if self._asharehub_client is None:
+                self._asharehub_client = AShareHub(
+                    api_key=os.environ.get('ASHAREHUB_API_KEY', ''),
+                    version='v2'
+                )
+            code6 = str(code).zfill(6)
+            symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
+            df = self._asharehub_client.moneyflow(symbol=symbol, limit=1)
+            if df is not None and not df.empty:
+                # net_mf_amount 单位为万元，转为元
+                net_amount_yuan = float(df.iloc[0]['net_mf_amount']) * 10000
+                if abs(net_amount_yuan) > 0:
+                    return net_amount_yuan
+            return None
+        except Exception as e:
+            logger.warning(f"asharehub资金流失败 {code}: {str(e)[:60]}")
+            self._source_available['asharehub_moneyflow'] = False
+            self._update_source_status('asharehub_moneyflow', False, str(e)[:60])
+        return None
+
+    def get_technical_factors_asharehub(self, code: str) -> Optional[dict]:
+        """AShareHub 预计算技术因子，独立熔断
+
+        返回最新一日的 MACD/RSI 等因子，用于双源技术评分校验。
+        与 K 线自算技术分互不影响。
+        """
+        if not self._source_available.get('asharehub_tech_factors', True):
+            return None
+        if not self._asharehub_budget_ok():
+            return None
+        try:
+            from asharehub import AShareHub
+            if self._asharehub_client is None:
+                self._asharehub_client = AShareHub(
+                    api_key=os.environ.get('ASHAREHUB_API_KEY', ''),
+                    version='v2'
+                )
+            code6 = str(code).zfill(6)
+            symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
+            df = self._asharehub_client.technical_factors(symbol=symbol, limit=1)
+            if df is not None and not df.empty:
+                row = df.iloc[-1]
+                return {
+                    'macd_dif': float(row.get('macd_dif', 0)),
+                    'macd_dea': float(row.get('macd_dea', 0)),
+                    'macd': float(row.get('macd', 0)),
+                    'rsi_6': float(row.get('rsi_6', 50)),
+                    'rsi_12': float(row.get('rsi_12', 50)),
+                    'rsi_24': float(row.get('rsi_24', 50)),
+                    'close_hfq': float(row.get('close_hfq', 0)),
+                    'cci': float(row.get('cci', 0)),
+                }
+            return None
+        except Exception as e:
+            logger.warning(f"asharehub技术因子失败 {code}: {str(e)[:60]}")
+            self._source_available['asharehub_tech_factors'] = False
+            self._update_source_status('asharehub_tech_factors', False, str(e)[:60])
+        return None
+
+    def get_concept_members(self, code: str) -> Optional[list]:
+        """AShareHub 个股所属概念板块列表，独立熔断
+
+        返回概念名称列表，用于 hot_theme 评分增强。
+        失败时不影响同花顺强势股 / 东财板块归属。
+        """
+        if not self._source_available.get('asharehub_concepts', True):
+            return None
+        if not self._asharehub_budget_ok():
+            return None
+        try:
+            from asharehub import AShareHub
+            if self._asharehub_client is None:
+                self._asharehub_client = AShareHub(
+                    api_key=os.environ.get('ASHAREHUB_API_KEY', ''),
+                    version='v2'
+                )
+            code6 = str(code).zfill(6)
+            symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
+            df = self._asharehub_client.concept_members(symbol=symbol, limit=200)
+            if df is not None and not df.empty:
+                names = df['con_name'].dropna().unique().tolist()
+                return names if names else None
+            return None
+        except Exception as e:
+            logger.warning(f"asharehub概念板块失败 {code}: {str(e)[:60]}")
+            self._source_available['asharehub_concepts'] = False
+            self._update_source_status('asharehub_concepts', False, str(e)[:60])
+        return None
+
+    def get_financial_indicators(self, code: str) -> Optional[dict]:
+        """AShareHub 核心财务指标，独立熔断
+
+        返回最新一期的 EPS/ROE/ROA/毛利率等，用于长线策略基本面评分。
+        失败时回退到 baostock / mootdx 财务数据。
+        """
+        if not self._source_available.get('asharehub_financial', True):
+            return None
+        if not self._asharehub_budget_ok():
+            return None
+        try:
+            from asharehub import AShareHub
+            if self._asharehub_client is None:
+                self._asharehub_client = AShareHub(
+                    api_key=os.environ.get('ASHAREHUB_API_KEY', ''),
+                    version='v2'
+                )
+            code6 = str(code).zfill(6)
+            symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
+            df = self._asharehub_client.financial_indicators(symbol=symbol, limit=1)
+            if df is not None and not df.empty:
+                row = df.iloc[-1]
+                return {
+                    'eps': float(row.get('eps', 0)),
+                    'roe': float(row.get('roe', 0)),
+                    'roe_waa': float(row.get('roe_waa', 0)),
+                    'roa': float(row.get('roa', 0)),
+                    'gross_margin': float(row.get('gross_margin', 0)),
+                    'netprofit_margin': float(row.get('netprofit_margin', 0)),
+                    'debt_to_assets': float(row.get('debt_to_assets', 0)),
+                    'bps': float(row.get('bps', 0)),
+                    'ocfps': float(row.get('ocfps', 0)),
+                    'basic_eps_yoy': float(row.get('basic_eps_yoy', 0)),
+                    'netprofit_yoy': float(row.get('netprofit_yoy', 0)),
+                }
+            return None
+        except Exception as e:
+            logger.warning(f"asharehub财务指标失败 {code}: {str(e)[:60]}")
+            self._source_available['asharehub_financial'] = False
+            self._update_source_status('asharehub_financial', False, str(e)[:60])
         return None
 
     def _get_ths_fund_flow(self, code: str) -> Optional[float]:

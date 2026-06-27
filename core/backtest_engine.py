@@ -19,6 +19,7 @@
 
 import logging
 import os
+import sqlite3
 import sys
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -67,6 +68,29 @@ class BacktestEngine:
         self.commission = self.config.get('commission_rate', 0.0003)
         self.slippage = self.config.get('slippage', 0.001)
 
+    def _warmup_kline_cache(self, codes: list, start_date: str, end_date: str):
+        """批量预热K线缓存：确保目标区间所有股票K线已缓存在SQLite"""
+        db_path = self.data_engine._kline_cache_path
+        if not os.path.exists(db_path):
+            logger.warning(f"K线缓存不存在({db_path})，回测将使用已有数据")
+            return
+
+        # 查缓存中已有多少股票
+        conn = sqlite3.connect(db_path)
+        try:
+            cached = conn.execute(
+                "SELECT COUNT(DISTINCT code) FROM kline_cache WHERE date>=? AND date<=?",
+                (start_date, end_date)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        coverage = cached / max(len(codes), 1) * 100
+        if coverage >= 50:
+            logger.info(f"K线缓存覆盖率 {coverage:.0f}% ({cached}/{len(codes)})，跳过预热")
+        else:
+            logger.info(f"K线缓存覆盖率仅 {coverage:.0f}% ({cached}/{len(codes)})，回测只能使用已缓存数据")
+
     def run(self, mode: str = 'short',
             start_date: str = "2025-01-01",
             end_date: str = "2025-12-31") -> BacktestResult:
@@ -110,9 +134,9 @@ class BacktestEngine:
         else:
             strategy = LongTermStrategy(self.config)
 
-        # 4. 预加载所有股票的历史 K 线（首次 ~10 分钟，缓存到 SQLite，
-        #    后续回测从缓存读取 ~1 分钟）
-        logger.info("预加载历史K线数据（首次较慢，后续缓存加速）...")
+        # 4. 预热K线缓存 + 预加载历史快照
+        self._warmup_kline_cache(codes, start_date, end_date)
+        logger.info("构建历史行情快照...")
         snapshots = self._load_historical_snapshots(
             codes, name_map, start_date, end_date
         )
@@ -120,7 +144,6 @@ class BacktestEngine:
 
         # 5. 逐日模拟
         all_records = []
-        equity_curve = []
 
         for i, trade_date in enumerate(trade_calendar):
             if (i + 1) % 20 == 0:
@@ -131,14 +154,18 @@ class BacktestEngine:
             if day_data is None or day_data.empty:
                 continue
 
-            # 运行策略
+            # 运行策略（传入回测模式标志 + 当前模拟日期）
             try:
-                recommendations = strategy.run({'quotes_df': day_data})
+                recommendations = strategy.run({
+                    'quotes_df': day_data,
+                    'backtest_mode': True,
+                    'backtest_date': trade_date,
+                })
             except Exception as e:
                 logger.warning(f"  {trade_date} 策略运行失败: {str(e)[:60]}")
                 continue
 
-            # 记录推荐
+            # 记录推荐（带仓位分配）
             for rec in recommendations:
                 all_records.append({
                     'date': trade_date,
@@ -147,20 +174,63 @@ class BacktestEngine:
                     'score': rec.get('score', 0),
                     'rating': rec.get('rating', ''),
                     'buy_price': rec.get('price', 0),
+                    'allocation_pct': rec.get('allocation_pct', 0),
                     'factor_breakdown': rec.get('breakdown', {}),
                 })
 
-            # 每日权益（简化：不模拟持仓，只算推荐命中率）
-            equity_curve.append(len(all_records))
+        # 6. 计算收益指标 + 仓位模拟
+        #    _calculate_results 保留原有的逐笔胜率/收益统计（不依赖仓位假设）
+        #    _simulate_portfolio 提供真实的仓位模拟指标
+        base_result = self._calculate_results(all_records, trade_calendar, mode,
+                                              start_date, end_date)
 
-        # 6. 计算收益（基于真实的 T+1 K线数据）
-        result = self._calculate_results(all_records, trade_calendar, mode,
-                                         start_date, end_date, equity_curve)
+        # 仓位模拟
+        pf = self._simulate_portfolio(all_records)
 
-        logger.info(f"\n回测完成: 胜率 {result.win_rate:.1f}% | "
+        result = BacktestResult(
+            strategy_name=base_result.strategy_name,
+            period=base_result.period,
+            total_trading_days=len(trade_calendar),
+            total_trades=base_result.total_trades,
+            win_rate=base_result.win_rate,
+            avg_return_t1=base_result.avg_return_t1,
+            avg_return_t5=base_result.avg_return_t5,
+            max_win_t1=base_result.max_win_t1,
+            max_loss_t1=base_result.max_loss_t1,
+            max_drawdown=pf['max_drawdown'],
+            sharpe_ratio=pf['sharpe_ratio'],
+            benchmark_return=base_result.benchmark_return,
+            strategy_return=pf['total_return'],
+            excess_return=round(pf['total_return'] - base_result.benchmark_return, 2),
+            monthly_returns=pf['monthly_returns'],
+            equity_curve=pf['equity_curve'],
+            factor_performance=base_result.factor_performance,
+            trade_details=pf['trade_details'][:50],
+        )
+
+        logger.info(f"\\n回测完成: 胜率 {result.win_rate:.1f}% | "
                      f"平均收益 {result.avg_return_t1:+.2f}% | "
-                     f"交易次数 {result.total_trades}")
+                     f"交易次数 {result.total_trades} | "
+                     f"组合收益 {result.strategy_return:+.2f}%")
         return result
+
+    # ── 历史量比计算 ─────────────────────────────────────────
+
+    @staticmethod
+    def _calc_volume_ratio(kline: pd.DataFrame, idx: int) -> float:
+        """从 K 线序列计算当日量比（当日成交量 / 过去 20 日均量）"""
+        today_vol = float(kline.iloc[idx]['volume']) if 'volume' in kline.columns else 0
+        if today_vol <= 0:
+            return 1.0
+        # 取过去 20 天（不含当日）
+        lookback = max(0, idx - 20)
+        past = kline.iloc[lookback:idx]['volume']
+        if len(past) < 2:
+            return 1.0
+        avg_vol = float(past.mean())
+        if avg_vol <= 0:
+            return 1.0
+        return today_vol / avg_vol
 
     def _load_historical_snapshots(self, codes: list, name_map: dict,
                                     start_date: str, end_date: str) -> Dict[str, pd.DataFrame]:
@@ -177,14 +247,11 @@ class BacktestEngine:
           - 名称取自今日行情（名称通常不变）
           - 股价=收盘价（非盘中实时价）
         """
-        import sqlite3
         db_path = self.data_engine._kline_cache_path
         if not os.path.exists(db_path):
             logger.warning(f"K线缓存不存在: {db_path}")
             return {}
 
-        import time as _time
-        batch_size = 200
         total = len(codes)
         kline_dict = {}
 
@@ -195,15 +262,16 @@ class BacktestEngine:
             try:
                 placeholders = ','.join(['?' for _ in cb])
                 conn = sqlite3.connect(db_path)
-                # 用 PARSE_DECLTYPES 加速日期解析
-                df_all = pd.read_sql_query(
-                    f"SELECT code, date, open, high, low, close, volume, amount "
-                    f"FROM kline_cache "
-                    f"WHERE code IN ({placeholders}) AND date>=? AND date<=? "
-                    f"ORDER BY code, date",
-                    conn, params=[str(c).zfill(6) for c in cb] + [start_date, end_date]
-                )
-                conn.close()
+                try:
+                    df_all = pd.read_sql_query(
+                        f"SELECT code, date, open, high, low, close, volume, amount "
+                        f"FROM kline_cache "
+                        f"WHERE code IN ({placeholders}) AND date>=? AND date<=? "
+                        f"ORDER BY code, date",
+                        conn, params=[str(c).zfill(6) for c in cb] + [start_date, end_date]
+                    )
+                finally:
+                    conn.close()
                 if not df_all.empty:
                     df_all['date'] = pd.to_datetime(df_all['date'])
                     df_all['date_str'] = df_all['date'].dt.strftime('%Y-%m-%d')
@@ -215,13 +283,20 @@ class BacktestEngine:
                         sub = df_all[df_all['code'] == code_str]
                         if len(sub) >= 3:
                             kline_dict[code_str] = sub.reset_index(drop=True)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"历史快照加载异常: {str(e)[:80]}")
                 pass
 
             if (len(kline_dict) % 1000) == 0 or len(kline_dict) == 0 and len(codes_batches) == 1:
                 logger.info(f"  历史快照加载: {len(kline_dict)} 只有效K线")
 
         logger.info(f"  历史快照加载完成: {len(kline_dict)}/{total} 只有效K线")
+
+        # 加载因子仓库数据（如果存在）
+        factor_data = self._load_factor_data(start_date, end_date)
+        cf_lookup = factor_data.get('capital_flow', {})   # {(date, code): value}
+        nf_lookup = factor_data.get('north_flow', {})     # {(date, code): value}
+        hot_lookup = factor_data.get('hot_stocks', set())  # set of (date, code)
 
         # 构建 {date: DataFrame}
         trade_dates = sorted(set(
@@ -242,24 +317,89 @@ class BacktestEngine:
                     prev_close = float(kline.iloc[idx - 1]['close'])
                 pct_chg = ((float(r['close']) - prev_close) / prev_close * 100) if prev_close and prev_close > 0 else 0.0
 
-                rows.append({
-                    'code': code,
-                    'name': name_map.get(code, ''),
+                # 查找因子仓库数据
+                code_str = str(code).zfill(6)
+                cf_val = cf_lookup.get((date_str, code_str))
+                nf_val = nf_lookup.get((date_str, code_str))
+                is_hot = (date_str, code_str) in hot_lookup
+
+                row = {
+                    'code': code_str,
+                    'name': name_map.get(code_str, ''),
                     'price': float(r['close']),
                     'pct_chg': round(pct_chg, 2),
                     'amount': float(r.get('amount', 0)),
-                    'turnover': 0.0,       # 历史换手率不可用
-                    'volume_ratio': 1.0,   # 历史量比不可用
+                    'turnover': 0.0,
+                    'volume_ratio': round(self._calc_volume_ratio(kline, idx), 2),
                     'volume': float(r.get('volume', 0)),
-                    'pe': None,            # 历史 PE 不可用
-                    'pb': None,            # 历史 PB 不可用
-                    'name_raw': name_map.get(code, ''),
-                })
+                    'pe': None,
+                    'pb': None,
+                    'name_raw': name_map.get(code_str, ''),
+                }
+
+                # 如果因子仓库中有数据，附加到快照
+                if cf_val is not None:
+                    row['main_fund_accumulated'] = cf_val
+                if nf_val is not None:
+                    row['north_flow_accumulated'] = nf_val
+                if is_hot:
+                    row['is_hot_stock'] = True
+
+                rows.append(row)
 
             if rows:
                 snapshots[date_str] = pd.DataFrame(rows)
 
         return snapshots
+
+    def _load_factor_data(self, start_date: str, end_date: str) -> Dict:
+        """从因子仓库批量加载历史因子数据"""
+        factor_db = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            'data', 'cache', 'factor_daily.db'
+        )
+        result = {
+            'capital_flow': {},
+            'north_flow': {},
+            'hot_stocks': set(),
+        }
+        if not os.path.exists(factor_db):
+            return result
+
+        try:
+            conn = sqlite3.connect(factor_db)
+
+            # 资金流
+            for row in conn.execute(
+                "SELECT date, code, accumulated_net FROM capital_flow "
+                "WHERE date>=? AND date<=?", (start_date, end_date)
+            ):
+                result['capital_flow'][(row[0], row[1])] = row[2]
+
+            # 北向
+            for row in conn.execute(
+                "SELECT date, code, holding_change FROM north_flow "
+                "WHERE date>=? AND date<=?", (start_date, end_date)
+            ):
+                result['north_flow'][(row[0], row[1])] = row[2]
+
+            # 热点
+            for row in conn.execute(
+                "SELECT date, code FROM hot_stocks "
+                "WHERE date>=? AND date<=?", (start_date, end_date)
+            ):
+                result['hot_stocks'].add((row[0], row[1]))
+
+            conn.close()
+            cf = len(result['capital_flow'])
+            nf = len(result['north_flow'])
+            hs = len(result['hot_stocks'])
+            if cf or nf or hs:
+                logger.info(f"因子仓库加载: 资金流{cf}条, 北向{nf}条, 热点{hs}条")
+        except Exception as e:
+            logger.warning(f"因子仓库加载失败: {e}")
+
+        return result
 
     def _get_trade_calendar(self, start: str, end: str) -> List[str]:
         """获取真实交易日历"""
@@ -281,37 +421,9 @@ class BacktestEngine:
                 current += timedelta(days=1)
             return dates
 
-    def _get_day_snapshot(self, trade_date: str) -> Optional[pd.DataFrame]:
-        """
-        获取某日的全市场行情快照
-
-        注意：回测模式下，调用 get_all_quotes() 获取的是今日实时数据，
-        并非历史当日数据。这意味着回测的预过滤/评分阶段使用的是
-        当前市场的价格排名，而非历史当日的。
-        这是一个已知的近似——回测主要验证策略框架的有效性，
-        而非精确的历史复现。
-        """
-        try:
-            return self.data_engine.get_all_quotes()
-        except Exception as e:
-            logger.warning(f"  {trade_date} 行情获取失败: {str(e)[:60]}")
-        return None
-
-    def _update_positions(self, positions: dict, trade_date: str):
-        """更新持仓状态"""
-        to_remove = []
-        for code, pos in positions.items():
-            pos['days_held'] = pos.get('days_held', 0) + 1
-            # T+3 时间止损
-            if pos['days_held'] >= 3:
-                to_remove.append(code)
-        for code in to_remove:
-            del positions[code]
-
     def _calculate_results(self, records: List[Dict],
                            trade_calendar: List[str],
-                           mode: str, start: str, end: str,
-                           equity_curve: List[float]) -> BacktestResult:
+                           mode: str, start: str, end: str) -> BacktestResult:
         """计算回测结果指标（全部基于真实K线数据）"""
         n_trades = len(records)
 
@@ -434,15 +546,194 @@ class BacktestEngine:
             strategy_return=round(strategy_return, 2),
             excess_return=round(excess_return, 2),
             monthly_returns=monthly_returns,
-            equity_curve=equity_curve,
             factor_performance=factor_performance,
             trade_details=trade_details[:50]  # 前50条明细
         )
 
+    # ── 仓位模拟回测 ─────────────────────────────────────────────
+
+    def _simulate_portfolio(self, records: List[Dict]) -> Dict:
+        """
+        按 allocation_pct 分配资金，逐日模拟真实仓位
+
+        T+1 策略：当日推荐 → 次日开盘买入 → 次日收盘卖出
+        每笔交易独立，资金次日复用。
+
+        返回：
+            equity_curve:     每日收盘总净值列表
+            total_return:     总收益率 (%)
+            max_drawdown:     最大回撤 (%)
+            sharpe_ratio:     夏普比率（年化）
+            monthly_returns:  月度收益明细
+            trade_details:    每笔交易明细（含仓位占比、实际盈亏）
+        """
+        if not records:
+            return self._empty_portfolio_result()
+
+        # 按日期分组
+        from collections import defaultdict
+        by_date = defaultdict(list)
+        for rec in records:
+            by_date[rec['date']].append(rec)
+
+        sorted_dates = sorted(by_date.keys())
+        cash = float(self.initial_capital)
+        equity_curve = [cash]
+        trade_details = []
+        daily_returns = []  # 每日收益率（小数）
+
+        for trade_date in sorted_dates:
+            day_recs = by_date[trade_date]
+            # 过滤掉没有 allocation_pct 的
+            day_recs = [r for r in day_recs if r.get('allocation_pct', 0) > 0]
+            if not day_recs:
+                equity_curve.append(cash)
+                daily_returns.append(0.0)
+                continue
+
+            total_alloc = sum(r['allocation_pct'] for r in day_recs)
+            day_pnl = 0.0  # 当日总盈亏
+
+            for rec in day_recs:
+                code = rec['code']
+                alloc = rec['allocation_pct']
+                # 分配该股票的资金比例
+                capital_ratio = alloc / total_alloc if total_alloc > 0 else 0
+
+                # 获取 T+1 K 线
+                from datetime import datetime, timedelta
+                end_look = (datetime.strptime(trade_date, '%Y-%m-%d') + timedelta(days=10)).strftime('%Y-%m-%d')
+                kline = self.data_engine.get_kline(code, start_date=trade_date, end_date=end_look)
+                if kline is None or kline.empty or len(kline) < 2:
+                    continue
+                kline = kline.reset_index(drop=True)
+
+                open_t1 = float(kline.iloc[1]['open'])
+                close_t1 = float(kline.iloc[1]['close'])
+
+                if open_t1 <= 0 or close_t1 <= 0:
+                    continue
+
+                # 买入：开盘价 + 滑点 + 佣金
+                buy_price = open_t1 * (1 + self.slippage) * (1 + self.commission)
+                # 卖出：收盘价 - 滑点 - 佣金
+                sell_price = close_t1 * (1 - self.slippage) * (1 - self.commission)
+
+                # 该股票占用资金比例
+                allocated_capital = cash * capital_ratio
+                shares = allocated_capital / buy_price
+
+                # 实际支出（从现金扣除）
+                cost = shares * buy_price
+                # 收入（回到现金）
+                proceeds = shares * sell_price
+
+                ret = (proceeds / cost - 1) * 100 if cost > 0 else 0
+                trade_details.append({
+                    'date': trade_date,
+                    'code': code,
+                    'name': rec.get('name', ''),
+                    'score': rec.get('score', 0),
+                    'allocation_pct': alloc,
+                    'buy_price': round(buy_price, 2),
+                    'sell_price': round(sell_price, 2),
+                    'return_pct': round(ret, 2),
+                    'capital_used': round(cost, 2),
+                    'pnl': round(proceeds - cost, 2),
+                })
+
+                day_pnl += (proceeds - cost)
+
+            # 当日总收益 = 所有持仓的净盈亏
+            # 当日现金变化 = cash + day_pnl (所有交易在同一天完成，现金不变动中间状态)
+            cash += day_pnl
+            day_return = day_pnl / (cash - day_pnl) if (cash - day_pnl) > 0 else 0
+            daily_returns.append(day_return)
+            equity_curve.append(round(cash, 2))
+
+        if len(equity_curve) < 2:
+            return self._empty_portfolio_result()
+
+        # 计算总收益
+        total_return = (equity_curve[-1] / self.initial_capital - 1) * 100
+
+        # 年化夏普
+        ret_arr = np.array(daily_returns)
+        if len(ret_arr) > 1 and np.std(ret_arr) > 0:
+            sharpe = float(np.mean(ret_arr) / np.std(ret_arr) * np.sqrt(252))
+        else:
+            sharpe = 0.0
+
+        # 最大回撤（从 equity_curve 算）
+        eq_arr = np.array(equity_curve)
+        peak = np.maximum.accumulate(eq_arr)
+        drawdowns = (eq_arr - peak) / peak
+        max_dd = float(np.min(drawdowns)) * 100 if len(drawdowns) > 0 else 0.0
+
+        # 月度收益
+        monthly = self._calc_monthly_portfolio_returns(trade_details)
+
+        return {
+            'equity_curve': equity_curve,
+            'total_return': round(total_return, 2),
+            'max_drawdown': round(max_dd, 2),
+            'sharpe_ratio': round(sharpe, 2),
+            'monthly_returns': monthly,
+            'trade_details': trade_details,
+        }
+
+    def _empty_portfolio_result(self) -> Dict:
+        return {
+            'equity_curve': [self.initial_capital],
+            'total_return': 0.0,
+            'max_drawdown': 0.0,
+            'sharpe_ratio': 0.0,
+            'monthly_returns': [],
+            'trade_details': [],
+        }
+
+    def _calc_monthly_portfolio_returns(self, trade_details: List[Dict]) -> List[Dict]:
+        """从仓位模拟的交易明细中按月汇总收益（用月初本金做分母）"""
+        monthly = {}
+        # 按日期排序，计算月初本金
+        sorted_trades = sorted(trade_details, key=lambda x: x['date'])
+        # 从第一笔交易开始模拟资金流
+        current_capital = self.initial_capital
+        month_start_capital = {}
+        prev_month = None
+        for td in sorted_trades:
+            month = td['date'][:7]
+            if month != prev_month:
+                month_start_capital[month] = current_capital
+                prev_month = month
+            # 更新资本（模拟后续月份使用）
+            current_capital += td.get('pnl', 0)
+
+        for td in sorted_trades:
+            month = td['date'][:7]
+            if month not in monthly:
+                monthly[month] = {'pnls': [], 'trades': 0}
+            monthly[month]['pnls'].append(td.get('pnl', 0))
+            monthly[month]['trades'] += 1
+
+        result = []
+        for month in sorted(monthly.keys()):
+            data = monthly[month]
+            total_pnl = sum(data['pnls'])
+            base = month_start_capital.get(month, self.initial_capital)
+            est_return = (total_pnl / base) * 100 if base > 0 else 0
+            result.append({
+                'month': month,
+                'pnl': round(total_pnl, 2),
+                'est_return': round(est_return, 2),
+                'trades': data['trades'],
+            })
+        return result
+
     def _calc_benchmark_return(self, start: str, end: str) -> float:
-        """计算沪深300基准收益"""
+        """计算沪深300基准收益（A股指数代码 399300）"""
         try:
-            kline = self.data_engine.get_kline('000300', start_date=start, end_date=end)
+            kline = self.data_engine.get_kline('399300', start_date=start, end_date=end)
             if kline is not None and not kline.empty and len(kline) >= 2:
                 return (kline['close'].iloc[-1] / kline['close'].iloc[0] - 1) * 100
         except Exception as e:
@@ -507,8 +798,14 @@ class BacktestEngine:
                     raw = detail.get('raw_score', 50)
                 else:
                     raw = 50
-                # 跳过常数列（如回测中恒定为 50 的 capital_flow），这些算 IC 没意义
                 factor_scores[fname] = raw
+
+            # ← 这里补上缺失的 append
+            rows.append({
+                'return_t1': score,
+                'factor_scores': factor_scores,
+                'is_win': score >= 0,
+            })
 
         if not rows:
             return {}
@@ -640,8 +937,6 @@ class BacktestEngine:
         logger.info(f"{'='*60}")
 
         # 1. 找出 K 线缓存里有足够历史的所有股票
-        import sqlite3
-        import os
         db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'cache', 'kline_cache.db')
         if not os.path.exists(db_path):
             logger.warning(f"K线缓存不存在: {db_path}")

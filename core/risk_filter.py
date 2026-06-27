@@ -20,6 +20,23 @@ logger = logging.getLogger(__name__)
 class RiskFilter:
     """风险过滤器 — 逐一检查股票是否符合买入条件"""
 
+    # 板块涨跌幅限制（根据代码前缀）
+    BOARD_LIMITS = [
+        ('688', 20.0), ('689', 20.0),  # 科创板
+        ('300', 20.0), ('301', 20.0),  # 创业板
+        ('8', 30.0),                   # 北交所
+        ('4', 30.0),                   # 老三板
+        # 默认: 60/00/其他 → 10%
+    ]
+
+    @staticmethod
+    def get_board_limit(code: str) -> float:
+        """根据股票代码判断涨跌幅限制"""
+        for prefix, limit in RiskFilter.BOARD_LIMITS:
+            if code.startswith(prefix):
+                return limit
+        return 10.0
+
     def __init__(self, config: dict = None):
         self.config = config or {}
         self.min_amount = self.config.get('min_volume', 30_000_000)  # 默认3000万
@@ -94,18 +111,24 @@ class RiskFilter:
             reasons.append(f'成交额不足 ({amount/1e4:.0f}万 < {self.min_amount/1e4:.0f}万)')
             penalty = max(penalty, 0.5)
 
-        # 3. 涨停封死检查
+        # 3. 涨停封死检查（根据板块涨跌幅限制）
         if self.exclude_limit_up:
             pct_chg = stock_info.get('pct_chg', 0) or 0
             limit_up = stock_info.get('limit_up_amount', 0) or 0
-            # 涨停且封单金额大
-            if pct_chg >= 9.5 and limit_up > 0:
-                reasons.append('涨停封死')
+            code = stock_info.get('code', '')
+            board_limit = self.get_board_limit(code)
+            threshold = board_limit * 0.95  # 留5%容差：10%→9.5%, 20%→19%, 30%→28.5%
+            if pct_chg >= threshold and limit_up > 0:
+                reasons.append(f'涨停封死(板{board_limit:.0f}%)')
                 penalty = max(penalty, 0.8)
 
-        # 4. 跌停检查
-        if stock_info.get('pct_chg', 0) is not None and stock_info.get('pct_chg', 0) <= -9.5:
-            reasons.append('跌停')
+        # 4. 跌停检查（根据板块涨跌幅限制）
+        pct_chg_val = stock_info.get('pct_chg', 0) or 0
+        code = stock_info.get('code', '')
+        board_limit = self.get_board_limit(code)
+        dd_threshold = board_limit * -0.95
+        if pct_chg_val <= dd_threshold:
+            reasons.append(f'跌停(板{board_limit:.0f}%)')
             penalty = max(penalty, 0.8)
 
         # 5. 换手率异常

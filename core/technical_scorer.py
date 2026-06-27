@@ -138,6 +138,110 @@ class TechnicalScorer:
 
         return result
 
+    def score_from_asharehub(self, tech: dict) -> float:
+        """将 AShareHub technical_factors 转换为 0-100 技术分
+
+        tech 字段: macd_dif, macd_dea, macd, rsi_6, rsi_12, rsi_24, cci
+        """
+        score = 50.0
+
+        # MACD 状态 (0-30分)
+        macd_val = tech.get('macd', 0)
+        macd_dif = tech.get('macd_dif', 0)
+        macd_dea = tech.get('macd_dea', 0)
+        if macd_dif > macd_dea and macd_dif > 0:
+            score += 15  # 零轴上多头
+        elif macd_dif > macd_dea:
+            score += 10  # 多头
+        elif macd_val > 0:
+            score += 5   # 柱线为正
+        else:
+            score -= 10  # 空头
+
+        # RSI (0-30分) — 取 RSI_14 近似值 (rsi_12 和 rsi_24 的中值)
+        rsi12 = tech.get('rsi_12', 50)
+        rsi24 = tech.get('rsi_24', 50)
+        rsi_approx = (rsi12 + rsi24) / 2
+        if rsi_approx < 25:
+            score += 15  # 超卖区，反弹机会
+        elif rsi_approx < 40:
+            score += 10  # 偏弱但安全
+        elif rsi_approx < 60:
+            score += 5   # 中性
+        elif rsi_approx < 75:
+            score += 0   # 偏强但正常
+        else:
+            score -= 5   # 超买风险
+
+        # CCI (0-10分)
+        cci = tech.get('cci', 0)
+        if cci < -100:
+            score += 5    # 超卖
+        elif cci > 100:
+            score += 0    # 超买区域
+        else:
+            score += 2    # 中性
+
+        return max(0, min(100, score))
+
+    def score_dual_source(self, kline_df: Optional[pd.DataFrame],
+                          asharehub_tech: Optional[dict]) -> TechnicalScore:
+        """双源技术评分 — K 线自算 + AShareHub API
+
+        逻辑：
+          - 两个源都可用 → 一致时平均加分，分歧时保守值
+          - 仅一个源可用 → 用该源
+          - 都不可用 → 中性 50 分
+        """
+        result = TechnicalScore()
+
+        # 自算分
+        our_result = self.score(kline_df) if kline_df is not None and len(kline_df) >= 20 else None
+        our_total = our_result.total if our_result else None
+
+        # API 分
+        their_total = self.score_from_asharehub(asharehub_tech) if asharehub_tech else None
+
+        if our_total is not None and their_total is not None:
+            diff = abs(our_total - their_total)
+            if diff < 20:
+                # 一致 → 平均 + 加分
+                result.total = (our_total + their_total) / 2 + 5
+                result.reasons.append(f"双源一致(diff={diff:.0f})，加5分")
+            elif diff < 40:
+                # 轻度分歧 → 保守加权
+                result.total = (our_total * 0.6 + their_total * 0.4)
+                result.reasons.append(f"双源轻度分歧(diff={diff:.0f})，保守加权")
+            else:
+                # 严重分歧 → 取低值减分
+                result.total = min(our_total, their_total) - 5
+                result.reasons.append(f"双源严重分歧(diff={diff:.0f})，取保守值")
+        elif our_total is not None:
+            result.total = our_total
+            result.reasons.append("仅K线源可用")
+        elif their_total is not None:
+            result.total = their_total
+            result.reasons.append("仅AShareHub源可用")
+        else:
+            result.total = 50.0
+            result.reasons.append("双源均不可用，中性分")
+
+        result.total = max(0, min(100, result.total))
+
+        # 信号判定（保持与 score() 一致的逻辑）
+        if result.total >= 75:
+            result.signal = "STRONG_BUY"
+        elif result.total >= 60:
+            result.signal = "BUY"
+        elif result.total >= 45:
+            result.signal = "HOLD"
+        elif result.total >= 30:
+            result.signal = "WAIT"
+        else:
+            result.signal = "SELL"
+
+        return result
+
     # ---- 各维度评分 ----
 
     def _score_trend(self, ma5: pd.Series, ma10: pd.Series,

@@ -75,6 +75,11 @@ class PredictionTracker:
             ON predictions(mode)
         """)
 
+        c.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_predictions_unique
+            ON predictions(date, code, mode)
+        """)
+
         conn.commit()
         conn.close()
 
@@ -137,19 +142,21 @@ class PredictionTracker:
         t20_return = round((t20_close - buy_price) / buy_price * 100, 2) if t20_close else None
 
         conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute(
-            """INSERT OR REPLACE INTO outcomes
-               (prediction_id, t1_date, t1_close, t1_return,
-                t5_date, t5_close, t5_return,
-                t20_date, t20_close, t20_return)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (prediction_id, t1_date, t1_close, t1_return,
-             t5_date, t5_close, t5_return,
-             t20_date, t20_close, t20_return)
-        )
-        conn.commit()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute(
+                """INSERT OR REPLACE INTO outcomes
+                   (prediction_id, t1_date, t1_close, t1_return,
+                    t5_date, t5_close, t5_return,
+                    t20_date, t20_close, t20_return)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (prediction_id, t1_date, t1_close, t1_return,
+                 t5_date, t5_close, t5_return,
+                 t20_date, t20_close, t20_return)
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def calc_accuracy(self, mode: str = 'short', days: int = None) -> Dict:
         """

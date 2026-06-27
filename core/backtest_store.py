@@ -105,6 +105,8 @@ class BacktestStore:
         )
 
         conn = sqlite3.connect(self.db_path)
+        # 从 strategy_name 提取 mode（如 "short_strategy" → "short"）
+        mode = result.strategy_name.replace('_strategy', '') if result.strategy_name else ''
         cur = conn.execute(
             """INSERT INTO backtest_runs
                (strategy_name, mode, start_date, end_date,
@@ -116,9 +118,10 @@ class BacktestStore:
                 factor_performance)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                result.strategy_name, result.period[0] if hasattr(result, 'period') and isinstance(result.period, tuple) else '',
-                '',  # 暂时用后面
-                '',
+                result.strategy_name,
+                mode,
+                str(result.period[0]) if hasattr(result, 'period') and result.period else '',
+                str(result.period[1]) if hasattr(result, 'period') and result.period else '',
                 json.dumps(weight_snapshot, ensure_ascii=False),
                 json.dumps(config_snapshot, ensure_ascii=False),
                 result.total_trading_days,
@@ -135,12 +138,6 @@ class BacktestStore:
             )
         )
         run_id = cur.lastrowid
-
-        # 写回 period
-        conn.execute("UPDATE backtest_runs SET start_date=?, end_date=? WHERE id=?",
-                     (str(result.period[0]) if hasattr(result, 'period') and result.period else '',
-                      str(result.period[1]) if hasattr(result, 'period') and result.period else '',
-                      run_id))
 
         # 存储交易明细（仅前 50 条）
         for td in result.trade_details[:50]:

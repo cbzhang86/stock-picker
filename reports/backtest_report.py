@@ -35,14 +35,13 @@ def generate_backtest_report(result: BacktestResult) -> str:
         lines.append("- 适用于因子筛选验证，不替代策略级回测")
         lines.append("")
     else:
-        lines.append("## ⚠️ 数据来源说明（必读）")
+        lines.append("## ℹ️ 回测说明")
         lines.append("")
-        lines.append("- **当前回测是\"近似回测\"**，并非严格历史复现")
-        lines.append("- 引擎 `_get_day_snapshot()` 简化实现：拉取的是**当日实时全市场行情**而非历史某日的 snapshot")
-        lines.append("- 资金流 / 题材 / 题材归因 / 龙虎榜 / 北向因子在回测期间**没有真实历史数据可用**（这些数据是当日 akshare 截面，回溯时只能用今日数据）")
-        lines.append("- 因此这些因子的\"赢单/输单分差\"会趋近于 0 —— **不代表因子无效**，是当前数据条件下的事实")
-        lines.append("- 因子分析新增 **IC（信息系数）** + verdict 解读：|IC| > 0.03 算有效，便于对照真实 alpha")
-        lines.append("- 如要严谨验证某个因子，请用 `--mode kfactor` 进入 K 线因子回测")
+        lines.append("- **数据来源**：基于 K 线缓存中股票的历史日 K 线构建每日行情快照，**无前视偏差**")
+        lines.append("- **资金流 / 题材 / 龙虎榜 / 北向因子** 在回测期间没有真实历史数据，这些因子恒定为中性分")
+        lines.append("- **动量(momentum) / 技术(technical) / 量价(volume_price)** 从历史 K 线重算，在回测中有真实方差")
+        lines.append("- **仓位模拟**：T+1 开盘买入 / T+1 收盘卖出，按 PortfolioOptimizer 分配比例执行，滑点万十+佣金万三")
+        lines.append("- 回测指标中的 **胜率** 和 **平均收益** 为逐笔独立统计；**总收益/夏普/回撤** 基于仓位模拟计算")
         lines.append("")
 
     if result.total_trades == 0:
@@ -112,28 +111,29 @@ def generate_backtest_report(result: BacktestResult) -> str:
     if result.monthly_returns:
         lines.append("")
         lines.append("---")
-        lines.append("## 📅 月度表现")
+        lines.append("## 📅 月度表现（仓位模拟）")
         lines.append("")
-        lines.append("| 月份 | 平均收益 | 胜率 | 交易次数 |")
-        lines.append("|------|---------|------|---------|")
+        lines.append("| 月份 | 收益 | 交易次数 |")
+        lines.append("|------|------|---------|")
         for m in result.monthly_returns:
-            lines.append(f"| {m['month']} | {m['avg_return']:+.2f}% | "
-                        f"{m['win_rate']:.0f}% | {m['trades']} |")
+            lines.append(f"| {m['month']} | {m['est_return']:+.2f}% | {m['trades']} |")
 
-    # 交易明细（前10条）
+    # 交易明细（前10条，仓位模拟版本）
     if result.trade_details:
         lines.append("")
         lines.append("---")
-        lines.append("## 📋 交易明细（前10条）")
+        lines.append("## 📋 交易明细（前10条，含仓位）")
         lines.append("")
-        lines.append("| 日期 | 代码 | 名称 | 评分 | 买入价 | T+1收益 |")
-        lines.append("|------|------|------|------|--------|---------|")
+        lines.append("| 日期 | 代码 | 名称 | 评分 | 仓位 | 买入价 | 卖出价 | 盈亏% |")
+        lines.append("|------|------|------|------|------|--------|--------|-------|")
         for td in result.trade_details[:10]:
-            ret = td.get('return_t1', 0)
+            ret = td.get('return_pct', 0)
             mark = "✅" if ret and ret > 0 else "❌"
+            alloc = f"{td.get('allocation_pct', 0):.0f}%"
             lines.append(f"| {td['date']} | {td['code']} | {td.get('name','')} | "
-                        f"{td.get('score', 0):.0f} | "
+                        f"{td.get('score', 0):.0f} | {alloc} | "
                         f"{td.get('buy_price', 0):.2f} | "
+                        f"{td.get('sell_price', 0):.2f} | "
                         f"{mark} {ret:+.2f}% |")
 
     # 优化建议

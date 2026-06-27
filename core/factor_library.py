@@ -22,7 +22,7 @@
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List
+from typing import Dict
 
 
 class FactorLibrary:
@@ -212,22 +212,32 @@ class FactorLibrary:
             return 40
 
     @staticmethod
-    def calc_hot_theme_score(is_hot_stock: bool, blocks: dict = None) -> float:
+    def calc_hot_theme_score(is_hot_stock: bool, blocks: dict = None,
+                             concept_names: list = None) -> float:
         """
-        热门题材加分 — 同花顺热点 + 板块归属
-        来源：a-stock-data §3.1 同花顺热点 + §3.3 板块归属
+        热门题材加分 — 三源融合：同花顺热点 + 板块归属 + AShareHub概念板块
 
         is_hot_stock: 是否在同花顺强势股列表中
         blocks: 板块归属结果（东财 slist）
+        concept_names: AShareHub概念板块名称列表
         返回: 0-100 分，仅供报告引用，实际加分由 ScoringModel 权重控制
         """
         score = 50.0
         if is_hot_stock:
-            score += 25  # 强势股且有题材归因标签
+            score += 20  # 强势股且有题材归因标签
         if blocks and blocks.get('total', 0) > 0:
-            # 所属板块数越多越好（覆盖面广）
             board_count = min(blocks['total'], 20)
-            score += min(board_count * 1.25, 25)
+            score += min(board_count * 1.0, 15)
+
+        # AShareHub 概念板块增强（全市场覆盖，覆盖面远超同花顺强势股）
+        if concept_names:
+            n_concepts = len(concept_names)
+            if n_concepts >= 10:
+                score += 15  # 多概念覆盖，板块效应强
+            elif n_concepts >= 5:
+                score += 10
+            elif n_concepts >= 2:
+                score += 5
         return min(score, 100)
 
     @staticmethod
@@ -454,12 +464,13 @@ class FactorLibrary:
         rps_value = stock_data.get('rps_20', 50)
         factors['momentum'] = self.calc_rps_score(rps_value)
 
-        # 技术形态 — 优先用 TechnicalScorer 完整评分，其次回退到 MACD
+        # 技术形态 — 双源评分（K线自算 + AShareHub API 校验）
         kline_df = stock_data.get('kline_df')
-        if kline_df is not None and not kline_df.empty and len(kline_df) >= 20:
+        asharehub_tech = stock_data.get('asharehub_tech')
+        if kline_df is not None or asharehub_tech is not None:
             from core.technical_scorer import TechnicalScorer
             tech_scorer = TechnicalScorer()
-            tech_result = tech_scorer.score(kline_df)
+            tech_result = tech_scorer.score_dual_source(kline_df, asharehub_tech)
             factors['technical'] = tech_result.total
         else:
             # 回退到原来的 MACD 评分
@@ -502,29 +513,45 @@ class FactorLibrary:
         # 风险 — 风控通过时 score_penalty=0 → risk_score=100
         factors['risk'] = stock_data.get('risk_score', 100)
 
-        # 新信号因子 — 同花顺热点/板块归属/龙虎榜
+        # 新信号因子 — 同花顺热点/板块归属/AShareHub概念/龙虎榜
         factors['hot_theme'] = self.calc_hot_theme_score(
             stock_data.get('is_hot_stock', False),
-            stock_data.get('blocks')
+            stock_data.get('blocks'),
+            stock_data.get('concept_names')
         )
         factors['dragon_tiger'] = self.calc_dragon_tiger_score(
             stock_data.get('dragon_tiger')
         )
 
         if mode == 'long':
-            # 基本面因子：使用新的 ROE/PE 多维度评分，而非内联硬编码
-            factors['fundamental'] = self.calc_fundamental_score(
-                pe=stock_data.get('pe'),
-                pb=stock_data.get('pb'),
-                roe=stock_data.get('roe'),
-                eps=stock_data.get('eps'),
-                mcap=stock_data.get('total_market_cap', 0),
-            )
-            factors['valuation'] = self.calc_valuation_score(
-                pe=stock_data.get('pe'),
-                pb=stock_data.get('pb'),
-                roe=stock_data.get('roe'),
-            )
+            # 基本面因子：优先用 AShareHub 财务指标，回退到 mootdx/baostock
+            fin = stock_data.get('financial_indicators')
+            if fin:
+                factors['fundamental'] = self.calc_fundamental_score(
+                    pe=stock_data.get('pe'),
+                    pb=stock_data.get('pb'),
+                    roe=fin.get('roe'),
+                    eps=fin.get('eps'),
+                    mcap=stock_data.get('total_market_cap', 0),
+                )
+                factors['valuation'] = self.calc_valuation_score(
+                    pe=stock_data.get('pe'),
+                    pb=stock_data.get('pb'),
+                    roe=fin.get('roe'),
+                )
+            else:
+                factors['fundamental'] = self.calc_fundamental_score(
+                    pe=stock_data.get('pe'),
+                    pb=stock_data.get('pb'),
+                    roe=stock_data.get('roe'),
+                    eps=stock_data.get('eps'),
+                    mcap=stock_data.get('total_market_cap', 0),
+                )
+                factors['valuation'] = self.calc_valuation_score(
+                    pe=stock_data.get('pe'),
+                    pb=stock_data.get('pb'),
+                    roe=stock_data.get('roe'),
+                )
             factors['institutional'] = self.calc_institutional_score(
                 dragon_tiger=stock_data.get('dragon_tiger'),
                 main_fund=stock_data.get('main_fund_accumulated'),
