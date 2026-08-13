@@ -9,18 +9,19 @@
 #   阶段2（>=30条预测后）：feedback/optimizer.py 自动 Ridge 校准
 short_term:
   weights:
-    capital_flow: 0.25         # 主力资金流（近10日累计流入）
-    north_flow: 0.10           # 北向资金（asharehub 个股持仓，2026-06-26 修复）
+    capital_flow: 0.35         # 主力资金流（吸收原 north_flow 10%，降权后短线最依赖因子）
+    north_flow: 0.00           # 北向资金（2024-08 政策停公开，因子返回中性 50，不再占权重）
     momentum: 0.25             # 动量/RPS排位（A 股最强 cross-sectional 因子）
     technical: 0.15            # 技术形态（均线/MACD）
     volume_price: 0.10         # 量价配合
     hot_theme: 0.10            # 同花顺热点/题材归因
     dragon_tiger: 0.05         # 龙虎榜信号（叠加于 capital_flow 表达游资动量维度）
     # 合计 1.00。设计原理：
-    # - 资金流 + 龙虎榜 总计 0.30，表达"游资动量"复合维度
+    # - 资金流 + 龙虎榜 总计 0.40 (原 0.30，吸收北向 0.10)
     # - momentum 0.25 是 A 股学术公认的 cross-sectional alpha 源
     # - 技术 + 量价 = 0.25 提供系统化择时确认
-    # - hot_theme + north_flow 各 0.10，反映"题材 + 境外聪明钱"的辅助信号
+    # - hot_theme 0.10 反映"题材热度"的辅助信号
+    # - north_flow 0.00 政策停公开，因子恒返回 50 不占权重（2026-07-13 改）
     # risk 不在权重表（语义不属于评分分项，而是过滤/惩罚）。
     # 风控通过 risk_filter 前置拦截（ST/涨停封死/解禁压力等），
     # 剩余软风险由 scoring_model 的 penalty 路径在总分上额外扣减。
@@ -43,9 +44,9 @@ short_term:
 # ---- 长线策略权重 ----
 long_term:
   weights:
-    fundamental: 0.30         # 基本面（ROE+净利率+负债率）
-    north_flow: 0.20          # 北向资金（长线权重显著上调，月度 IC 约 0.05-0.08）
-    momentum: 0.15            # 中期动量（60/120日RPS，与短线动量切开）
+    fundamental: 0.40           # 基本面（吸收原 north_flow 10%，长线最稳定信号源）
+    north_flow: 0.00            # 北向资金（2024-08 政策停公开，因子恒返回 50 中性值，不占权重）
+    momentum: 0.25              # 中期动量（60/120日RPS，吸收另一半 north_flow 10%，长线增强动量权重）
     valuation: 0.20           # 估值水位（PB+PS+股息率，分位指标，不含 PE）
     institutional: 0.15       # 机构动向（龙虎榜机构+大股东增减持）
 

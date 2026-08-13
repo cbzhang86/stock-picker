@@ -147,7 +147,7 @@ python scripts/eod_stock_picker.py --status
 # 回测验证（默认近 3 个月）
 python scripts/run_backtest.py --mode short
 
-# 健康检查（23 项）
+# 健康检查（9 项）
 python scripts/verify.py
 ```
 

@@ -123,7 +123,7 @@ python scripts/run_backtest.py --mode short
 python scripts/run_backtest.py --list
 python scripts/run_backtest.py --compare 1 2
 
-# 健康检查（23 项）
+# 健康检查（9 项）
 python scripts/verify.py
 ```
 
@@ -251,7 +251,7 @@ stock-picker/
 ├── scripts/                       # 用户入口
 │   ├── eod_stock_picker.py        # 主入口
 │   ├── run_backtest.py            # 回测入口
-│   └── verify.py                  # 23 项健康检查
+│   └── verify.py                  # 9 项健康检查
 │
 ├── config.yml                     # 中心配置
 ├── SKILL.md                       # AI 助手技能文件
@@ -297,7 +297,7 @@ stock-picker/
 > "茅台基本面怎么样" → 显示 ROE / EPS / 估值
 > "跑一下回测" → 执行回测引擎
 > "对比两次回测" → 查看历史回测记录对比
-> "检查系统健康" → 运行 verify.py 23 项检查
+> "检查系统健康" → 运行 verify.py 9 项检查
 
 ---
 

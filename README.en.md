@@ -123,7 +123,7 @@ python scripts/run_backtest.py --mode short
 python scripts/run_backtest.py --list
 python scripts/run_backtest.py --compare 1 2
 
-# Health check (23 items)
+# Health check (9 items)
 python scripts/verify.py
 ```
 
@@ -247,7 +247,7 @@ stock-picker/
 ├── scripts/                       User Entry Points
 │   ├── eod_stock_picker.py        Main entry
 │   ├── run_backtest.py            Backtest entry
-│   └── verify.py                  23-item health check
+│   └── verify.py                  9-item health check
 │
 ├── config.yml                     Central configuration
 ├── SKILL.md                       AI assistant skill definition
@@ -293,7 +293,7 @@ Example prompts:
 > "Show me fundamentals for 600519" → ROE/EPS/valuation snapshot
 > "Run a backtest" → executes backtest engine
 > "Compare two backtest runs" → version comparison
-> "Check system health" → runs verify.py 23 checks
+> "Check system health" → runs verify.py 9 checks
 
 ---
 

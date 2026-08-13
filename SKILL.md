@@ -46,7 +46,7 @@ python scripts/run_backtest.py --compare 1 2
 # K 线因子专项回测（仅量价+动量+技术）
 python scripts/run_backtest.py --mode kfactor --start 2026-01-01 --end 2026-06-27
 
-# 健康检查 23 项
+# 健康检查 9 项
 python scripts/verify.py
 
 # 权重优化（仅报告，不写入）
