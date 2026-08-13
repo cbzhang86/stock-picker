@@ -4,12 +4,22 @@ __pycache__/
 # 运行时数据库 / 缓存（自动生成）
 data/cache/*.db
 data/db/*.db
+data/*.db
 
 # 自动生成的报告
 data/reports/*.md
+data/reports/*.json
+
+# 数据源配额账本 / 优化器状态（自动生成，含时间戳）
+data/cache/asharehub_quota.json*
+data/cache/.last_optimize_*
+data/cache/.last_*
 
 # 优化器输出权重
 data/weights/
+
+# 运行时日志
+logs/
 
 # 零时缓存文件
 data/cache/codes_cache.json
@@ -28,3 +38,6 @@ tmp_*.py
 
 # 工作文档
 audit_data_consistency.md
+
+# 归档周报
+reports/backtest_weekly.md
