@@ -142,8 +142,8 @@ class BacktestStore:
             )
             run_id = cur.lastrowid
 
-            # 存储交易明细（仅前 50 条）
-            for td in result.trade_details[:50]:
+            # 存储交易明细（全量；此前 [:50] 截断 + return_t1 字段名错位导致明细表数据不全）
+            for td in result.trade_details:
                 conn.execute(
                     "INSERT INTO backtest_trades (run_id, date, code, name, score, buy_price, return_t1) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",

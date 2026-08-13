@@ -76,9 +76,12 @@ def backfill_pending_outcomes():
         code = pred['code']
         pred_date = pred['date']
         try:
-            kline = data_engine.get_kline(code, start_date=pred_date)
+            # 回填走前复权口径（adjust='qfq'）：除权日价差不失真，
+            # 避免 mootdx raw 价把送转/分红当暴跌。qfq 绕开 raw 缓存直接 baostock。
+            kline = data_engine.get_kline(code, start_date=pred_date, adjust='qfq')
             if kline is not None and not kline.empty:
-                tracker.update_outcomes(pred['id'], kline)
+                tracker.update_outcomes(pred['id'], kline,
+                                         pred_date=pred['date'])
         except Exception as e:
             logger.warning(f"回填失败 {code}: {e}")
 
@@ -224,20 +227,17 @@ def main():
         show_status(config)
         return
 
-    # 1. 自动回填 T+1 结果（每天运行策略时自动更新历史推荐）
-    backfill_pending_outcomes()
-
-    # 2. 运行策略
+    # 1. 运行策略（先跑：14:45 cron 触发后尽快出推荐，避免回填拖延贴近收盘）
     if args.mode == 'short':
         recommendations = run_short_term(config)
     else:
         recommendations = run_long_term(config)
 
-    # 3. 生成每日市场简报（包含完整信息，不只是推荐列表）
+    # 2. 生成每日市场简报（包含完整信息，不只是推荐列表）
     briefing_text = generate_market_briefing(recommendations, mode=args.mode)
     print(briefing_text)
 
-    # 4. 保存简报文件
+    # 3. 保存简报文件
     report_generator = DailyReportGenerator()
     path = report_generator.save_report(recommendations, args.mode)
     # 同时保存完整简报版本
@@ -246,6 +246,13 @@ def main():
         f.write(briefing_text)
     print(f"\n📝 报告已保存: {path}")
     print(f"📊 简报已保存: {briefing_path}")
+
+    # 4. 自动回填 T+1 结果（放最后：qfq 走 baostock ~8s/条，避免慢速回填推迟选股；
+    #    回填与策略无依赖，时序无关）
+    try:
+        backfill_pending_outcomes()
+    except Exception as e:
+        logger.warning(f"回填失败: {e}")
 
     # 5. 检查优化器是否触发（仅产报告，不自动写入）
     if recommendations and args.mode == 'short':

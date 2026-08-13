@@ -11,6 +11,7 @@ import sqlite3
 import json
 import os
 import logging
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -113,37 +114,122 @@ class PredictionTracker:
             if conn:
                 conn.close()
 
-    def update_outcomes(self, prediction_id: int, kline: pd.DataFrame):
+    def update_outcomes(self, prediction_id: int, kline: pd.DataFrame,
+                        pred_date: str = None):
         """
         更新推荐的结果（T+1, T+5, T+20平仓收益）
 
         参数：
           prediction_id: log_prediction返回的ID
-          kline: 包含推荐日之后K线的DataFrame，需含 date, close 列
+          kline: 包含推荐日及之后K线的DataFrame，需含 date, close 列
+          pred_date: 推荐日（YYYY-MM-DD），用于精确定位买入日。
+                     缺省时退化用 kline.iloc[0]['date']（不安全，
+                     mootdx/缓存缺失可能导致首行日期 != 推荐日）。
         """
         if kline is None or kline.empty:
             logger.warning(f"K线为空，无法更新结果 ID={prediction_id}")
             return
 
-        buy_price = float(kline.iloc[0]['close'])
-        buy_date = kline.iloc[0]['date']
+        # 规整：确保 date 列为 datetime 并按日期排序
+        kline = kline.copy()
+        kline['date'] = pd.to_datetime(kline['date'], errors='coerce')
+        kline = kline.dropna(subset=['date']).sort_values('date').reset_index(drop=True)
+        if kline.empty:
+            logger.warning(f"K线无有效日期，无法更新结果 ID={prediction_id}")
+            return
 
-        # 确保索引访问
-        def get_data(idx):
-            if idx < len(kline):
-                return str(kline.iloc[idx]['date']), float(kline.iloc[idx]['close'])
+        # 定位推荐日：
+        #   - 有 pred_date → 优先匹配 kline 中 pred_date 当天
+        #   - 匹配不到（缓存缺失）→ 警告，退化用 pred_date 之前最后一个交易日作为买入参考，
+        #     但不取 iloc[0] 的 close（首行日期可能 != 推荐日，导致 buy_price 失真）
+        #   - 没有 pred_date → 用 kline.iloc[0]['date']（旧行为，不安全，保留向后兼容）
+        if pred_date is not None:
+            pred_ts = pd.Timestamp(pred_date)
+            match = kline[kline['date'] == pred_ts]
+            if not match.empty:
+                buy_idx = match.index[0]
+                buy_price = float(kline.loc[buy_idx, 'close'])
+                buy_date = kline.loc[buy_idx, 'date']
+            else:
+                # 推荐日不在K线中：用 K 线里 <= pred_date 的最后一天作为买入参考价
+                # （mootdx offet=600 或缓存缺口可能导致推荐日缺失，但前后日的收盘价
+                #   可作为近似的买入参考；不强行取 iloc[0]，避免抓到几天后的价）
+                prior = kline[kline['date'] <= pred_ts]
+                if not prior.empty:
+                    buy_idx = prior.index[-1]
+                    buy_price = float(kline.loc[buy_idx, 'close'])
+                    buy_date = kline.loc[buy_idx, 'date']
+                    logger.warning(
+                        f"推荐日 {pred_date} 不在K线中，用 {buy_date.strftime('%Y-%m-%d')} "
+                        f"收盘作为买入参考 ID={prediction_id}"
+                    )
+                else:
+                    # K线最早也晚于推荐日：此前 get_kline(code, start_date=pred_date)
+                    # 应当能抓到 pred_date 当天，首行 == pred_date 是常态；只有 mootdx
+                    # 缓存残缺到连推荐日都缺才会走到这里。如果硬把"比推荐日晚的某天"
+                    # 当买入日算 T+N，相当于买入日顺延一个交易日 → T+N 全部 off-by-one。
+                    # 选择"置 None 不写 outcomes"：让该 prediction 继续留在 pending 池，
+                    # 下次 cron 触发 backfill 时，缓存已被方案 B 的 fall-through 愈合，
+                    # 即可按正确 pred_date 取 T+N。（subagent id=22 实证此分支会 off-by-one）
+                    logger.warning(
+                        f"K线最早日期晚于推荐日 {pred_date}，置 None 不写 outcomes "
+                        f"ID={prediction_id}（等数据愈合后重算）"
+                    )
+                    return  # 不写 outcomes，避免 off-by-one 污染统计
+        else:
+            # 没传 pred_date：向后兼容旧行为
+            buy_idx = 0
+            buy_price = float(kline.iloc[0]['close'])
+            buy_date = kline.iloc[0]['date']
+            logger.debug(
+                f"未传 pred_date，用 K线首行 {buy_date.strftime('%Y-%m-%d')} "
+                f"作为买入日 ID={prediction_id}"
+            )
+
+        # 按日期查找 buy_date 之后的真实第 N 个交易日
+        # （不用 iloc[N]，避免K线缺口导致抓到非T+N的价格）
+        future = kline[kline['date'] > buy_date].reset_index(drop=True)
+
+        # T+N 残缺检测：第 N 个交易日距 buy_date 的最大合理自然日间隔。
+        # 单一阈值（如 12+N）会在 T+20 撞春节/国庆（合法 36 天）误杀 → 改为按 N 分段，
+        # 每段覆盖对应最长假期 + 余量。
+        # 实测依据：春节 T+20 间隔 36 天（T+1=11、T+5=15-17），阈值取
+        #   T+1  → 13 (满 1 周 + 节假日 + 6.5 余量)
+        #   T+5  → 18 (春节 T+5 ≈ 15)
+        #   T+20 → 45 (春节 T+20 ≈ 36)
+        MAX_GAP = {1: 13, 5: 18, 20: 45}
+
+        def fetch_future(idx_offset: int):
+            """返回 future 中第 idx_offset 个交易日的 (date_str, close)。
+
+            残缺检测：第 N 个交易日距 buy_date 的自然日间隔超过 MAX_GAP[N] →
+            K线缓存残缺（中间缺了交易日），返回 (None, None) 避免把"几周后"
+            的价格当 T+N 写进 outcomes 污染统计。
+            """
+            if idx_offset - 1 < len(future):
+                row = future.iloc[idx_offset - 1]
+                natural_gap = (row['date'] - buy_date).days
+                threshold = MAX_GAP.get(idx_offset, 12 + idx_offset * 2)
+                if natural_gap > threshold:
+                    logger.warning(
+                        f"T+{idx_offset} 距 buy_date {buy_date.strftime('%Y-%m-%d')} "
+                        f"间隔 {natural_gap} 天 > 阈值 {threshold}（K线残缺），置 None "
+                        f"ID={prediction_id}"
+                    )
+                    return None, None
+                return row['date'].strftime('%Y-%m-%d'), float(row['close'])
             return None, None
 
-        # T+1
-        t1_date, t1_close = get_data(1)
+        # T+1: buy_date 之后的第 1 个交易日
+        t1_date, t1_close = fetch_future(1)
         t1_return = round((t1_close - buy_price) / buy_price * 100, 2) if t1_close else None
 
-        # T+5
-        t5_date, t5_close = get_data(4)
+        # T+5: 第 5 个交易日
+        t5_date, t5_close = fetch_future(5)
         t5_return = round((t5_close - buy_price) / buy_price * 100, 2) if t5_close else None
 
-        # T+20
-        t20_date, t20_close = get_data(19)
+        # T+20: 第 20 个交易日
+        t20_date, t20_close = fetch_future(20)
         t20_return = round((t20_close - buy_price) / buy_price * 100, 2) if t20_close else None
 
         conn = sqlite3.connect(self.db_path)
@@ -230,7 +316,12 @@ class PredictionTracker:
         }
 
     def get_pending_outcomes(self) -> List[Dict]:
-        """获取还没有T+1结果的推荐"""
+        """获取未补齐结果的推荐（任一 T+1/T+5/T+20 为 NULL 即返回）。
+
+        原谓词仅 `o.t1_close IS NULL` → T+1 写满后行离开 pending 池，
+        T+5/T+20 永远不会被回填（即使到期）。改为 OR 任一个为 NULL，
+        让 update_outcomes 的幂等 INSERT OR REPLACE 滚动补齐多阶结果。
+        """
         conn = None
         try:
             conn = sqlite3.connect(self.db_path)
@@ -240,6 +331,8 @@ class PredictionTracker:
                    FROM predictions p
                    LEFT JOIN outcomes o ON p.id = o.prediction_id
                    WHERE o.t1_close IS NULL
+                      OR o.t5_close IS NULL
+                      OR o.t20_close IS NULL
                    ORDER BY p.date"""
             )
             rows = c.fetchall()

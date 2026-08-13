@@ -117,9 +117,9 @@ class LongTermStrategy(BaseStrategy):
             stock['risk_check'] = risk_result
 
             if risk_result['passed'] or risk_result['score_penalty'] < 0.5:
-                # 长线：排除极小市值股票（<20亿，腾讯API返回单位是亿）
-                mcap_yi = stock.get('total_market_cap', 0) or 0
-                if mcap_yi < 20:
+                # 长线：排除极小市值股票（<20亿；data_engine 已将腾讯亿元转元，按元比较）
+                mcap_yuan = stock.get('total_market_cap', 0) or 0
+                if mcap_yuan < 20 * 1e8:
                     continue
                 candidates.append(stock)
 
@@ -134,15 +134,8 @@ class LongTermStrategy(BaseStrategy):
         for i, stock in enumerate(candidates[:50]):
             code = stock['code']
 
-            # 北向资金（回测模式下跳过实时API）
-            if not is_backtest:
-                try:
-                    north_30d = self.data_engine.get_north_flow_accumulated(code, days=30)
-                except Exception:
-                    north_30d = None
-                stock['north_flow_accumulated'] = north_30d
-            else:
-                stock['north_flow_accumulated'] = None
+            # 北向资金（2024-08 起停公开，不再调用以节省 AShareHub 配额）
+            stock['north_flow_accumulated'] = None
 
             # K线
             try:

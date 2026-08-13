@@ -207,7 +207,7 @@ class BacktestEngine:
             monthly_returns=pf['monthly_returns'],
             equity_curve=pf['equity_curve'],
             factor_performance=base_result.factor_performance,
-            trade_details=pf['trade_details'][:50],
+            trade_details=pf['trade_details'],  # 全量明细（此前 [:50] 截断，明细表只有前50条）
         )
 
         logger.info(f"\\n回测完成: 胜率 {result.win_rate:.1f}% | "
@@ -642,6 +642,10 @@ class BacktestEngine:
                     'allocation_pct': alloc,
                     'buy_price': round(buy_price, 2),
                     'sell_price': round(sell_price, 2),
+                    # return_t1 与 _calculate_results 的字段名对齐（backtest_store 按
+                    # return_t1 写入明细表；此前只写了 return_pct → 明细表 return_t1 全 NULL，
+                    # 因子 IC 分析样本与明细对不上）
+                    'return_t1': round(ret, 2),
                     'return_pct': round(ret, 2),
                     'capital_used': round(cost, 2),
                     'pnl': round(proceeds - cost, 2),

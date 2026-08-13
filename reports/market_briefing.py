@@ -55,7 +55,8 @@ def generate_market_briefing(recommendations: List[Dict],
             down_count = (quotes['pct_chg'] <= 0).sum()
             total_amount = quotes['amount'].sum()
             lines.append(f"    上涨/下跌: {up_count}/{down_count}")
-            lines.append(f"    成交额: {total_amount / 10000:,.0f} 亿")
+            # amount 单位已是元（data_engine 腾讯实时已转元），元 → 亿 = /1e8
+            lines.append(f"    成交额: {total_amount / 1e8:,.0f} 亿")
     except Exception as e:
         lines.append("    市场数据暂不可用")
         logger.warning(f"市场行情获取失败: {e}")
@@ -63,10 +64,19 @@ def generate_market_briefing(recommendations: List[Dict],
     # 北向资金
     try:
         north = de.get_north_flow_summary()
-        if north:
+        if north and north.get('available'):
             direction = "净流入" if north['total'] > 0 else "净流出"
             lines.append(f"    北向资金: {direction} {north['total']:+.2f}亿"
-                         f"（沪{north['hgt']:+.2f} / 深{north['sgt']:+.2f}）")
+                         f"（沪{north['hgt']:+.2f} / 深{north['sgt']:+.2f}）"
+                         f" [{north.get('time','')}]")
+        elif north and not north.get('available'):
+            err = north.get('error', '')
+            if err == 'securities_token_expired':
+                lines.append("    北向资金: 数据源暂不可用（token疑似失效，东财datacenter在线）")
+            else:
+                lines.append("    北向资金: 数据源暂不可用（东财datacenter不可达）")
+        else:
+            lines.append("    北向资金: 数据未获取")
     except Exception as e:
         logger.warning(f"北向数据获取失败: {e}")
     lines.append("")
@@ -103,12 +113,13 @@ def generate_market_briefing(recommendations: List[Dict],
             rating = rec.get('rating_cn', '')
             allocation = rec.get('allocation_pct', 0)
             bd = rec.get('breakdown', {})
-            # 全部因子
+            # 全部因子：数据缺失的因子打 [缺] 标记，让"分数低因为没数据"和"分数低因为股票差"可区分
             top_factors = sorted(bd.items(),
                                  key=lambda x: x[1].get('weighted', 0),
                                  reverse=True)
-            factors_str = ' '.join(f"{f}({d.get('raw_score',0):.0f})"
-                                   for f, d in top_factors)
+            factors_str = ' '.join(
+                f"{f}({d.get('raw_score',0):.0f})" + ('' if d.get('data_available', True) else '[缺]')
+                for f, d in top_factors)
             lines.append(f"    {i}. {code} {name}")
             lines.append(f"       评分 {score}/100 | {rating} | 仓位 {allocation:.0f}%")
             lines.append(f"       因子: {factors_str}")

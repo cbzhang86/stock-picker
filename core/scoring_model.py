@@ -63,13 +63,13 @@ class ScoringModel:
     """
 
     # 默认权重（与 config.yml 保持同步，作为 fallback）
-    # 短线：研报中位数对齐（资金流+龙虎榜共0.30 + momentum 0.25 + hot_theme 0.10）
-    # 长线：研报中位数对齐（基础财务+估值共0.50 + momentum+北向 0.35 + 机构 0.15）
+    # 短线：北向因子降权0%（2024-08起数据停公开），权重让给主力资金
+    # 长线：北向因子降权0%（同上），权重让给基本面
     # risk 不进权重表，由 penalty 路径独立扣分（见 ActiveWeight 与 penalty 注释）
     DEFAULT_WEIGHTS = {
         'short': {
-            'capital_flow': 0.25,
-            'north_flow': 0.10,
+            'capital_flow': 0.35,  # 25→35: 吸收北向10%全部让给主力资金
+            'north_flow': 0.00,
             'momentum': 0.25,
             'technical': 0.15,
             'volume_price': 0.10,
@@ -77,9 +77,9 @@ class ScoringModel:
             'dragon_tiger': 0.05,
         },
         'long': {
-            'fundamental': 0.30,
-            'north_flow': 0.20,
-            'momentum': 0.15,
+            'fundamental': 0.40,  # 30→40: 吸收一半北向
+            'north_flow': 0.00,
+            'momentum': 0.25,    # 15→25: 吸收另一半北向
             'valuation': 0.20,
             'institutional': 0.15,
         }
@@ -203,16 +203,17 @@ class ScoringModel:
 
         for factor_name, (factor_score, weight, is_neutral) in factor_scores.items():
             if is_neutral:
-                # 数据不可用：用原权重，标记出来
-                weighted = factor_score * weight
+                # 数据不可用：权重全部让渡给活跃因子，自身不贡献分数。
+                # （此前实现同时"按原权重×50 计入"+"active 因子吸收权重"= 双重计权，
+                #   权重总和变成 1+neutral_weight，数据缺失时分数反而虚高）
                 breakdown[factor_name] = {
                     'raw_score': round(factor_score, 2),
                     'weight': weight,
-                    'weighted': round(weighted, 2),
+                    'weighted': 0.0,
+                    'effective_weight': 0.0,
                     'data_available': False,
-                    'note': '接口不可用，已降权'
+                    'note': '接口不可用，权重已让渡给活跃因子'
                 }
-                weighted_score += weighted
             else:
                 # 数据可用：获得额外权重分配（按比例吸收不可用因子的权重）
                 extra = (neutral_weight * weight / active_weight) if active_weight > 0 else 0
@@ -226,6 +227,12 @@ class ScoringModel:
                     'data_available': True
                 }
                 weighted_score += weighted
+
+        # 防御性兜底：active_weight <= 0（所有加权因子都数据不可用）时给中性 50，
+        # 避免 weighted_score=0 → 总分 0。当前权重下不会触发（capital_flow/north_flow
+        # 之外总有数据），但保留以防未来权重调整引入全 neutral 场景。
+        if active_weight <= 0:
+            weighted_score = 50.0
 
         # === Risk penalty（risk 改成纯扣分项，不进加权） ===
         # 设计：risk_filter 已经把 ST/解禁压力/成交额过低/涨停封死的票 in-pass 直接拦。
@@ -448,6 +455,9 @@ class ScoringModel:
                     continue  # 严重风险，直接跳过
 
             result = self.score_stock(stock, mode)
+            # 附带全字段源 dict 引用：下游补算（如 blocks/dragon_tiger 补全后重算）
+            # 需要完整因子输入，瘦 result 缺 main_fund_accumulated/rps_20/macd_status 等
+            result['_src'] = stock
             results.append(result)
 
         # 按评分降序

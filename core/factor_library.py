@@ -60,17 +60,12 @@ class FactorLibrary:
     def calc_north_flow_score(accumulated_net: float, days: int = 10) -> float:
         """
         北向资金评分（0-100）
-        北向持续净买入 → 高分
-
-        注意：accumulated_net 来自 asharehub northbound_holdings，
-        单位是"持股量变化（股数）"，而非金额（元）。
-        用 days 天数做加权日均后评分，横截面百分位会稀释偏差。
+        
+        2024-08-19 起沪深交易所停止公开北向实时/日级别个股持股数据，
+        季度持股数据频率太低（滞后2-3个月）不适合短线T+1策略。
+        因子降级为中性50分，权重已在scoring_model中调整为0%。
         """
-        if accumulated_net is None or days == 0:
-            return 50.0  # 北向不可用，中性降权（与主力资金保持一致）
-        avg_per_day = accumulated_net / days
-        score = 50 + (avg_per_day / 100_0000) * 50
-        return np.clip(score, 0, 100)
+        return 50.0  # 北向数据停公开，中性降权
 
     # ========== 动量因子 ==========
 
@@ -211,23 +206,67 @@ class FactorLibrary:
         else:  # > 10
             return 40
 
+    # 风格/指数标签板块（非题材，涨幅≈大盘普涨，剔除不参与题材热度计分）
+    _STYLE_BOARD_KEYWORDS = (
+        '融资融券', '沪股通', '深股通', 'MSCI', '标普', '富时', 'QFII',
+        '证金', '汇金', '基金重仓', '社保重仓', '机构重仓', '保险重仓',
+        '中证', '上证', '深证', '沪深', '创业成分', '中字头',
+        '高股息', '破净', '低价股', '百元股', '次新股', '微盘股', 'ST板块',
+    )
+
     @staticmethod
     def calc_hot_theme_score(is_hot_stock: bool, blocks: dict = None,
-                             concept_names: list = None) -> float:
+                             concept_names: list = None,
+                             stock_name: str = '') -> float:
         """
         热门题材加分 — 三源融合：同花顺热点 + 板块归属 + AShareHub概念板块
 
         is_hot_stock: 是否在同花顺强势股列表中
-        blocks: 板块归属结果（东财 slist）
+        blocks: 板块归属结果（东财 slist，含 boards[].change_pct / lead_stock）
         concept_names: AShareHub概念板块名称列表
+        stock_name: 股票名称，用于判断是否为板块龙头
         返回: 0-100 分，仅供报告引用，实际加分由 ScoringModel 权重控制
+
+        板块归属部分采用「涨幅加权 + 龙头加成」（2026-08-13 改）：
+          - 原按板块数量计分（板块多=加分多），导致冷门票归属板块多也能拿高分，
+            热板块涨幅差异被抹平。改为取题材板块（剔除"XX板块"地域板块 +
+            风格/指数标签板块如融资融券/沪股通/MSCI/中证500）top-3 涨幅均值，
+            连续映射 0-15 分（板块均涨 3% → 满分 15）。
+          - 该股是某板块 lead_stock（龙头）→ +5。
         """
         score = 50.0
         if is_hot_stock:
             score += 20  # 强势股且有题材归因标签
         if blocks and blocks.get('total', 0) > 0:
-            board_count = min(blocks['total'], 20)
-            score += min(board_count * 1.0, 15)
+            boards = blocks.get('boards') or []
+            if boards:
+                # 板块涨幅加权：剔除地域板块（"XX板块"）和风格/指数标签板块
+                # （融资融券/沪股通/MSCI等，涨幅≈大盘普涨非题材热度），
+                # 取剩余行业/概念板块 top-3 涨幅均值，连续映射 0-15 分。
+                style_kw = FactorLibrary._STYLE_BOARD_KEYWORDS
+                sector_chgs = []
+                for b in boards:
+                    bname = str(b.get('name', ''))
+                    if bname.endswith('板块'):
+                        continue
+                    if any(k in bname for k in style_kw):
+                        continue
+                    try:
+                        c = float(b.get('change_pct', 0) or 0)
+                    except (ValueError, TypeError):
+                        continue
+                    sector_chgs.append(c)
+                if sector_chgs:
+                    top3 = sorted(sector_chgs, reverse=True)[:3]
+                    avg_chg = sum(top3) / len(top3)
+                    score += min(max(0.0, avg_chg) * 5, 15)
+                # 龙头加成：lead_stock 与股票名称匹配（名称≥3字符防短名误伤）
+                if stock_name and len(stock_name) >= 3:
+                    for b in boards:
+                        lead = str(b.get('lead_stock', '') or '').strip()
+                        if lead and (lead == stock_name or lead in stock_name or stock_name in lead):
+                            score += 5
+                            break
 
         # AShareHub 概念板块增强（全市场覆盖，覆盖面远超同花顺强势股）
         if concept_names:
@@ -517,7 +556,8 @@ class FactorLibrary:
         factors['hot_theme'] = self.calc_hot_theme_score(
             stock_data.get('is_hot_stock', False),
             stock_data.get('blocks'),
-            stock_data.get('concept_names')
+            stock_data.get('concept_names'),
+            stock_data.get('name', '')
         )
         factors['dragon_tiger'] = self.calc_dragon_tiger_score(
             stock_data.get('dragon_tiger')

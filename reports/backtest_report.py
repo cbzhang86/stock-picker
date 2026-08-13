@@ -55,8 +55,13 @@ def generate_backtest_report(result: BacktestResult) -> str:
     lines.append("---")
     lines.append("## 📊 基本统计")
     lines.append("")
+    # 交易频率换算：帮助理解 399 次是全年累计，不是每周几百次
+    freq_note = ""
+    if result.total_trading_days and result.total_trades > 0:
+        per_day = result.total_trades / result.total_trading_days
+        freq_note = f"（区间 {result.total_trading_days} 个交易日，日均 {per_day:.2f} 笔，周均约 {per_day * 5:.1f} 笔）"
     stats = [
-        ("总交易次数", f"{result.total_trades} 次"),
+        (f"总交易次数{freq_note}", f"{result.total_trades} 次"),
         ("胜率", f"{result.win_rate:.1f}%"),
         ("平均收益(T+1)", f"{result.avg_return_t1:+.2f}%"),
         ("平均收益(T+5)", f"{result.avg_return_t5:+.2f}%"),
@@ -241,11 +246,14 @@ def generate_daily_report(recommendations: List[Dict], mode: str = 'short') -> s
     # 市场级数据
     market_data = recommendations[0].get('market_data', {})
     north = market_data.get('north_flow')
-    if north:
+    if north and north.get('available'):
         direction = "净流入" if north['total'] > 0 else "净流出"
         lines.append(f"  🌐 北向资金：{direction} {north['total']}亿元"
-                     f"（沪股通{north['hgt']:+.2f}亿 / 深股通{north['sgt']:+.2f}亿）")
-        lines.append("")
+                     f"（沪股通{north['hgt']:+.2f}亿 / 深股通{north['sgt']:+.2f}亿）"
+                     f" [{north.get('time','')}]")
+    elif north and not north.get('available'):
+        lines.append(f"  🌐 北向资金：数据源暂不可用 ({north.get('error','未知')})")
+    lines.append("")
 
     for i, rec in enumerate(recommendations, 1):
         code = rec.get('code', 'N/A')

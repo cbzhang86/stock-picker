@@ -17,6 +17,7 @@
 """
 
 import logging
+import time
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -162,29 +163,62 @@ class ShortTermStrategy(BaseStrategy):
                 logger.warning(f"北向数据补充失败: {e}")
 
         # 对推荐结果补充板块归属和龙虎榜（仅对 top N 做，走 em_get 限流）
-        for rec in recommendations:
-            code = rec['code']
-            try:
-                blocks = self.data_engine.get_stock_blocks(code)
-                rec['blocks'] = blocks
-            except Exception:
-                logger.warning(f"板块获取失败 {code}")
-                rec['blocks'] = {"total": 0, "boards": [], "concept_tags": []}
-            try:
-                dt = self.data_engine.get_dragon_tiger(code)
-                rec['dragon_tiger'] = dt
-            except Exception:
-                logger.warning(f"龙虎榜获取失败 {code}")
-            # 板块和龙虎榜数据已补全，重新计算 hot_theme 和 dragon_tiger 评分
-            updated_factors = self.scoring_model.factor_lib.compute_all_factors(rec, 'short')
-            if 'hot_theme' in updated_factors and rec.get('breakdown', {}).get('hot_theme'):
-                rec['breakdown']['hot_theme']['raw_score'] = updated_factors['hot_theme']
-                rec['breakdown']['hot_theme']['note'] = '板块归属已纳入'
-            if 'dragon_tiger' in updated_factors and rec.get('breakdown', {}).get('dragon_tiger'):
-                rec['breakdown']['dragon_tiger']['raw_score'] = updated_factors['dragon_tiger']
-                rec['breakdown']['dragon_tiger']['note'] = '龙虎榜数据已纳入'
-            # breakdown 中 hot_theme / dragon_tiger 的实际得分通过 scoring_model.compute_all_factors
-            # 算出来的，不要 pop 掉，让配置里 0.08+0.05 这 13% 权重真的生效
+        # 回测模式跳过实时拉取（避免回测因子 IC 被实时/stale 数据前视污染，
+        # 回测推荐股 blocks 沿用评分前的状态：top30 空/未补）
+        if not is_backtest:
+            for rec in recommendations:
+                code = rec['code']
+                # rank_stocks 附带的全字段源 dict（含 main_fund_accumulated/rps_20/
+                # macd_status/volume_ratio/risk_check/is_hot_stock 等评分所需输入）。
+                # 瘦 rec 只有 code/name/score/breakdown，直接 score_stock 会让
+                # compute_all_factors 全部 .get() 静默退化（capital_flow 假中性等）
+                src = rec.get('_src')
+                if not src:
+                    # 防御：_src 缺失时跳过补算，保留排序时的原始分（避免静默塌缩）
+                    logger.warning(f"{code} 缺 _src（非 rank_stocks 产物？），跳过板块补算")
+                    continue
+                # 评分前已 force_live 预加载的 blocks 直接复用（保持与排序一致），
+                # 未就绪（如 top30 外）才补拉
+                if src.get('blocks', {}).get('total', 0) > 0:
+                    blocks = src['blocks']
+                else:
+                    try:
+                        blocks = self.data_engine.get_stock_blocks(code, force_live=True)
+                        src['blocks'] = blocks
+                    except Exception as e:
+                        logger.warning(f"板块获取失败 {code}: {str(e)[:80]}")
+                        src['blocks'] = {"total": 0, "boards": [], "concept_tags": []}
+                        blocks = src['blocks']
+                try:
+                    dt = self.data_engine.get_dragon_tiger(code)
+                    src['dragon_tiger'] = dt
+                except Exception as e:
+                    logger.warning(f"龙虎榜获取失败 {code}: {str(e)[:80]}")
+                # 板块和龙虎榜数据已补全，在【全字段源 dict】上整体重算 score_stock：
+                # weighted/effective_weight/总分一起更新，避免"展示 raw 新值、
+                # 排序 weighted 旧值"的脱节（补算前只改 raw_score 的残留 bug）
+                try:
+                    updated = self.scoring_model.score_stock(src, 'short')
+                except Exception as e:
+                    # 防御：重算失败保留排序时原始分（崩溃可见非静默污染，但别拖垮整个 run）
+                    logger.warning(f"{code} 补算重算失败，保留排序时分数: {str(e)[:80]}")
+                    continue
+                rec['score'] = updated['score']
+                rec['rating'] = updated['rating']
+                rec['rating_cn'] = updated.get('rating_cn', rec.get('rating_cn'))
+                rec['breakdown'] = updated['breakdown']
+                # 同步决策字段：decision/target_price/stop_price/reasoning 由重算前 score 生成，
+                # 不更新会出现"评级新、决策旧"的日报展示脱节（daily_report 展示这 4 项）
+                rec['decision'] = updated.get('decision', rec.get('decision'))
+                rec['target_price'] = updated.get('target_price', rec.get('target_price'))
+                rec['stop_price'] = updated.get('stop_price', rec.get('stop_price'))
+                rec['reasoning'] = updated.get('reasoning', rec.get('reasoning'))
+                # 回写 blocks/dragon_tiger 到瘦 rec：日报展示（market_briefing）和
+                # 因子采集（data_collector）读的是瘦 rec，不写会丢板块/龙虎榜展示 + 龙虎榜表全记 0
+                rec['blocks'] = src.get('blocks', {"total": 0, "boards": [], "concept_tags": []})
+                rec['dragon_tiger'] = src.get('dragon_tiger', {"records": [], "seats": {"buy": [], "sell": []}, "institution": {}})
+                # breakdown 中 hot_theme / dragon_tiger 的实际得分通过 score_stock 重算，
+                # weighted/effective_weight 与 raw_score 严格一致，让配置里 0.10+0.05 这 15% 权重真的生效
 
         # 组合优化：评分加权仓位分配
         recommendations = PortfolioOptimizer.allocate(recommendations)
@@ -454,10 +488,17 @@ class ShortTermStrategy(BaseStrategy):
         total = len(top_candidates)
         logger.info(f"详评 {total} 只（初步评分前200）")
 
-        # 预加载大单缓存 — 跳过（境外网络akshare可能超时，各股票单独调用时自动降权）
+        # 预加载大单缓存 — 详评开始前预热全市场大单数据（实测 ~26s，akshare 100页），
+        # 之后 200 只候选股的 capital_flow 全部命中缓存，避免第一批股票
+        # fallback 拿不到数据被中性化。失败不影响流程（个股走同花顺降级）。
+        if not is_backtest:
+            try:
+                self.data_engine.preload_big_deal()
+            except Exception as e:
+                logger.warning(f"big_deal 预加载异常: {str(e)[:80]}")
 
         # 先集中获取所有资金流（回测模式下跳过实时API，设默认值）
-        for stock in top_candidates:
+        for idx, stock in enumerate(top_candidates):
             code = stock['code']
             if is_backtest:
                 stock['main_fund_accumulated'] = None
@@ -465,16 +506,21 @@ class ShortTermStrategy(BaseStrategy):
                 stock['tail_end_stats'] = {'available': False}
             else:
                 try:
-                    main_accum = self.data_engine.get_main_fund_accumulated(code, days=10)
+                    # AShareHub moneyflow 配额保护：
+                    # 仅 top 10 候选股调 AShareHub（消耗 10 次配额）
+                    # 其余直接走 big_deal + 同花顺 fallback（0 配额消耗）
+                    # 资金流是短线最高权重因子(0.35)，但 big_deal 缓存已能覆盖主力资金
+                    # 所以 ASHareHub moneyflow 只给可能进入推荐池的前 10 只用精确数据
+                    # 预算：moneyflow 10 + 技术 10 + 概念 20 + 财务 15 = 55/次，留 45 余量
+                    skip_ash = idx >= 10
+                    main_accum = self.data_engine.get_main_fund_accumulated(code, days=10, skip_asharehub=skip_ash)
                 except Exception:
                     main_accum = None
                 stock['main_fund_accumulated'] = main_accum
 
-                try:
-                    north_accum = self.data_engine.get_north_flow_accumulated(code, days=10)
-                except Exception:
-                    north_accum = None
-                stock['north_flow_accumulated'] = north_accum
+                # 北向个股持股数据于 2024-08-16 起停公开（港交所不再披露）
+                # 不再调用 get_north_flow_accumulated 以节省 AShareHub 配额
+                stock['north_flow_accumulated'] = None
 
                 # 尾盘成交结构（从已缓存的大单数据提取，不走额外API）
                 try:
@@ -488,8 +534,9 @@ class ShortTermStrategy(BaseStrategy):
         from threading import Lock
         enrich_lock = Lock()
 
-        def fetch_kline(stock):
+        def fetch_kline(stock, rank_index):
             code = stock['code']
+            stock['_rank_index'] = rank_index  # 记录初步评分排名，供板块预加载按 top N 补
             try:
                 # 回测模式：只取回测日期之前的K线，防止前瞻偏差
                 if is_backtest and backtest_date:
@@ -514,29 +561,41 @@ class ShortTermStrategy(BaseStrategy):
                     stock['macd_status'] = {'score': 50, 'status': 'unknown'}
                     stock['raw_return_20'] = 0
 
-                # 双源技术校验：AShareHub 技术因子（独立熔断，失败不影响 K 线）
-                try:
-                    asharehub_tech = self.data_engine.get_technical_factors_asharehub(code)
-                    if asharehub_tech is not None:
-                        stock['asharehub_tech'] = asharehub_tech
-                except Exception as e:
-                    logger.warning(f"{code} AShareHub技术因子失败: {e}")
+                # AShareHub 分级配额分配（日限100次，按优先级分四档）
+                # top 10:  资金流 moneyflow（10次）— 短线最高权重(0.35)，但 big_deal 兜底
+                # top 10:  技术因子双源校验（10次）
+                # top 15:  财务指标（15次）
+                # top 20:  概念板块（20次）
+                # 合计 55 次（10+10+20+15），预算闸门 90/天（data_engine 配额管理）
+                # 2026-08-07 优化：moneyflow top 15→10（预算 60→55），
+                # 配额账本已持久化跨进程共享 + 线程锁 + 原子写（见 data_engine）
 
-                # AShareHub 概念板块（hot_theme 增强，独立熔断）
-                try:
-                    concepts = self.data_engine.get_concept_members(code)
-                    if concepts is not None:
-                        stock['concept_names'] = concepts
-                except Exception as e:
-                    logger.warning(f"{code} AShareHub概念板块失败: {e}")
+                # 双源技术校验：AShareHub 技术因子（仅 top 10，独立熔断）
+                if rank_index < 10:
+                    try:
+                        asharehub_tech = self.data_engine.get_technical_factors_asharehub(code)
+                        if asharehub_tech is not None:
+                            stock['asharehub_tech'] = asharehub_tech
+                    except Exception as e:
+                        logger.warning(f"{code} AShareHub技术因子失败: {e}")
 
-                # AShareHub 财务指标（长线策略，独立熔断）
-                try:
-                    fin = self.data_engine.get_financial_indicators(code)
-                    if fin is not None:
-                        stock['financial_indicators'] = fin
-                except Exception as e:
-                    logger.warning(f"{code} AShareHub财务指标失败: {e}")
+                # AShareHub 概念板块（top 20，hot_theme 增强，独立熔断）
+                if rank_index < 20:
+                    try:
+                        concepts = self.data_engine.get_concept_members(code)
+                        if concepts is not None:
+                            stock['concept_names'] = concepts
+                    except Exception as e:
+                        logger.warning(f"{code} AShareHub概念板块失败: {e}")
+
+                # AShareHub 财务指标（top 15，长线基本面，独立熔断）
+                if rank_index < 15:
+                    try:
+                        fin = self.data_engine.get_financial_indicators(code)
+                        if fin is not None:
+                            stock['financial_indicators'] = fin
+                    except Exception as e:
+                        logger.warning(f"{code} AShareHub财务指标失败: {e}")
             except Exception as e:
                 logger.warning(f"{code} 技术面失败: {str(e)[:60]}")
                 stock['macd_status'] = {'score': 50, 'status': 'unknown'}
@@ -546,7 +605,7 @@ class ShortTermStrategy(BaseStrategy):
         # baostock 是全局单例，只能用1个线程。但大部分已缓存，串行走就行。
         # 用 max_workers=3 让少量未命中并行，大部分已命中毫秒返回
         with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {executor.submit(fetch_kline, s): s for s in top_candidates}
+            futures = {executor.submit(fetch_kline, s, i): s for i, s in enumerate(top_candidates)}
             for future in as_completed(futures):
                 try:
                     enriched.append(future.result(timeout=30))
@@ -569,11 +628,42 @@ class ShortTermStrategy(BaseStrategy):
                         break
 
         # 补充新数据源信号（不额外请求 API，只打标签）
-        # 板块归属和龙虎榜在最终推荐后单独补充（避免 em_get 限流阻塞200只流程）
+        # 板块归属：评分前对初步评分 top N（30 只）补真实板块（东财 em_get 限流，
+        # 只补可能进推荐池的候选，避免 200 只全补阻塞流程），让 hot_theme 的
+        # 板块涨幅加权+龙头加成真正参与排序（§33 修复）。回测模式无实时板块数据，
+        # 保持空 blocks 不改变回测路径。评分后推荐股会基于全字段源 dict 整体重算
+        # （见 run_short_term 的补算环节，score_stock 重算 weighted/总分）。
         for s in enriched:
             s['is_hot_stock'] = hot_codes and s['code'] in hot_codes
             s['blocks'] = {"total": 0, "boards": [], "concept_tags": []}
             s['dragon_tiger'] = {"records": [], "seats": {"buy": [], "sell": []}, "institution": {}}
+
+        if not is_backtest:
+            # 按初步评分排名取 top 30 补板块归属（东财 slist，每只 ~0.5s 限流）
+            top_ranked = sorted(
+                (s for s in enriched if s.get('_rank_index') is not None),
+                key=lambda s: s['_rank_index']
+            )[:30]
+            for s in top_ranked:
+                code = s['code']
+                for attempt in (1, 2):
+                    try:
+                        # force_live：板块涨幅是日频数据，评分必须当日实时，
+                        # 不能用周末预取缓存的 stale change_pct
+                        blocks = self.data_engine.get_stock_blocks(code, force_live=True)
+                        if blocks and blocks.get('total', 0) > 0:
+                            s['blocks'] = blocks
+                            break
+                    except Exception as e:
+                        if attempt == 1:
+                            time.sleep(1.0)
+                            logger.warning(f"{code} 评分前板块预加载失败(重试): {str(e)[:80]}")
+                        else:
+                            logger.warning(f"{code} 评分前板块预加载失败×2: {str(e)[:80]}")
+            loaded = sum(1 for s in top_ranked if s['blocks'].get('total', 0) > 0)
+            logger.info(f"评分前板块预加载完成: {loaded}/{len(top_ranked)} 只有真实板块")
+            if loaded < len(top_ranked) * 0.8:
+                logger.warning(f"板块预加载成功率过低 {loaded}/{len(top_ranked)}，hot_theme 板块涨幅加权可能部分失效")
 
         logger.info(f"详评完成: {len(enriched)} 只")
         return enriched
