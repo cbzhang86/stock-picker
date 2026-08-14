@@ -29,7 +29,7 @@ short_term:
   # 买入条件
   buy:
     max_candidates: 3         # 最多推荐数量
-    min_score: 60             # 最低评分（0-100），低于此值跳过
+    min_score: 75             # 最低评分（0-100），低于此值跳过
     exclude_st: true
     exclude_limit_up: true    # 涨停封死的股票
     min_volume: 30000000      # 最低日成交额（3000万）

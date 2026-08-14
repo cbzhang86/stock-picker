@@ -380,13 +380,17 @@ class ScoringModel:
             else:
                 parts.append("同花顺强势股，有题材归因标签")
 
-        # 龙虎榜
+        # 龙虎榜（2026-08-14 修正：上榜≠利好，只展示机构真金白银方向）
         dt = stock_data.get('dragon_tiger', {})
         if dt and dt.get('records'):
-            latest = dt['records'][0]
             inst = dt.get('institution', {})
-            parts.append(f"龙虎榜上榜：净买入{latest.get('net_buy_wan', 0):.0f}万"
-                         f"{'，机构净买入' + str(inst.get('net_amt', 0)) + '万' if inst.get('net_amt', 0) > 0 else ''}")
+            inst_net = inst.get('net_amt', 0)
+            if inst_net > 0:
+                parts.append(f"龙虎榜机构净买入{inst_net:.0f}万")
+            elif inst_net < 0:
+                parts.append(f"龙虎榜机构净卖出{abs(inst_net):.0f}万")
+            else:
+                parts.append("龙虎榜上榜（无机构净买入）")
 
         # 评分汇总
         if breakdown:

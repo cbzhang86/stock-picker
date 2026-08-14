@@ -282,8 +282,13 @@ class FactorLibrary:
     @staticmethod
     def calc_dragon_tiger_score(dragon_tiger: dict) -> float:
         """
-        龙虎榜评分 — 有上榜记录且机构净买入为正 → 加分
+        龙虎榜评分 — 机构净买入为正 → 加分
         来源：a-stock-data §3.5
+
+        2026-08-14 修正：实盘 94 样本验证发现「上榜+净买入>0 泛加分」是反信号
+        （龙虎榜高分组 T+1 胜率 38.1% 均收 -1.60%，低于低分组）。上榜本身在
+        短线 T+1 是「利好兑现」而非「继续涨」信号。只保留机构真金白银加分
+        （机构净买入方向经验证有效），去掉泛上榜加分。
         """
         if not dragon_tiger:
             return 50.0
@@ -291,23 +296,15 @@ class FactorLibrary:
         if not records:
             return 50.0
 
-        # 最近一次上榜
-        latest = records[0] if records else {}
-        net_buy = latest.get('net_buy_wan', 0)
-
-        # 机构净买入
+        # 机构净买入（只保留有机构资金实锤的加分方向）
         inst = dragon_tiger.get('institution', {})
         inst_net = inst.get('net_amt', 0)
 
         score = 50.0
-        if net_buy > 0:
-            score += 15
-        if net_buy > 10000:  # 净买入 > 1亿
-            score += 10
         if inst_net > 0:
-            score += 15
-        if inst_net > 5000:
-            score += 10
+            score += 25
+        if inst_net > 5000:  # 机构净买入 > 5000万
+            score += 25
 
         return min(score, 100)
 

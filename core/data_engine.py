@@ -752,6 +752,10 @@ class DataEngine:
                             #   全市场股票都触发"成交额不足" penalty=0.5 → 分数被 ×0.75）
                             'amount': self._safe_float(fields[37]) * 10000,
                             'turnover': self._safe_float(fields[38]),
+                            # 腾讯 fields[49] 量比（无量纲）。此前漏解析导致
+                            # volume_ratio 恒 1.0 → volume_price 恒 52.5 零区分度。
+                            # 无效值回退 1.0（保持旧行为），避免数据未就绪时误压低分。
+                            'volume_ratio': self._safe_float(fields[49]) if len(fields) > 49 and self._safe_float(fields[49]) > 0 else 1.0,
                             'pe': self._safe_float(fields[39]),
                             'pb': self._safe_float(fields[46]) if len(fields) > 46 else None,
                             # 腾讯市值字段单位是亿元，统一转为元（与 factor_library 的
@@ -1857,6 +1861,7 @@ class DataEngine:
                 ("RPT_BILLBOARD_DAILYDETAILSBUY", "BUY"),
                 ("RPT_BILLBOARD_DAILYDETAILSSELL", "SELL")
             ]):
+                key = "buy" if side == 0 else "sell"
                 try:
                     params = {
                         "reportName": report, "columns": "ALL",
@@ -1870,7 +1875,6 @@ class DataEngine:
                         logger.warning(f"龙虎榜{key}席位失败 {code}: em_get 返回 None")
                         continue
                     sdata = (r.json().get("result") or {}).get("data", [])
-                    key = "buy" if side == 0 else "sell"
                     for row in sdata[:5]:
                         seats[key].append({
                             "name": row.get("OPERATEDEPT_NAME", ""),
