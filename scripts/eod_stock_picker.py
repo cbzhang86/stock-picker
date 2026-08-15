@@ -247,12 +247,9 @@ def main():
     print(f"\n📝 报告已保存: {path}")
     print(f"📊 简报已保存: {briefing_path}")
 
-    # 4. 自动回填 T+1 结果（放最后：qfq 走 baostock ~8s/条，避免慢速回填推迟选股；
-    #    回填与策略无依赖，时序无关）
-    try:
-        backfill_pending_outcomes()
-    except Exception as e:
-        logger.warning(f"回填失败: {e}")
+    # 4. 自动回填 T+1 结果（2026-08-15 起挪到凌晨独立跑 scripts/backfill_pending.py：
+    #    qfq 走 baostock ~8s/条，14:45 贴收盘，回填拖延会推迟报告生成；
+    #    凌晨数据已完整，回填与策略无依赖，时序无关。cron: dream-backfill 3:15）
 
     # 5. 检查优化器是否触发（仅产报告，不自动写入）
     if recommendations and args.mode == 'short':
