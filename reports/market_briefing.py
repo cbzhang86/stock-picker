@@ -68,7 +68,7 @@ def generate_market_briefing(recommendations: List[Dict],
             direction = "净流入" if north['total'] > 0 else "净流出"
             lines.append(f"    北向资金: {direction} {north['total']:+.2f}亿"
                          f"（沪{north['hgt']:+.2f} / 深{north['sgt']:+.2f}）"
-                         f" [{north.get('time','')}]")
+                         f" [上一交易日 {north.get('time','')}]")
         elif north and not north.get('available'):
             err = north.get('error', '')
             if err == 'securities_token_expired':

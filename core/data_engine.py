@@ -1196,7 +1196,8 @@ class DataEngine:
     def get_concept_members(self, code: str) -> Optional[list]:
         """AShareHub 个股所属概念板块列表，独立熔断
 
-        返回概念名称列表，用于 hot_theme 评分增强。
+        返回概念标识列表（BK 概念指数代码，如 BK1722.DC），用于 hot_theme 评分
+        的概念数量计数（calc_hot_theme_score 只 len() 不关心可读名）。
         失败时不影响同花顺强势股 / 东财板块归属。
         """
         # 非交易日预取缓存优先（concepts 低频，7 天新鲜）
@@ -1219,9 +1220,27 @@ class DataEngine:
                 )
             code6 = str(code).zfill(6)
             symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
-            df = self._asharehub_client.concept_members(symbol=symbol, limit=200)
+            # 2026-08-17 修复：con_symbol 才是"查该股票所属概念"的参数。
+            # 原用 symbol=股票代码 是查"股票代码作为概念指数"的成分股 → 恒空 DataFrame，
+            # 导致 concept_names 恒 None → hot_theme 恒 65（50基准+15板块顶格，缺概念加分）。
+            # 返回列: trade_date/symbol/con_symbol/name — symbol 列才是概念指数代码(BK)，
+            # name 列是股票自身名称（同名重复），所以按 symbol 去重取概念数。
+            df = self._asharehub_client.concept_members(con_symbol=symbol, limit=200)
             if df is not None and not df.empty:
-                names = df['con_name'].dropna().unique().tolist()
+                # 返回含历史多日快照（实测单只 4681 行），取最新 trade_date 当日去重
+                if 'trade_date' in df.columns:
+                    latest = df['trade_date'].dropna().max()
+                    if pd.isna(latest):
+                        logger.warning(f"asharehub概念板块 {code}: trade_date 全为空，跳过去重取全部 symbol")
+                        latest = None
+                    else:
+                        df = df[df['trade_date'] == latest]
+                # 概念代码列：symbol（BKxxx.DC），回退 con_name/name 兼容（name 是股票名，仅兜底）
+                if 'symbol' in df.columns:
+                    names = df['symbol'].dropna().unique().tolist()
+                else:
+                    name_col = 'con_name' if 'con_name' in df.columns else 'name'
+                    names = df[name_col].dropna().unique().tolist()
                 return names if names else None
             return None
         except Exception as e:
