@@ -41,9 +41,8 @@ class LongTermStrategy(BaseStrategy):
             sell_config=config.get('sell', {})
         )
         # 从嵌套的 buy 段读取参数
+        # （2026-09-06 审查清理：删除未使用的 sell_cfg/hold_cfg 局部变量）
         buy_cfg = config.get('buy', {})
-        sell_cfg = config.get('sell', {})
-        hold_cfg = config.get('hold_period', {})
         self.risk_filter = RiskFilter(config=buy_cfg)
         self.top_n = buy_cfg.get('max_candidates', 5)
         self.min_score = buy_cfg.get('min_score', 65)
@@ -181,24 +180,24 @@ class LongTermStrategy(BaseStrategy):
             enriched.append(stock)
 
         # 横截面RPS计算（长线用120日涨幅排名）
+        # 修复（2026-09-05 审查 P3-3）：O(N²) 双重循环 → dict 一次映射 O(N)
         all_returns = {s['code']: s.get('rps_20', 50) for s in enriched}
         if all_returns:
-            codes_list = list(all_returns.keys())
-            returns_series = pd.Series([all_returns[c] for c in codes_list])
-            rps_values = returns_series.rank(pct=True) * 100
-            for code, rps_val in zip(codes_list, rps_values):
-                for s in enriched:
-                    if s['code'] == code:
-                        s['rps_20'] = float(rps_val)
-                        break
+            rps_map = dict(zip(
+                all_returns.keys(),
+                pd.Series(list(all_returns.values())).rank(pct=True) * 100))
+            for s in enriched:
+                v = rps_map.get(s['code'])
+                if v is not None:
+                    s['rps_20'] = float(v)
 
         # 附加数据源状态
         try:
             source_status = self.data_engine.get_data_source_summary()
             for rec in enriched:
                 rec['data_source_status'] = source_status
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"数据源状态附加失败（忽略）: {str(e)[:60]}")
 
         if total > 0:
             logger.info(f"详评完成: {len(enriched)} 只")
@@ -216,5 +215,14 @@ class LongTermStrategy(BaseStrategy):
         return ['code', 'name', 'price', 'pe', 'pb', 'amount']
 
     def describe(self) -> str:
+        # 修复（2026-09-06 审查）：原为硬编码权重字符串，与实际生效权重
+        # （v1.json）易脱节。改为与 short_term.describe() 一致，动态读取
+        try:
+            w = self.scoring_model.get_weights('long')
+            parts = [f"{name}({pct*100:.0f}%)" for name, pct in
+                     sorted(w.items(), key=lambda kv: -kv[1]) if pct > 0]
+            weights_str = '+'.join(parts) if parts else '未配置'
+        except Exception:
+            weights_str = '动态读取失败'
         return (f"长线持股策略: 月度选股，持有{self.min_months}-{self.max_months}个月。"
-                f"基本面(30%)+北向(20%)+动量(15%)+估值(15%)+风控(10%)+机构(10%)")
+                f"权重: {weights_str}")

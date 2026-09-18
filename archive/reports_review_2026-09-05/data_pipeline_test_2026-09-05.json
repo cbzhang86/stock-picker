@@ -1,0 +1,245 @@
+{
+  "test_date": "2026-09-05 10:55",
+  "duration_s": 137.8,
+  "summary": {
+    "pass": 20,
+    "fail": 9,
+    "warn": 0,
+    "total": 29
+  },
+  "asharehub_quota_consumed": 1,
+  "results": [
+    {
+      "group": "A",
+      "name": "A1 跨天账本重置",
+      "status": "PASS",
+      "detail": "旧账本 99/100 @2026-09-01 → 跨天重置 0 → 消耗 1 次",
+      "elapsed_s": 3.43,
+      "extra": null
+    },
+    {
+      "group": "A",
+      "name": "A2 配额消耗计数+原子写入",
+      "status": "FAIL",
+      "detail": "AssertionError: 账本计数应为 3，实际 4",
+      "elapsed_s": 0.89,
+      "extra": "Traceback (most recent call last):\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 55, in run\n    out = fn()\n          ^^^^\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 175, in a2_consume_counting\n    assert used == 3, f\"账本计数应为 3，实际 {used}\"\n           ^^^^^^^^^\nAssertionError: 账本计数应为 3，实际 4\n"
+    },
+    {
+      "group": "A",
+      "name": "A3 配额临界熔断（used≥90）",
+      "status": "PASS",
+      "detail": "used=90 → 拒绝 + 4 个 asharehub 源全部熔断标记",
+      "elapsed_s": 0.29,
+      "extra": null
+    },
+    {
+      "group": "A",
+      "name": "A4 账本损坏降级",
+      "status": "PASS",
+      "detail": "损坏 JSON → 降级内存计数，不崩溃",
+      "elapsed_s": 0.29,
+      "extra": null
+    },
+    {
+      "group": "B",
+      "name": "B1 moneyflow 万元→元解析",
+      "status": "FAIL",
+      "detail": "AssertionError: 万元→元换算错误: None",
+      "elapsed_s": 0.27,
+      "extra": "Traceback (most recent call last):\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 55, in run\n    out = fn()\n          ^^^^\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 220, in b1_moneyflow_ok\n    assert v == 1234.5 * 10000, f\"万元→元换算错误: {v}\"\n           ^^^^^^^^^^^^^^^^^^^\nAssertionError: 万元→元换算错误: None\n"
+    },
+    {
+      "group": "B",
+      "name": "B2 technical_factors 解析",
+      "status": "FAIL",
+      "detail": "AssertionError: None",
+      "elapsed_s": 0.26,
+      "extra": "Traceback (most recent call last):\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 55, in run\n    out = fn()\n          ^^^^\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 231, in b2_tech_factors_ok\n    assert d and abs(d['macd_dif'] - 0.12) < 1e-9 and d['rsi_6'] == 55.0, str(d)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None\n"
+    },
+    {
+      "group": "B",
+      "name": "B3 concepts 去重",
+      "status": "FAIL",
+      "detail": "AssertionError: 去重失败: None",
+      "elapsed_s": 0.28,
+      "extra": "Traceback (most recent call last):\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 55, in run\n    out = fn()\n          ^^^^\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 242, in b3_concepts_dedup\n    assert names == ['BK0804.DC'], f\"去重失败: {names}\"\n           ^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: 去重失败: None\n"
+    },
+    {
+      "group": "B",
+      "name": "B4 financial_indicators 解析",
+      "status": "FAIL",
+      "detail": "AssertionError: None",
+      "elapsed_s": 0.27,
+      "extra": "Traceback (most recent call last):\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 55, in run\n    out = fn()\n          ^^^^\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 253, in b4_financial_ok\n    assert d and d['roe'] == 15.0 and d['netprofit_yoy'] == 22.0, str(d)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None\n"
+    },
+    {
+      "group": "B",
+      "name": "B5 northbound 区间增量",
+      "status": "FAIL",
+      "detail": "AssertionError: 北向净增持股数错误: None",
+      "elapsed_s": 0.31,
+      "extra": "Traceback (most recent call last):\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 55, in run\n    out = fn()\n          ^^^^\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 263, in b5_northbound_delta\n    assert v == 345.0, f\"北向净增持股数错误: {v}\"\n           ^^^^^^^^^^\nAssertionError: 北向净增持股数错误: None\n"
+    },
+    {
+      "group": "B",
+      "name": "B6 空数据返回 None",
+      "status": "PASS",
+      "detail": "空 DataFrame → None（不熔断，仅本票 miss）✓",
+      "elapsed_s": 0.27,
+      "extra": null
+    },
+    {
+      "group": "B",
+      "name": "B7 网络异常→熔断",
+      "status": "PASS",
+      "detail": "TimeoutError → 返回 None + 熔断标记 ✓",
+      "elapsed_s": 0.29,
+      "extra": null
+    },
+    {
+      "group": "B",
+      "name": "B8 熔断后短路（零调用）",
+      "status": "PASS",
+      "detail": "熔断态 → 短路返回 None，client 零调用 ✓",
+      "elapsed_s": 0.31,
+      "extra": null
+    },
+    {
+      "group": "B",
+      "name": "B9 配额耗尽拒绝服务",
+      "status": "PASS",
+      "detail": "账本 used=95 ≥ 预留线 → budget_ok 拒绝，接口返回 None ✓",
+      "elapsed_s": 0.3,
+      "extra": null
+    },
+    {
+      "group": "B",
+      "name": "B10 缓存 NaN 字面量风险",
+      "status": "FAIL",
+      "detail": "缓存存在 NaN 字段 ['basic_eps_yoy', 'netprofit_yoy']…：读回后 float('NaN') 直接进入评分路径，属已知污染风险",
+      "elapsed_s": 0.14,
+      "extra": null
+    },
+    {
+      "group": "C",
+      "name": "C1 真实调用 get_financial_indicators(600519)",
+      "status": "FAIL",
+      "detail": "真实调用返回 None（key/网络/解析之一失败），源状态: {'available': True, 'last_error': None, 'label': '财务指标(AShareHub)'}",
+      "elapsed_s": 0.28,
+      "extra": null
+    },
+    {
+      "group": "D",
+      "name": "D1 腾讯全市场行情 get_all_quotes",
+      "status": "PASS",
+      "detail": "5213 只解析成功；price≤0: 0，|pct_chg|>11%: 9，amount≤0: 8",
+      "elapsed_s": 90.25,
+      "extra": null
+    },
+    {
+      "group": "D",
+      "name": "D2 K线缓存命中 600519",
+      "status": "PASS",
+      "detail": "缓存命中 64 行 [2026-06-01~2026-08-28]",
+      "elapsed_s": 0.38,
+      "extra": null
+    },
+    {
+      "group": "D",
+      "name": "D3 K线 live（mootdx 冷门票）",
+      "status": "FAIL",
+      "detail": "OperationalError: no such table: kline",
+      "elapsed_s": 0.24,
+      "extra": " (most recent call last):\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 55, in run\n    out = fn()\n          ^^^^\n  File \"C:\\Users\\Administrator\\Documents\\stock-picker-v2\\scripts\\test_data_pipeline.py\", line 426, in d3_kline_live\n    cached_codes = {r[0] for r in conn.execute(\"SELECT DISTINCT code FROM kline\").fetchall()}\n                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nsqlite3.OperationalError: no such table: kline\n"
+    },
+    {
+      "group": "D",
+      "name": "D4 K线无效代码异常处理",
+      "status": "PASS",
+      "detail": "无效代码 999999 → 返回 空（三源全部 miss 后优雅降级）",
+      "elapsed_s": 3.53,
+      "extra": null
+    },
+    {
+      "group": "D",
+      "name": "D5 mootdx 财务快照",
+      "status": "PASS",
+      "detail": "eps=217.9259, roe=10.06%, 报告期 0",
+      "elapsed_s": 0.33,
+      "extra": null
+    },
+    {
+      "group": "E",
+      "name": "E1 同花顺强势股",
+      "status": "PASS",
+      "detail": "40 只强势股，题材归因字段✓",
+      "elapsed_s": 1.56,
+      "extra": null
+    },
+    {
+      "group": "E",
+      "name": "E2 题材归因提取",
+      "status": "PASS",
+      "detail": "提取 118 个题材，Top: 生猪养殖(5只)",
+      "elapsed_s": 0.28,
+      "extra": null
+    },
+    {
+      "group": "E",
+      "name": "E3 东财板块归属",
+      "status": "PASS",
+      "detail": "600519 所属板块 28 个: [{'name': '食品饮料', 'code': 'BK0438', 'change_pct': 2.19, 'lead_stock': '会稽山'}, {'",
+      "elapsed_s": 2.44,
+      "extra": null
+    },
+    {
+      "group": "E",
+      "name": "E4 龙虎榜",
+      "status": "PASS",
+      "detail": "结构完整 records=0 上榜记录（茅台近期未必上榜，空记录也算接口通）",
+      "elapsed_s": 2.88,
+      "extra": null
+    },
+    {
+      "group": "E",
+      "name": "E5 全市场北向汇总",
+      "status": "PASS",
+      "detail": "北向汇总: 沪股通 -47.08亿 + 深股通 -53.13亿 = -100.21亿 (2026-09-04)",
+      "elapsed_s": 2.14,
+      "extra": null
+    },
+    {
+      "group": "E",
+      "name": "E6 东财 7x24 快讯",
+      "status": "PASS",
+      "detail": "东财 7x24 快讯 5 条，最新: 2026-09-05 10:51:41",
+      "elapsed_s": 2.09,
+      "extra": null
+    },
+    {
+      "group": "E",
+      "name": "E7 个股新闻",
+      "status": "PASS",
+      "detail": "600519 个股新闻 5 条",
+      "elapsed_s": 0.54,
+      "extra": null
+    },
+    {
+      "group": "E",
+      "name": "E8 解禁日历",
+      "status": "PASS",
+      "detail": "解禁日历缓存构建成功，覆盖 413 只；600519: 近期无解禁",
+      "elapsed_s": 4.92,
+      "extra": null
+    },
+    {
+      "group": "E",
+      "name": "E9 同花顺个股资金流",
+      "status": "PASS",
+      "detail": "600519 主力净流入 3,634,000,000 元",
+      "elapsed_s": 18.33,
+      "extra": null
+    }
+  ]
+}

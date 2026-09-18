@@ -1,0 +1,193 @@
+{
+  "test_date": "2026-09-05 10:53~11:03",
+  "summary": {
+    "pass": 27,
+    "fail": 1,
+    "warn": 1,
+    "total": 29
+  },
+  "asharehub_quota": {
+    "server_consumed": 1,
+    "ledger": {
+      "date": "2026-09-05",
+      "used": 1
+    },
+    "note": "仅 C1 一次真实调用；Group A/B 全部走临时账本+FakeClient 零消耗"
+  },
+  "results": [
+    {
+      "name": "A1 跨天账本重置",
+      "status": "PASS",
+      "elapsed_s": 3.4,
+      "detail": "旧账本 99/100 @2026-09-01 → 跨天自动重置 → 消耗 1 次验证原子写"
+    },
+    {
+      "name": "A2 配额消耗计数+原子写入",
+      "status": "PASS",
+      "elapsed_s": 4.9,
+      "detail": "连续 3 次 budget_ok → 账本 used=3（独立临时账本后修复通过）"
+    },
+    {
+      "name": "A3 配额临界熔断",
+      "status": "PASS",
+      "elapsed_s": 0.3,
+      "detail": "used=90（预留10）→ 拒绝 + 4 个 asharehub 源全部熔断标记"
+    },
+    {
+      "name": "A4 账本损坏降级",
+      "status": "PASS",
+      "elapsed_s": 0.3,
+      "detail": "损坏 JSON → 降级内存计数，不崩溃"
+    },
+    {
+      "name": "B1 moneyflow 万元→元解析",
+      "status": "PASS",
+      "elapsed_s": 0.3,
+      "detail": "net_mf_amount 1234.5万元 → 12,345,000 元 ✓"
+    },
+    {
+      "name": "B2 technical_factors 解析",
+      "status": "PASS",
+      "elapsed_s": 5.5,
+      "detail": "8 字段（macd/rsi/cci/close_hfq）解析正确"
+    },
+    {
+      "name": "B3 concepts 去重",
+      "status": "PASS",
+      "elapsed_s": 0.3,
+      "detail": "2 行快照 → 按最新 trade_date 去重 → 1 个 BK ✓"
+    },
+    {
+      "name": "B4 financial_indicators 解析",
+      "status": "PASS",
+      "elapsed_s": 0.4,
+      "detail": "11 字段（eps/roe/roa/margins/yoy）解析正确"
+    },
+    {
+      "name": "B5 northbound 区间增量",
+      "status": "PASS",
+      "elapsed_s": 0.4,
+      "detail": "最新 vol 12345 − 10日前 12000 = 345 ✓"
+    },
+    {
+      "name": "B6 空数据返回 None",
+      "status": "PASS",
+      "elapsed_s": 0.3,
+      "detail": "空 DataFrame → None，不熔断（仅本票 miss）"
+    },
+    {
+      "name": "B7 网络异常→熔断",
+      "status": "PASS",
+      "elapsed_s": 0.3,
+      "detail": "TimeoutError → None + 熔断标记 ✓"
+    },
+    {
+      "name": "B8 熔断后短路",
+      "status": "PASS",
+      "elapsed_s": 0.3,
+      "detail": "熔断态下 client 零调用 ✓"
+    },
+    {
+      "name": "B9 配额耗尽拒绝服务",
+      "status": "PASS",
+      "elapsed_s": 0.4,
+      "detail": "used=95 ≥ 预留线 → budget_ok 拒绝 ✓"
+    },
+    {
+      "name": "B10 缓存 NaN 字面量风险",
+      "status": "FAIL",
+      "elapsed_s": 0.1,
+      "detail": "prefetch.db financial 表存在 NaN 字段（basic_eps_yoy/netprofit_yoy 等），json 读回 NaN 直接进评分路径 —— 真实缺陷，待修复"
+    },
+    {
+      "name": "C1 真实调用 financial_indicators",
+      "status": "PASS",
+      "elapsed_s": 13.6,
+      "detail": "600519: roe=26.48, eps=6.74, netprofit_yoy=42.56 —— key 有效、API 连通、解析正常（服务端配额消耗 1 次，账本已同步 used=1）"
+    },
+    {
+      "name": "D1 腾讯全市场行情",
+      "status": "PASS",
+      "elapsed_s": 90.3,
+      "detail": "5213 只解析；price≤0: 0，|pct_chg|>11%: 9（科创/北交 30% 股正常），amount≤0: 8（停牌）"
+    },
+    {
+      "name": "D2 K线缓存命中",
+      "status": "PASS",
+      "elapsed_s": 0.4,
+      "detail": "600519 缓存 64 行 [06-01~08-28]，残缺检测通过（最大间隔<7天）"
+    },
+    {
+      "name": "D3 K线 live mootdx",
+      "status": "PASS",
+      "elapsed_s": 2.6,
+      "detail": "603806 缓存未命中 → mootdx live 拉到 69 行，自动写缓存 ✓"
+    },
+    {
+      "name": "D4 无效代码异常处理",
+      "status": "PASS",
+      "elapsed_s": 3.5,
+      "detail": "999999 → mootdx 垃圾日期被拦 → sina/baostock miss → 优雅返回空，无崩溃"
+    },
+    {
+      "name": "D5 mootdx 财务快照",
+      "status": "PASS",
+      "elapsed_s": 0.3,
+      "detail": "600519 eps=217.93(总股本口径), roe=10.06% ✓"
+    },
+    {
+      "name": "E1 同花顺强势股",
+      "status": "PASS",
+      "elapsed_s": 1.6,
+      "detail": "40 只强势股，题材归因字段完整"
+    },
+    {
+      "name": "E2 题材归因提取",
+      "status": "PASS",
+      "elapsed_s": 0.3,
+      "detail": "提取 118 个题材，Top: 生猪养殖(5只)"
+    },
+    {
+      "name": "E3 东财板块归属",
+      "status": "PASS",
+      "elapsed_s": 2.4,
+      "detail": "600519 所属 28 个板块（force_live 实时路径）"
+    },
+    {
+      "name": "E4 龙虎榜",
+      "status": "PASS",
+      "elapsed_s": 2.9,
+      "detail": "结构完整 records=0（茅台近期未上榜，接口通）"
+    },
+    {
+      "name": "E5 全市场北向汇总",
+      "status": "PASS",
+      "elapsed_s": 2.1,
+      "detail": "沪股通 -47.08亿 + 深股通 -53.13亿 = -100.21亿 (2026-09-04)"
+    },
+    {
+      "name": "E6 东财 7x24 快讯",
+      "status": "PASS",
+      "elapsed_s": 2.1,
+      "detail": "5 条，最新 2026-09-05 10:51（实时性 ✓）"
+    },
+    {
+      "name": "E7 个股新闻",
+      "status": "PASS",
+      "elapsed_s": 0.5,
+      "detail": "600519 5 条新闻"
+    },
+    {
+      "name": "E8 解禁日历",
+      "status": "PASS",
+      "elapsed_s": 4.9,
+      "detail": "缓存构建成功覆盖 413 只；600519 近期无解禁"
+    },
+    {
+      "name": "E9 同花顺个股资金流",
+      "status": "WARN",
+      "elapsed_s": 18.3,
+      "detail": "600519 返回 36.34 亿主力净流入 —— 数值对茅台异常偏大（同期北向净流出100亿），列位/单位解析需人工核对同花顺原始行"
+    }
+  ]
+}

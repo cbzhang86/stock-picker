@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sqlite3
+from datetime import datetime
 from typing import Dict, List, Optional
 
 from core.backtest_engine import BacktestResult
@@ -106,6 +107,12 @@ class BacktestStore:
         )
 
         conn = None
+        # 防御性初始化（非缺陷修复）：当前结构为 try/finally 无 except，
+        # INSERT 失败时异常直接传播，并不会真正执行到下面的 logger/return，
+        # 因此 UnboundLocalError 目前无法发生。
+        # 此处的价值在于：若日后有人为本段补上 except 分支来吞掉异常，
+        # 未初始化的 run_id 会抛 UnboundLocalError 掩盖真实错误。提前初始化可豁免该类回归。
+        run_id = None
         try:
             conn = sqlite3.connect(self.db_path)
             # 从 strategy_name 提取 mode（如 "short_strategy" → "short"）
@@ -143,13 +150,19 @@ class BacktestStore:
             run_id = cur.lastrowid
 
             # 存储交易明细（全量；此前 [:50] 截断 + return_t1 字段名错位导致明细表数据不全）
-            for td in result.trade_details:
-                conn.execute(
-                    "INSERT INTO backtest_trades (run_id, date, code, name, score, buy_price, return_t1) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (run_id, td.get('date', ''), td.get('code', ''), td.get('name', ''),
-                     td.get('score', 0), td.get('buy_price', 0), td.get('return_t1'))
-                )
+            # 性能（2026-09-06）：逐条 execute → executemany 批量提交
+            # （明细数百~上千笔时，单次事务内 N 次 execute 的语句开销明显）
+            conn.executemany(
+                "INSERT INTO backtest_trades (run_id, date, code, name, score, buy_price, return_t1) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(run_id, td.get('date', ''), td.get('code', ''), td.get('name', ''),
+                  td.get('score', 0), td.get('buy_price', 0), td.get('return_t1'))
+                 for td in result.trade_details]
+            )
+
+            # T6 实验追踪归档（2026-09-06 第一梯队）：run_meta 表记录
+            # 代码版本指纹 + 完整参数快照，保证历史回测结果可复现、可对比。
+            self._save_run_meta(conn, run_id, config)
 
             conn.commit()
         finally:
@@ -157,6 +170,96 @@ class BacktestStore:
                 conn.close()
         logger.info(f"回测结果已保存: run_id={run_id}")
         return run_id
+
+    def _save_run_meta(self, conn, run_id: int, config: dict):
+        """T6 实验追踪（2026-09-06 第一梯队）：
+
+        为每次回测归档"可复现性快照"：
+          - git_commit / git_dirty：代码版本（.git 存在时）
+          - code_hashes：关键模块文件的 sha1 前 12 位（比 git 更细粒度的
+            版本指纹，防止"提交了但未含全部文件"的假象）
+          - sell_config / fill_convention / slippage_tiers：影响收益数字的
+            全部参数（weight/config_snapshot 已有基础字段，这里补齐卖出侧）
+        失败仅告警不阻塞主流程。
+        """
+        try:
+            import hashlib
+            import subprocess
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS run_meta (
+                    run_id INTEGER PRIMARY KEY,
+                    git_commit TEXT,
+                    git_dirty INTEGER,
+                    code_hashes TEXT,
+                    sell_config TEXT,
+                    fill_convention TEXT,
+                    slippage_tiers TEXT,
+                    created_at TEXT
+                )
+            """)
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            git_commit, git_dirty = None, None
+            try:
+                git_commit = subprocess.run(
+                    ['git', 'rev-parse', '--short', 'HEAD'], cwd=root,
+                    capture_output=True, text=True, timeout=5).stdout.strip() or None
+                dirty = subprocess.run(
+                    ['git', 'status', '--porcelain'], cwd=root,
+                    capture_output=True, text=True, timeout=5).stdout.strip()
+                git_dirty = 1 if dirty else 0
+            except Exception as e:
+                # 2026-09-14 整体审查 P3-3：原为静默 pass——git 不可用（非仓库/无 git
+                # 命令/超时）会让 run_meta 的 git_commit/git_dirty 恒为 None，
+                # 事后无法区分"没记录"与"记录失败"。改为 debug 级留痕，不改变行为。
+                logging.getLogger(__name__).debug(
+                    f"run_meta git 指纹采集失败（按无 git 信息记录）: {str(e)[:80]}")
+            code_hashes = {}
+            for rel in ('core/backtest_engine.py', 'core/scoring_model.py',
+                        'core/factor_library.py', 'strategies/short_term.py'):
+                p = os.path.join(root, rel)
+                if os.path.exists(p):
+                    with open(p, 'rb') as f:
+                        code_hashes[rel] = hashlib.sha1(f.read()).hexdigest()[:12]
+            sell = (config or {}).get('sell', {})
+            meta = (
+                run_id, git_commit, git_dirty,
+                json.dumps(code_hashes, ensure_ascii=False),
+                json.dumps(sell, ensure_ascii=False, default=str),
+                (config or {}).get('fill_convention'),
+                json.dumps((config or {}).get('slippage_tiers'), default=str),
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO run_meta (run_id, git_commit, git_dirty, "
+                "code_hashes, sell_config, fill_convention, slippage_tiers, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", meta)
+        except Exception as e:
+            logger.warning(f"run_meta 归档失败（不阻塞回测保存）: {str(e)[:60]}")
+
+    def get_run_meta(self, run_id: int) -> Dict:
+        """读取某次回测的可复现性快照；无记录返回空 dict。"""
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM run_meta WHERE run_id=?", (run_id,)).fetchone()
+            if row is None:
+                return {}
+            d = dict(row)
+            for k in ('code_hashes', 'sell_config', 'slippage_tiers'):
+                if d.get(k):
+                    try:
+                        d[k] = json.loads(d[k])
+                    except Exception:
+                        pass
+            return d
+        except Exception as e:
+            logger.warning(f"run_meta 读取失败: {str(e)[:60]}")
+            return {}
+        finally:
+            if conn:
+                conn.close()
 
     def list_runs(self, limit: int = 20) -> List[Dict]:
         """列出最近的回测运行记录"""

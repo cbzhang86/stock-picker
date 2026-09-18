@@ -9,7 +9,8 @@
 1. **mootdx (TCP 7709)** — K线 + 财务快照，永不封 IP，复用连接后 ~0.1s/只
 2. **腾讯财经 (HTTP)** — 实时行情 5205 只，不封 IP，~46s 全市场
 3. **同花顺 10jqka** — 强势股 + 题材归因，零鉴权 73ms
-4. **hexin.cn** — 北向资金汇总，零鉴权
+4. **东财 datacenter-web** — 北向资金日度净流入汇总，零鉴权
+   （早期文档写作 `hexin.cn`，代码中并无该域名，已更正）
 5. **ASHareHub (免费 API Key)** — 个股北向持仓 / 个股资金流 / 技术因子 / 概念板块 / 财务指标，4 端共享 100次/天
 6. **东财 (em_get 限流)** — 板块归属 / 龙虎榜，有 WAF 风控，必须经 `em_get()` 串行限流
 
@@ -129,17 +130,37 @@ ScoringModel 不再写入 v1.json（仅优化器三段式写入）。
 17. **Optimizer 缓存目录** — `.last_optimize_short` 计数文件在 `data/cache/`，不在 `data/weights/`。
 18. **Tracker UNIQUE 约束** — `predictions(date, code, mode)` 有 UNIQUE 索引，重复插入会抛异常，需用 INSERT OR REPLACE。
 19. **factor_scores JSON 序列化** — `json.dumps(factor_scores, default=str)` 处理 numpy 类型。
-20. **backtest_engine SQLite** — `_load_factor_data()` 连接无 try/finally（已知遗留，低风险）。
-21. **ScoringModel 权重加载顺序** — v1.json > config 传入 > DEFAULT_WEIGHTS。v1.json 存在时 config 权重被忽略并记录 warning。
+20. **backtest_engine SQLite** — `_load_factor_data()` 连接已补 try/finally（2026-09-06 修复，此前为已知遗留）。
+21. **ScoringModel 权重加载顺序** — v1.json > config 传入 > DEFAULT_WEIGHTS。三层已全部对齐（2026-09-14 起：config.yml 的 short_term.weights 同步为 v1.json 值，告警改为语义比较——只在真不一致时打印，不再恒假阳性）。改权重必须改 `data/weights/v1.json`。
 22. **止盈止损从 config 读取** — `sell_config` 参数传入 ScoringModel，`short_term.sell.take_profit` / `stop_loss`，不再硬编码。
 
 ---
 
+**V2 速查（新架构补充）**
+
+- `core/expert_ensemble.py` — 5 维专家第二意见：一致微调、分歧降权、冲突（Δ>25）降仓
+- `core/oos_validator.py` — walk-forward OOS IC（三口径取悲观值 + daily_ics）
+- `core/trading_calendar.py` — 集中式交易日历（本地缓存+联网刷新）
+- `scripts/pick.py` — 统一 CLI：pick/backfill/health/oos/backtest/prefetch/calibrate/slippage
+- `scripts/daily_job.py` — 每日统一调度（交易日→选股 / 非交易日→预取）
+- `scripts/evaluate_all.py` — 回归门禁（9 项；任何代码/权重改动后必跑）
+- `scripts/calibrate_weights.py` — OOS 权重校准（--apply 需人工审批）
+
 **快速调试命令**
 
 ```bash
-# 完整策略（~4分钟）
+# 完整策略（2026-09-06 性能优化后端到端 ~113s）
 python scripts/eod_stock_picker.py --mode short
+
+# 统一 CLI 入口（2026-09-07）：pick/backfill/health/oos/backtest/prefetch/calibrate/slippage
+python scripts/pick.py health          # 快速门禁（9 项）
+python scripts/pick.py pick            # 尾盘选股
+
+# 每日统一调度（交易日→选股，非交易日→配额预取，内置交易日历分流）
+python scripts/daily_job.py
+
+# 回归门禁（任何代码/权重改动后必跑）
+python scripts/evaluate_all.py
 
 # 查看状态和近期表现
 python scripts/eod_stock_picker.py --status

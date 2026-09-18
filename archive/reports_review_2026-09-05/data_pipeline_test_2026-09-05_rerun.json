@@ -1,0 +1,45 @@
+{
+  "test_date": "2026-09-05 11:04",
+  "duration_s": 20.0,
+  "summary": {
+    "pass": 4,
+    "fail": 0,
+    "warn": 0,
+    "total": 4
+  },
+  "asharehub_quota_consumed": 1,
+  "results": [
+    {
+      "group": "B",
+      "name": "B2 technical_factors 解析",
+      "status": "PASS",
+      "detail": "解析 8 字段（macd/rsi/cci/close_hfq）✓",
+      "elapsed_s": 5.51,
+      "extra": null
+    },
+    {
+      "group": "B",
+      "name": "B4 financial_indicators 解析",
+      "status": "PASS",
+      "detail": "解析 11 字段（eps/roe/roa/margins/yoy）✓",
+      "elapsed_s": 0.42,
+      "extra": null
+    },
+    {
+      "group": "B",
+      "name": "B5 northbound 区间增量",
+      "status": "PASS",
+      "detail": "最新 vol 12345 - 10日前 vol 12000 = 345.0 ✓",
+      "elapsed_s": 0.43,
+      "extra": null
+    },
+    {
+      "group": "C",
+      "name": "C1 真实调用 get_financial_indicators(600519)",
+      "status": "PASS",
+      "detail": "真实调用成功: roe=26.4847, eps=6.74, netprofit_yoy=42.561；今日配额账本 used=1",
+      "elapsed_s": 13.65,
+      "extra": null
+    }
+  ]
+}

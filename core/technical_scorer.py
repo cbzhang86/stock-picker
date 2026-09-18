@@ -15,6 +15,7 @@
 参考：daily-stock-analysis StockTrendAnalyzer._generate_signal()
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional
 from enum import Enum
@@ -91,6 +92,14 @@ class TechnicalScorer:
             return result
 
         close = df['close'].astype(float)
+
+        # 修复（2026-09-05 审查 P3-5）：最新收盘价缺失/非正（坏数据）时整票
+        # 返回中性 50。旧代码会让 0 价混入均线与乖离计算（乖离=-100%、
+        # 均线"空头排列"），产出荒谬结论而非中性。
+        if pd.isna(close.iloc[-1]) or close.iloc[-1] <= 0:
+            result.total = 50.0
+            result.signal = "HOLD"
+            return result
         volume = df['volume'].astype(float) if 'volume' in df.columns else pd.Series([0] * len(df))
         high = df['high'].astype(float) if 'high' in df.columns else close
         low = df['low'].astype(float) if 'low' in df.columns else close
@@ -145,10 +154,20 @@ class TechnicalScorer:
         """
         score = 50.0
 
+        # 数值兜底：键存在但值为 null / NaN / ±Inf 时按缺省处理
+        # （2026-09-16 P0-1 收尾）：原实现只判 isinstance(v, float)，而 NaN 本身
+        # 就是 float 会被放行 → nan 的所有比较恒为 False，RSI 落入 else「超买 -5」、
+        # MACD 落入 else「空头 -10」，全空记录静默得 37 分而非中性 50 分。
+        # 现改用 math.isfinite 统一把「非有限」视同「缺失」。
+        def _num(v, default):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return default
+            return v if math.isfinite(v) else default
+
         # MACD 状态 (0-30分)
-        macd_val = tech.get('macd', 0)
-        macd_dif = tech.get('macd_dif', 0)
-        macd_dea = tech.get('macd_dea', 0)
+        macd_val = _num(tech.get('macd'), 0)
+        macd_dif = _num(tech.get('macd_dif'), 0)
+        macd_dea = _num(tech.get('macd_dea'), 0)
         if macd_dif > macd_dea and macd_dif > 0:
             score += 15  # 零轴上多头
         elif macd_dif > macd_dea:
@@ -159,8 +178,8 @@ class TechnicalScorer:
             score -= 10  # 空头
 
         # RSI (0-30分) — 取 RSI_14 近似值 (rsi_12 和 rsi_24 的中值)
-        rsi12 = tech.get('rsi_12', 50)
-        rsi24 = tech.get('rsi_24', 50)
+        rsi12 = _num(tech.get('rsi_12'), 50)
+        rsi24 = _num(tech.get('rsi_24'), 50)
         rsi_approx = (rsi12 + rsi24) / 2
         if rsi_approx < 25:
             score += 15  # 超卖区，反弹机会
@@ -174,7 +193,7 @@ class TechnicalScorer:
             score -= 5   # 超买风险
 
         # CCI (0-10分)
-        cci = tech.get('cci', 0)
+        cci = _num(tech.get('cci'), 0)
         if cci < -100:
             score += 5    # 超卖
         elif cci > 100:
@@ -247,9 +266,12 @@ class TechnicalScorer:
     def _score_trend(self, ma5: pd.Series, ma10: pd.Series,
                      ma20: pd.Series, close: pd.Series) -> tuple:
         """趋势形态评分 (30分)"""
-        c5 = ma5.iloc[-1] if not ma5.isna().iloc[-1] else 0
-        c10 = ma10.iloc[-1] if not ma10.isna().iloc[-1] else 0
-        c20 = ma20.iloc[-1] if not ma20.isna().iloc[-1] else 0
+        # 修复（2026-09-05 审查 P3-5）：此前 NaN → 0 哨兵，会把"数据不足"
+        # （尾部停牌/缺行导致均线为 NaN）误判为空头排列（0 < 有效均线，
+        # 白扣 22 分）。改为任一均线缺失/非正时给中性盘整分，不奖不罚。
+        c5, c10, c20 = ma5.iloc[-1], ma10.iloc[-1], ma20.iloc[-1]
+        if any(pd.isna(v) or v <= 0 for v in (c5, c10, c20)):
+            return 15, "盘整(数据不足)"
 
         # 均线角度（用过去N日的斜率）
         def slope(s, n=5):
@@ -262,8 +284,14 @@ class TechnicalScorer:
 
         if c5 > c10 > c20 and slope5 > 0:
             # 强势多头 + 角度向上
-            angle_bonus = min(slope5 * 3, 5)
-            return min(30 + angle_bonus, 30), "强势多头"
+            # 修复说明（2026-09-03）：原实现为 `min(30 + angle_bonus, 30)`，
+            # 上限恒等于 30，上一行算出的 angle_bonus 完全无效，是死代码。
+            # 此处改为显式返回 30，运行行为与修复前逐字节一致（零行为变化）。
+            #
+            # 若要真正引入"角度"区分度，不可在此直接放开上限——趋势维度 30 分
+            # 是 6 维合计 100 的硬约束，超上限会破坏其他维度的相对权重。
+            # 正确做法是重新分配 6 维分值并重建回测基线，属独立立项事项。
+            return 30, "强势多头"
         elif c5 > c10 > c20:
             return 24, "多头排列"
         elif c5 > c10 and c10 > c20 * 0.98:
@@ -302,12 +330,17 @@ class TechnicalScorer:
         if len(volume) < 10:
             return 7, "数据不足"
 
-        avg_vol_5 = volume.rolling(5).mean()
+        # 修复（2026-09-05 审查 P3-5）：删除从未使用的 avg_vol_5/avg5 死代码
+        # （量比基准实际只用 20 日均量）；avg20 缺失时原"NaN→1 哨兵"会让
+        # v_ratio 变成原始成交量（天文数字），误入"放量"分支。改为中性分。
         avg_vol_20 = volume.rolling(20).mean()
 
         current_v = volume.iloc[-1]
-        avg5 = avg_vol_5.iloc[-1] if not avg_vol_5.isna().iloc[-1] else 1
-        avg20 = avg_vol_20.iloc[-1] if not avg_vol_20.isna().iloc[-1] else 1
+        avg20 = avg_vol_20.iloc[-1]
+        # 当日成交量缺失/为零（坏数据）时旧代码会让 v_ratio=0 落入"缩量回调"
+        # 拿最高分 14，同理归为数据不足
+        if pd.isna(avg20) or avg20 <= 0 or pd.isna(current_v) or current_v <= 0:
+            return 9, "量能数据不足"
 
         # 当日涨跌
         if len(close) >= 2:
@@ -337,7 +370,9 @@ class TechnicalScorer:
         sup_ma5 = ma5.iloc[-1] if not ma5.isna().iloc[-1] else None
         sup_ma10 = ma10.iloc[-1] if not ma10.isna().iloc[-1] else None
 
-        if sup_ma5 and sup_ma10:
+        # 修复（2026-09-05 审查 P3-5）：原 `if sup_ma5 and sup_ma10` 用真值判断，
+        # 均线为 0/0.0 时会被当作"无数据"。改为显式非空且为正的判断。
+        if sup_ma5 is not None and sup_ma10 is not None and sup_ma5 > 0 and sup_ma10 > 0:
             dist_to_ma5 = abs(c - sup_ma5) / sup_ma5 * 100
             dist_to_ma10 = abs(c - sup_ma10) / sup_ma10 * 100
 
@@ -370,6 +405,12 @@ class TechnicalScorer:
         prev_dif = dif.iloc[-2] if len(dif) > 1 else cur_dif
         prev_dea = dea.iloc[-2] if len(dea) > 1 else cur_dea
 
+        # 2026-09-17 修复：K 线含 NaN 时 dif/dea 为 NaN，所有比较均为 False，
+        # 此前会落到最后的 `return 6, "空头"` —— 把"无数据"伪装成看空信号。
+        # 缺失必须中性化（与"数据不足"同档），不得参与方向判断。
+        if any(np.isnan(v) for v in (cur_dif, cur_dea, prev_dif, prev_dea)):
+            return 7, "数据缺失（中性）"
+
         # 金叉
         if prev_dif < prev_dea and cur_dif > cur_dea:
             if cur_dif > 0:
@@ -395,11 +436,19 @@ class TechnicalScorer:
         avg_gain = gain.rolling(14).mean().iloc[-1]
         avg_loss = loss.rolling(14).mean().iloc[-1]
 
+        # 2026-09-17 修复：close 含 NaN → avg_gain/avg_loss 均为 NaN，RSI 为 NaN，
+        # 下方所有阈值比较均为 False → 此前落到 `return 4`（"超买"），
+        # 把"无数据"伪装成最高风险档。缺失必须中性化（与"数据不足"同档）。
+        if np.isnan(avg_gain) or np.isnan(avg_loss):
+            return 5  # 数据缺失（中性）
+
         if avg_loss == 0 or avg_loss is None or np.isnan(avg_loss):
             return 8  # 一直在涨
 
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
+        if np.isnan(rsi):
+            return 5  # 数据缺失（中性）
 
         if rsi < 25:
             return 9   # 超卖区，可能反弹

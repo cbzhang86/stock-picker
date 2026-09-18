@@ -1,0 +1,37 @@
+{
+  "smoke_test": {
+    "timestamp": "2026-09-05T10:14",
+    "scope": "Task 3 通路 — TDX/问财数据 → FundamentalProvider/EventProvider → FactorLibrary → ScoringModel",
+    "samples": 5,
+    "codes": ["600519", "300750", "002594", "600183", "002415"]
+  },
+  "prefetch_result": {
+    "fundamentals_upserted": 5,
+    "events_upserted": 5,
+    "auto_labeled_positive": 3,
+    "auto_labeled_negative": 2
+  },
+  "raw_factor_scores": {
+    "valuation_fundamental": {
+      "600519": 70.0,
+      "300750": 72.0,
+      "002594": 57.0,
+      "600183": 46.0,
+      "002415": 66.0
+    },
+    "event_catalyst": {
+      "600519": 53.6,
+      "300750": 56.4,
+      "002594": 58.4,
+      "600183": 42.8,
+      "002415": 46.5
+    }
+  },
+  "interpretation": [
+    "估值分体现 ROE 主导：宁德/茅台 70+，海康 66，比亚迪 57（ROE 仅 4.86），生益 46（PE 64 泡沫扣分）",
+    "事件分受时间衰减：业绩预增/回购/分红 → 53-58 正向；问询/减持 → 42-46 负向",
+    "中性检测正确触发：fundamentals=None 或 recent_events=空时返回 50 分中性，不污染总分",
+    "Decision date 参数正确传递：reference_date=2026-09-05 用于事件衰减时间锚，无 look-ahead"
+  ],
+  "next_step": "v1.json 暂未加入这两个因子（保持权重 0）。待 OOS IC 验证有效后再 calibrate_weights.py 提升权重"
+}

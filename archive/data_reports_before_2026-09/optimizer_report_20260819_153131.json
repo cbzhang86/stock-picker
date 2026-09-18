@@ -1,0 +1,143 @@
+{
+  "generated_at": "2026-08-19 15:31:31",
+  "mode": "short",
+  "triggered": true,
+  "summary": "触发优化: 胜率 46.73%, 总记录 107, 新鲜度 55% → 已生成权重建议，等待审批",
+  "data_diagnostics": {
+    "factor_stats": {
+      "capital_flow": {
+        "n_samples": 107,
+        "unique_values": 35,
+        "min": 50.0,
+        "max": 100.0
+      },
+      "north_flow": {
+        "n_samples": 107,
+        "unique_values": 2,
+        "min": 0.0,
+        "max": 50.0
+      },
+      "momentum": {
+        "n_samples": 107,
+        "unique_values": 81,
+        "min": 42.89,
+        "max": 100.0
+      },
+      "technical": {
+        "n_samples": 107,
+        "unique_values": 37,
+        "min": 50.0,
+        "max": 92.0
+      },
+      "volume_price": {
+        "n_samples": 107,
+        "unique_values": 11,
+        "min": 33.18,
+        "max": 80.0
+      },
+      "hot_theme": {
+        "n_samples": 76,
+        "unique_values": 12,
+        "min": 50.0,
+        "max": 71.25
+      },
+      "dragon_tiger": {
+        "n_samples": 76,
+        "unique_values": 5,
+        "min": 50.0,
+        "max": 100.0
+      }
+    },
+    "valid_signals": [
+      "capital_flow",
+      "momentum",
+      "technical",
+      "volume_price",
+      "hot_theme",
+      "dragon_tiger"
+    ],
+    "low_signal": [
+      "north_flow"
+    ],
+    "missing": [],
+    "total_records": 107,
+    "date_range": "2026-06-11 ~ 2026-08-17",
+    "win_rate": 46.73,
+    "avg_return_t1": 0.14,
+    "fresh_ratio": 0.551
+  },
+  "old_weights": {
+    "capital_flow": 0.35,
+    "north_flow": 0.0,
+    "momentum": 0.25,
+    "technical": 0.15,
+    "volume_price": 0.1,
+    "hot_theme": 0.1,
+    "dragon_tiger": 0.05
+  },
+  "proposed_weights": {
+    "capital_flow": 0.3462,
+    "north_flow": 0.0,
+    "momentum": 0.3557,
+    "technical": 0.2981,
+    "volume_price": 0.0,
+    "hot_theme": 0.0,
+    "dragon_tiger": 0.0
+  },
+  "changed": true,
+  "factor_deltas": {
+    "capital_flow": {
+      "old": 0.35,
+      "new": 0.3462,
+      "delta": -0.0038
+    },
+    "north_flow": {
+      "old": 0.0,
+      "new": 0.0,
+      "delta": 0.0
+    },
+    "momentum": {
+      "old": 0.25,
+      "new": 0.3557,
+      "delta": 0.1057
+    },
+    "technical": {
+      "old": 0.15,
+      "new": 0.2981,
+      "delta": 0.1481
+    },
+    "volume_price": {
+      "old": 0.1,
+      "new": 0.0,
+      "delta": -0.1
+    },
+    "hot_theme": {
+      "old": 0.1,
+      "new": 0.0,
+      "delta": -0.1
+    },
+    "dragon_tiger": {
+      "old": 0.05,
+      "new": 0.0,
+      "delta": -0.05
+    }
+  },
+  "major_changes": [
+    "momentum",
+    "technical",
+    "volume_price",
+    "hot_theme",
+    "dragon_tiger"
+  ],
+  "ridge_detail": {
+    "coefficients": {
+      "capital_flow": 0.024728,
+      "momentum": 0.025407,
+      "technical": 0.021292,
+      "volume_price": -0.061606,
+      "hot_theme": -0.040012,
+      "dragon_tiger": -0.033677
+    },
+    "r2_score": 0.0774
+  }
+}

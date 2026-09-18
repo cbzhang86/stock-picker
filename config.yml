@@ -3,43 +3,134 @@
 # ============================================================
 
 # ---- 短线策略权重 ----
-# 权重起点：A 股量化研报中位数对齐（资金流+动量共50%，题材弱化15%）
-# 设计原则：每阶段迭代
-#   阶段1（现在）：研报中位为起点（避免 optimizer 陷入局部最优）
-#   阶段2（>=30条预测后）：feedback/optimizer.py 自动 Ridge 校准
+# ⚠️ 唯一事实源声明（2026-09-05 审查报告 P0-A）：
+#   实际生效权重 = data/weights/v1.json（ScoringModel 加载优先级 v1.json > config.yml，
+#   见 SKILL.md 陷阱 21）。本段数值为 2026-09-05 校准的历史草稿，【不生效】，仅作追溯记录。
+#   当前生效值（v1.json short，2026-09-18 第二次调整后）：hot_theme 0.35 /
+#   reversal_20d 0.49 / capital_flow 0.05 / technical 0.03 / volume_price 0.03 /
+#   momentum 0.03 / dragon_tiger 0.02 / north_flow 0.00 / size 0.00。
+#   权重调整唯一入口：python scripts/calibrate_weights.py（--apply 需人工审批）。
+#
+# 校准依据（2026-06-30~2026-09-03，47 交易日 / 889 只，主口径 hold1d）：
+#   hot_theme      OOS IC +0.0651 (t=+2.17) ← 唯一统计显著的有效因子
+#   capital_flow   OOS IC +0.0056 (t=+0.11) ← 三种口径方向一致，弱正
+#   dragon_tiger   OOS IC -0.0072            ← 噪声
+#   volume_price   OOS IC -0.0460 (t=-2.08) ← 稳定反向
+#   technical      OOS IC -0.0462 (t=-1.81) ← 负向
+#   momentum       OOS IC -0.0926 (t=-2.24) ← 强反向（原权重 25%，本次降至 4%）
+#
+# 原权重来自"A股量化研报中位数"，与本系统实测方向严重背离。现改为按 IC 校准，
+# 并向等权先验收缩（λ=0.25，样本外仅 15 天，不宜激进）。
+#
+# 注意：ScoringModel 加载优先级 v1.json > config.yml > DEFAULT_WEIGHTS。
+# 本段是「兜底」，必须与 data/weights/v1.json 保持一致——2026-09-14 整体审查 P1-1：
+# 此前本段停留在「资金权重时代」的旧值（capital_flow 0.3036 / technical 0.0619 /
+# volume_price 0.062），与生效权重差异巨大；一旦 v1.json 丢失/被清空，就会静默回落到
+# 旧参数，而动态门槛（强市 65 / 中性 70 / 弱市 75）是按 v1 的评分尺度定的
+# → 评分尺度与门槛错配、选股行为静默剧变。已同步为 v1.json 值（Σ=1.00）。
+# 改动此处后必须同步 data/weights/v1.json，否则不生效（SKILL.md 陷阱 21）。
 short_term:
+  # 影子推荐（2026-09-18）：极端市况（极差市停推 / 拥挤度断路器 / 动态门槛零达标）当日
+  # **照常评分并以 mode='shadow' 落库**，但不下发、不进正式统计（全工程 7 处统计读取硬滤
+  # mode='short'；get_pending_outcomes 不滤 mode → 影子行自动补 T+1/T+5/T+20 结果）。
+  # 目的：破解"样本删失"——停推日不落库 → 永远攒不出"冰点期该不该推"的直接证据。
+  # 置 false 可关闭（关闭后恢复"极端日直接停推、不落库"的旧行为）。
+  shadow_enabled: true
   weights:
-    capital_flow: 0.35         # 主力资金流（吸收原 north_flow 10%，降权后短线最依赖因子）
-    north_flow: 0.00           # 北向资金（2024-08 政策停公开，因子返回中性 50，不再占权重）
-    momentum: 0.25             # 动量/RPS排位（A 股最强 cross-sectional 因子）
-    technical: 0.15            # 技术形态（均线/MACD）
-    volume_price: 0.10         # 量价配合
-    hot_theme: 0.10            # 同花顺热点/题材归因
-    dragon_tiger: 0.05         # 龙虎榜信号（叠加于 capital_flow 表达游资动量维度）
-    # 合计 1.00。设计原理：
-    # - 资金流 + 龙虎榜 总计 0.40 (原 0.30，吸收北向 0.10)
-    # - momentum 0.25 是 A 股学术公认的 cross-sectional alpha 源
-    # - 技术 + 量价 = 0.25 提供系统化择时确认
-    # - hot_theme 0.10 反映"题材热度"的辅助信号
-    # - north_flow 0.00 政策停公开，因子恒返回 50 不占权重（2026-07-13 改）
-    # risk 不在权重表（语义不属于评分分项，而是过滤/惩罚）。
-    # 风控通过 risk_filter 前置拦截（ST/涨停封死/解禁压力等），
-    # 剩余软风险由 scoring_model 的 penalty 路径在总分上额外扣减。
+    # 2026-09-18 权重优化（经 2.2 年全市场 OOS 验证 + IC 衰减分析后审批执行）：
+    # - hot_theme 0.50→0.42：有效（IC +0.0367, t=+10.74）但 IC 在衰减
+    #   （前半 +0.0393 → 后半 +0.0342，斜率 -0.00016/日，月度分解 1月 +0.0474 → 8月 +0.0179）
+    # - reversal_20d 0→0.42（新增）：IC +0.0298 (t=+2.11) 且上升
+    #   （前半 +0.0274 → 后半 +0.0322，walk-forward 均值 +0.0474，三折符号稳定）；
+    #   T+1 反转是 A 股制度性特征，不像题材热度会因拥挤而衰减
+    # - technical/volume_price/momentum：弱负 IC（-0.0179~-0.0298 符号稳定）→ 探索位 0.03
+    # - capital_flow 0.15→0.05：coverage 2.3% + 衰减最剧烈（+0.034 → -0.021）
+    # - dragon_tiger 0.02：噪声（t=-0.31）
+    capital_flow: 0.05          # 主力资金流（coverage 2.3% + IC 剧烈衰减，与 v1.json 一致）
+    north_flow: 0.00            # 北向资金（2024-08 政策停公开，因子返回中性 50）
+    momentum: 0.03              # 动量/RPS排位（OOS 弱负 IC -0.0298，反向）
+    technical: 0.03             # 技术形态（OOS 弱负 IC -0.0207）
+    volume_price: 0.03          # 量价配合（OOS 弱负 IC -0.0179；急拉诱多问题待拆分修复）
+    hot_theme: 0.35             # 题材热度（2026-09-18 第二步降权 0.42→0.35：月度复检检出
+                                # IC 连续 2 月下降 0.0232→0.0179→−0.0205；让渡权重给上升中的 reversal_20d）
+    dragon_tiger: 0.02          # 龙虎榜信号（噪声）
+    reversal_20d: 0.49          # 反转因子（2026-09-18 启用并经第二次调整 0.42→0.49）：= 100 - momentum 百分位。
+                                # IC +0.0298(t=+2.11) 且上升（前半 +0.0274 → 后半 +0.0322），walk-forward +0.0474，
+                                # 三折符号稳定 → 承接 hot_theme 让渡的 7pp（两强因子合计 0.84 不变）。
+    size: 0.00                  # 小市值因子（2026-09-18 R-B，权重 0 链路先行）：横截面市值
+                                # 百分位取反，市值越小分越高（study-vault F09：A 股最稳健截面
+                                # 因子，现体系无规模维度）。OOS 面板无市值数据，启用条件 =
+                                # 市值历史快照积累 >= 60 交易日后跑 OOS 验证再审批加权。
+    # ---- 待验证新因子（权重 0，链路已通，验证后再启用）----
+    valuation_fundamental: 0.00 # 通达信估值/基本面：PE/PB/ROE/股息率（见 core/fundamental_provider.py）
+    event_catalyst: 0.00        # 事件催化：公告/业绩预告/新闻（见 core/event_provider.py）
+    # 合计 1.00。
+    # 新因子启用条件：data/cache 下积累 >= 60 个交易日的估值/事件快照后，
+    # 跑 `python scripts/run_backtest.py --mode oos` 计算其 OOS IC，
+    # 再跑 `python scripts/calibrate_weights.py` 重新分配权重。
+    # 未经 OOS 验证就给权重 = 盲押，与「①先修验证方法」的原则冲突。
 
   # 买入条件
   buy:
     max_candidates: 3         # 最多推荐数量
     min_score: 75             # 最低评分（0-100），低于此值跳过
     exclude_st: true
-    exclude_limit_up: true    # 涨停封死的股票
+    exclude_limit_up: true    # 涨停封死的股票（2026-09-05 P0-E：limit_up_amount 无数据源，
+                              # 改用代理规则 pct_chg >= 板块上限×0.98 直接硬过滤）
     min_volume: 30000000      # 最低日成交额（3000万）
     min_listing_days: 60      # 最低上市天数
+    momentum_filter_rps_max: 80  # 动量硬过滤：剔除非热点·rps_20>=80（候选池分位）的票。
+                                 # 实测该段胜率 40.3%/日均-1.09%（n=7370）；热点票豁免。0=关闭
+    max_per_board: 2          # 组合层风控：推荐组合内同板块最多 N 只（0=关闭）
+    max_correlation: 0.85     # 组合层风控③：持仓两两 20 日收益相关上限（0=关闭；0.85 仅拦极端同质持仓）
+    # P3（2026-09-18）：拥挤度断路器——全市场日均涨幅（绝对值）≥ 此阈值时当日停推。
+    # 依据 run52 分解（4-8 月 111 笔）：市场日均涨幅 >=2.0% 的决策日 9 笔 0 胜
+    # （−4.52%/笔，合计 −40.7pp）；机制 = 暴涨日尾盘追题材 → 次日拥挤回落
+    # （study-vault F02 拥挤度）。0=关闭。A/B：回测 --crowding-avg-pct 覆盖。
+    crowding_avg_pct: 2.0
+    # R1（2026-09-18）：拥挤度分档仓位压缩——[[市场日均涨幅阈值, 仓位系数], ...]。
+    # 【默认关闭】原因：回测组合模拟按「当日委托合计」归一化（alloc×base_equity/total_alloc），
+    # 刻意做到尺度不变（tests/test_portfolio_sim_scale_invariance_20260916.py 锁定），
+    # 因此仓位/sizing 类改动在回测中【无法验证】——实测同一窗口「均匀缩放 ×0.5」与
+    # 不缩放结果完全相同（+3.23% vs +3.23%），而分档混合缩放会因延期买入与当日买入
+    # 混合导致归一化分母失真，产出 −30.76% 的**伪结果**（非真实风险效应）。
+    # 若要启用，需先建立「绝对仓位口径」的回测模式（见 docs/下一步工作方案 修订记录）。
+    # 机制与单测已就绪（_crowding_position_scale + tests/test_crowding_scale_20260918.py）。
+    crowding_scale_levels: []
+    # 弱市仓位系数（2026-09-18 参数化，原硬编码 0.5）：弱市时总仓位 × 此系数，
+    # 1.0 = 关闭弱市压缩。与波动保险丝/连亏压缩/拥挤度分档共同构成仓位机制栈，
+    # 其效果只有在 sizing_mode=absolute 口径下才可被回测验证（见该字段注释）。
+    weak_market_scale: 0.5
+    # P4（2026-09-18）：尾盘急拉过滤——收盘位置 (close-low)/(high-low) 高于阈值
+    # 的票剔除（0=关闭）。【默认关闭】A/B 结论（run61 vs run62）：过滤器确实
+    # 剔除了差票（被过滤 43 笔均值 −1.20%），但顶替上来的 40 笔更差（−1.50%）
+    # ——候选池整体边际≈0 时，过滤只是弱票换位，组合收益 −19.11%→−47.77%。
+    # 待候选池质量改善（size/估值因子启用、覆盖率提升）后再 A/B 启用。
+    max_close_pos: 0
+    vol_breaker_median_abs: 3.0  # 波动率保险丝：全市场中位|涨幅|% 超过此值触发降仓（历史极罕见）
+    vol_breaker_scale: 0.8    # 波动率保险丝触发后的仓位系数
+    losing_streak_days: 3     # 组合层风控：最近 N 个有结果交易日日均收益连续为负触发降仓
+    losing_streak_scale: 0.5  # 触发连亏降仓后的仓位系数
+    # 策略级 kill-switch（2026-09-05 审查报告 P3-R）：
+    # 最近 N 个有 T+1 结果的交易日累计收益 <= -drawdown 时停止当日推荐。
+    # drawdown 用小数（0.10 = 10%），0 = 关闭。样本不足时自动放行不误伤。
+    killswitch_window_days: 20
+    killswitch_drawdown: 0.10
 
   # 卖出规则
   sell:
     take_profit: 0.02         # 止盈 +2%
     stop_loss: -0.02          # 止损 -2%
     time_stop_days: 3         # 时间止损（T+3）
+    # 波动率自适应止损（2026-09-05 审查报告 P2-N）：
+    #   fixed = 固定 stop_loss（默认，行为与历史一致）
+    #   atr   = max(atr_mult × ATR14, |stop_loss|)，热点票噪音止损减少
+    stop_mode: fixed
+    atr_mult: 1.0
+    # 因子横截面标准化（2026-09-05 审查报告 P2-K，实验开关）：
+    # true = 评分前对因子做横截面百分位标准化（rank 0-100）。
+    # 默认 false 保持历史行为；启用后必须重跑 --mode oos 与 calibrate_weights。
+    standardize: false
 
 # ---- 长线策略权重 ----
 long_term:
@@ -69,7 +160,35 @@ backtest:
   initial_capital: 1000000       # 初始资金
   commission_rate: 0.0003         # 手续费万三
   slippage: 0.001                 # 滑点 0.1%
+  # ---- 交易成本补全（2026-09-05 审查报告 P0-C：原配置漏计印花税/过户费，
+  #      每笔双边成本低估约 0.051%，T+5 口径收益被高估）----
+  stamp_duty: 0.0005              # 印花税 0.05%（仅卖出收取，2023-08 减半后现行税率）
+  transfer_fee: 0.00001           # 过户费 0.001%（买卖双向）
+  # 分级滑点 [[单笔委托金额上限(元), 滑点], ...] 升序；非空时覆盖固定 slippage。
+  # ⚠️ 2026-09-17 修复（缺陷1）：滑点按【单笔委托金额】查表，不是股票日成交额；
+  #   与 scripts/capacity_check.py::lookup_slippage 同语义。大额单笔按市场冲击分级，
+  #   避免 0.1% 统一滑点低估大单成本（报告 P0-C）。
+  slippage_tiers:
+    - [2000000, 0.001]            # 单笔≤200万：0.1%
+    - [10000000, 0.002]           # 单笔 200万~1000万：0.2%
+    - [100000000, 0.004]          # 单笔 1000万~1亿：0.4%
+    - [1000000000000, 0.008]      # 单笔 >1亿：0.8%
+  # ---- 多基准（2026-09-05 审查报告 P1-J：仅沪深300 会掩盖小盘池超额，
+  #      中证1000 与小市值候选池更可比；失败自动跳过，不阻断回测）----
+  benchmark_codes: ['399300', '000852']
 
 # ---- 推送 ----
 notifications:
   console: true                  # 控制台输出
+
+# ---- 维护任务 ----
+maintenance:
+  # 周日全市场 K 线预取（2026-09-17 T10）：kline_cache 覆盖曾塌缩（5月4587→9月43），
+  # 每周日追加一次全市场 K 线预取（脚本自带断点续传，仅补增量），防止覆盖再塌缩。
+  # 默认开；置 false 可关闭。
+  weekly_kline_prefetch: true
+  # 每日市值/估值快照（2026-09-18 P5 数据线）：腾讯行情全市场 PE/PB/总市值/流通市值
+  # 落库到 factor_daily.db::valuation_snapshot，零 ASHareHub 配额。用于为 size（精确
+  # 市值）与估值（PE/PB）因子积累 point-in-time 历史，累计 ≥60 交易日可进 OOS 验证。
+  # 默认开；置 false 可关闭。
+  daily_valuation_snapshot: true

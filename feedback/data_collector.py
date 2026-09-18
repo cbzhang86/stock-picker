@@ -61,6 +61,21 @@ SCHEMA = {
             PRIMARY KEY (date, code)
         )
     """,
+    # 因子原始值（2026-09-05 架构对标 #6）：0-100 映射前的 raw 数值。
+    # 供未来的标准化/正交化/ML 使用——评分路径不变，仅增量落库。
+    'factor_raw': """
+        CREATE TABLE IF NOT EXISTS factor_raw (
+            date TEXT NOT NULL,
+            code TEXT NOT NULL,
+            volume_ratio REAL,
+            rps_20 REAL,
+            turnover REAL,
+            pct_chg REAL,
+            amount REAL,
+            raw_return_20 REAL,
+            PRIMARY KEY (date, code)
+        )
+    """,
 }
 
 
@@ -110,6 +125,8 @@ class FactorDataCollector:
             self._save_hot_stocks(conn, hot_df, trade_date)
             # 4. 龙虎榜
             self._save_dragon_tiger(conn, recommendations, trade_date)
+            # 5. 因子原始值（架构对标 #6）
+            self._save_factor_raw(conn, enriched_stocks, trade_date)
 
             conn.commit()
             n_flow = sum(1 for s in enriched_stocks
@@ -130,6 +147,40 @@ class FactorDataCollector:
             conn.close()
 
     # ── 各因子写入 ──────────────────────────────────────────
+
+    def _save_factor_raw(self, conn, stocks: list, trade_date: str):
+        """保存因子原始值（缺数据的字段写 NULL，不写 0——与评分层中性化口径一致）
+
+        T3 因子扩容（2026-09-06）：新增 limit_up_streak / vol_surge_5d 两列
+        （ALTER TABLE 增量迁移，老库自动补列，旧数据不受影响）。
+        """
+        self._ensure_factor_raw_columns(conn)
+        rows = []
+        for s in stocks:
+            factors = s.get('_factor_scores') or {}
+            rows.append((
+                trade_date, str(s['code']).zfill(6),
+                s.get('volume_ratio'), s.get('rps_20'), s.get('turnover'),
+                s.get('pct_chg'), s.get('amount'), s.get('raw_return_20'),
+                factors.get('limit_up_streak'), factors.get('vol_surge_5d'),
+            ))
+        if rows:
+            conn.executemany(
+                "INSERT OR REPLACE INTO factor_raw "
+                "(date, code, volume_ratio, rps_20, turnover, pct_chg, amount, raw_return_20, "
+                " limit_up_streak, vol_surge_5d) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+
+    def _ensure_factor_raw_columns(self, conn):
+        """增量迁移：老库缺新列时自动补齐（幂等）。"""
+        expected = {'limit_up_streak': 'REAL', 'vol_surge_5d': 'REAL'}
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(factor_raw)").fetchall()}
+            for col, ctype in expected.items():
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE factor_raw ADD COLUMN {col} {ctype}")
+        except Exception as e:
+            logger.warning(f"factor_raw 列迁移失败（按原结构继续）: {e}")
 
     def _save_capital_flow(self, conn, stocks: list, trade_date: str):
         """保存主力资金流"""

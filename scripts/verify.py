@@ -163,8 +163,16 @@ def check_north_flow_freshness():
 
 
 def check_weights_consistency():
-    """Check that v1.json, DEFAULT_WEIGHTS, and config.yml weights sum to 1.0 and agree on north_flow."""
+    """Check weight governance (2026-09-05 审查 P0-A)：
+
+    1. v1.json 存在、按模式 sum=1.0、north_flow=0（北向停公开）
+    2. ScoringModel 实际加载权重 == v1.json（验证 v1 > config 优先级链路真正生效）
+    3. 单因子集中度：任一因子权重 > 0.60 → WARN（报告 P2-L 单因子集中度风险）
+    4. config.yml 仅查 sum（其权重段已声明为"历史草稿不生效"，与 v1 的因子级
+       差异是设计如此，不再作为问题报告）
+    """
     problems = []
+    notes = []
     # v1.json
     if not WEIGHTS_V1.exists():
         return 'FAIL', f"missing {WEIGHTS_V1.name}"
@@ -179,8 +187,12 @@ def check_weights_consistency():
             problems.append(f"v1.json {mode} sum={s:.3f}")
         if v1.get(mode, {}).get('north_flow', -1) != 0.0:
             problems.append(f"v1.json {mode}.north_flow={v1[mode]['north_flow']} (expect 0)")
+        # P0-A/P2-L：单因子集中度
+        for fac, w in v1.get(mode, {}).items():
+            if w > 0.60:
+                problems.append(f"v1.json {mode}.{fac}={w:.2f} >0.60 集中度风险")
 
-    # DEFAULT_WEIGHTS — import
+    # P0-A：ScoringModel 实际加载权重必须与 v1.json 一致（否则 v1>config 优先级失效）
     try:
         from core.scoring_model import ScoringModel
         dw = ScoringModel.DEFAULT_WEIGHTS
@@ -188,28 +200,40 @@ def check_weights_consistency():
             s = sum(dw.get(mode, {}).values())
             if abs(s - 1.0) > 0.001:
                 problems.append(f"DEFAULT_WEIGHTS {mode} sum={s:.3f}")
+        sm = ScoringModel()
+        for mode in ('short', 'long'):
+            loaded = sm.get_weights(mode)
+            expected = v1.get(mode, {})
+            for fac in set(loaded) | set(expected):
+                lw, ew = loaded.get(fac, 0.0), expected.get(fac, 0.0)
+                if abs(lw - ew) > 0.005:
+                    problems.append(f"ScoringModel 加载 {mode}.{fac}={lw:.4f} != v1.json {ew:.4f}（v1 优先级失效?）")
     except Exception as e:
-        problems.append(f"can't import ScoringModel: {e}")
+        problems.append(f"can't import/instantiate ScoringModel: {e}")
 
-    # config.yml — check sum only (north_flow difference is BY DESIGN since
-    # config.yml predates this normalization).
+    # config.yml — check sum only (its weights section is DECLARED as a
+    # non-effective historical draft since 2026-09-05 P0-A; factor-level
+    # divergence from v1.json is by design).
     try:
         import yaml
         with open(CONFIG_YML, encoding='utf-8') as f:
             cfg = yaml.safe_load(f)
-        # weights live under short_term.weights and long_term.weights
         short_cfg = cfg.get('short_term', {}).get('weights', {})
         long_cfg = cfg.get('long_term', {}).get('weights', {})
         for name, w in (('short', short_cfg), ('long', long_cfg)):
             s = sum(w.values()) if w else 0
             if abs(s - 1.0) > 0.001:
                 problems.append(f"config.yml {name} sum={s:.3f}")
+        notes.append("config weights=historical draft (non-effective)")
     except Exception as e:
         problems.append(f"config.yml parse: {e}")
 
     if problems:
         return 'WARN', "; ".join(problems)
-    return 'OK', "v1/DEFAULT/config sums=1.00"
+    msg = "v1/DEFAULT sums=1.00; loaded==v1.json; caps OK"
+    if notes:
+        msg += "; " + "; ".join(notes)
+    return 'OK', msg
 
 
 def check_cron_health():

@@ -15,6 +15,11 @@
 工作流（2026-06-27 重构）：
   check_and_report() → 产出报告不写入 → 用户审批 → apply_from_report() 写入
   maybe_optimize() 保留原逻辑但不自动写入（降级为只报告）
+
+⚠️ 写权重唯一入口已收敛（2026-09-17）：v1.json 的唯一写入口是
+  scripts/calibrate_weights.py --apply（需人工审批）。
+  本模块的 apply_from_report() 不再写 v1.json（改为只产出诊断日志），
+  以避免与 calibrate_weights.py 形成双写入口冲突。
 """
 
 import json
@@ -28,6 +33,16 @@ import pandas as pd
 from sklearn.linear_model import Ridge
 
 logger = logging.getLogger(__name__)
+
+# 收益口径不同源声明（2026-09-17）：在 optimizer 产出的报告头部显式标注。
+# tracker.update_outcomes 用的是 T 日收盘买入价 + 零成本；回测用的是
+# T+1 开盘 + 全成本。两者口径不一致，Ridge 建议权重与回测/OOS 结果
+# 不可互相印证、不可互相佐证。
+RETURN_CONVENTION_NOTE = (
+    "⚠️ 收益口径不同源，不可互相印证：本优化器 tracker.update_outcomes 用 T 日收盘"
+    "买入价 + 零成本；回测用 T+1 开盘 + 全成本。Ridge 建议权重与回测/OOS 结果"
+    "不可互相佐证。"
+)
 
 
 def optimize_weights(historical_results: pd.DataFrame,
@@ -146,6 +161,9 @@ class WeightsOptimizer:
 
         返回报告 dict 或 None（条件不满足时）
         """
+        # 收益口径不同源声明（报告首行级提示，每日诊断都打一次，避免被误读为"已验证"）
+        logger.info(RETURN_CONVENTION_NOTE)
+
         accuracy = tracker.calc_accuracy(mode=mode)
         total = accuracy.get('total_records', 0)
 
@@ -202,7 +220,10 @@ class WeightsOptimizer:
             'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'mode': mode,
             'triggered': True,
+            # 收益口径不同源声明：报告首行即标注，提醒读者不可与回测/OOS 互证
+            'return_convention': RETURN_CONVENTION_NOTE,
             'summary': (
+                f"{RETURN_CONVENTION_NOTE}\n"
                 f"触发优化: 胜率 {current_win_rate}%, "
                 f"总记录 {total}, 新鲜度 {fresh_ratio:.0%}"
             ),
@@ -251,41 +272,37 @@ class WeightsOptimizer:
     # ── 新方法：执行写入 ───────────────────────────────────────
 
     def apply_from_report(self, report: Dict) -> bool:
-        """
-        根据报告中的建议权重写入版本文件 + v1.json
+        """⚠️ 权重写入已收敛（2026-09-17）：本函数**不再写入任何权重文件**。
+
+        写权重唯一入口 = scripts/calibrate_weights.py --apply（需人工审批）。
+        原实现会同步 data/weights/v1.json，与 calibrate_weights.py 形成双写
+        入口冲突，已被移除。本函数现在只产出诊断日志（打印），供人工在审批
+        `calibrate_weights.py --apply` 时参考 Ridge 建议。
 
         参数：
           report: check_and_report 返回的报告
 
         返回：
-          bool 写入是否成功
+          bool —— 始终返回 False，表示"未执行写入"（权重需经
+          calibrate_weights.py 人工审批后写入）。保留签名以兼容手动审批工作流。
         """
         if not report or not report.get('proposed_weights'):
-            logger.warning("报告为空或无建议权重，跳过写入")
+            logger.warning("报告为空或无建议权重，跳过（不写入）")
             return False
 
         mode = report.get('mode', 'short')
         new_weights = report['proposed_weights']
 
-        # 写入版本文件（带时间戳）
-        version_tag = f"v{datetime.now().strftime('%Y%m%d_%H%M%S')}_{mode}"
-        version_path = os.path.join(self.weights_dir, f"{version_tag}.json")
-        with open(version_path, 'w', encoding='utf-8') as f:
-            json.dump({mode: new_weights}, f, ensure_ascii=False, indent=2)
-        logger.info(f"权重版本已保存: {version_path}")
-
-        # 同步到 v1.json
-        v1_path = os.path.join(self.weights_dir, 'v1.json')
-        existing = {}
-        if os.path.exists(v1_path):
-            with open(v1_path) as f:
-                existing = json.load(f)
-        existing[mode] = new_weights
-        with open(v1_path, 'w', encoding='utf-8') as f:
-            json.dump(existing, f, ensure_ascii=False, indent=2)
-        logger.info(f"权重已同步到 v1.json: {v1_path}")
-
-        return True
+        # —— 收敛后：仅诊断，不写 v1.json ——
+        # 写权重唯一入口 = scripts/calibrate_weights.py --apply（需人工审批），2026-09-17 收敛。
+        logger.warning(
+            "⚠️ 权重写入已收敛：apply_from_report 不再写 v1.json。"
+            "写权重唯一入口 = scripts/calibrate_weights.py --apply（需人工审批）。"
+            "以下为 Ridge 优化器建议权重（仅诊断，未生效）："
+        )
+        for f, w in sorted(new_weights.items(), key=lambda kv: -kv[1]):
+            logger.info(f"  [Ridge建议][{mode}] {f}: {w:.4f}")
+        return False
 
     # ── 新鲜度检查 ──────────────────────────────────────────────
 
@@ -406,11 +423,15 @@ class WeightsOptimizer:
                 FROM predictions p
                 JOIN outcomes o ON p.id = o.prediction_id
                 WHERE p.mode = ? AND o.t1_return IS NOT NULL
-                ORDER BY p.id
+                ORDER BY p.id DESC
                 LIMIT 500
             """
 
             df = pd.read_sql_query(query, conn, params=(mode,))
+            # 2026-09-17 修复：原 ORDER BY p.id（升序）LIMIT 500 取的是**最旧** 500 条，
+            # 记录超 500 后训练集冻结在早期样本。改为 DESC 取最新 500 条，再按时间
+            # 正序排列，保持 Ridge 训练集的时序语义（不能让"最新"样本倒序进回归）。
+            df = df.sort_values('id').reset_index(drop=True)
         finally:
             if conn:
                 conn.close()

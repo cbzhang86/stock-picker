@@ -38,9 +38,16 @@ def generate_backtest_report(result: BacktestResult) -> str:
         lines.append("## ℹ️ 回测说明")
         lines.append("")
         lines.append("- **数据来源**：基于 K 线缓存中股票的历史日 K 线构建每日行情快照，**无前视偏差**")
-        lines.append("- **资金流 / 题材 / 龙虎榜 / 北向因子** 在回测期间没有真实历史数据，这些因子恒定为中性分")
+        lines.append("- **资金流 / 龙虎榜 / 北向因子** 在回测期间没有真实历史数据，这些因子恒定为中性分")
+        # 2026-09-18 修正：hot_theme 自 658 天热点回填后有真实历史数据（消融可证其驱动选股），
+        # 旧文案"题材恒定中性分"已失实
+        lines.append("- **题材热度(hot_theme)** 由 658 天热点历史回填提供，在回测中有真实方差")
         lines.append("- **动量(momentum) / 技术(technical) / 量价(volume_price)** 从历史 K 线重算，在回测中有真实方差")
-        lines.append("- **仓位模拟**：T+1 开盘买入 / T+1 收盘卖出，按 PortfolioOptimizer 分配比例执行，滑点万十+佣金万三")
+        # 2026-09-18 修正：P0-D 台账模式重写后，组合模拟按策略卖出规则持仓
+        # （止盈/止损/T+3 时间止损，严格 T+1），旧文案"T+1 收盘卖出"已失实
+        lines.append("- **仓位模拟**：T+1 开盘买入（open_t1），按策略卖出规则持仓（止盈/止损/T+3 时间止损），"
+                     "逐日 mark-to-market 含空仓日，PortfolioOptimizer 分配比例执行")
+        lines.append("- **成本口径**：分层滑点（按单笔委托金额分档，最低档万十）+ 佣金万三 + 印花税 0.05%（仅卖出）+ 过户费 0.001%（双向）")
         lines.append("- 回测指标中的 **胜率** 和 **平均收益** 为逐笔独立统计；**总收益/夏普/回撤** 基于仓位模拟计算")
         lines.append("")
 
@@ -77,7 +84,7 @@ def generate_backtest_report(result: BacktestResult) -> str:
     lines.append("### 收益对比")
     lines.append(f"- **沪深300**: {result.benchmark_return:+.2f}%")
     lines.append(f"- **策略收益**: {result.strategy_return:+.2f}%")
-    lines.append(f"- **超额收益**: {result.excess_return:+.2f}%")
+    lines.append(f"- **超额收益（基准为毛收益未扣成本，超额偏保守）**: {result.excess_return:+.2f}%")
     lines.append("")
 
     # 权益曲线（文本块状图）
@@ -209,6 +216,20 @@ def generate_daily_report(recommendations: List[Dict], mode: str = 'short') -> s
     if not recommendations:
         lines.append("今日尾盘策略跳过")
         lines.append("原因：当前没有评分合格的标的")
+        return "\n".join(lines)
+
+    # 门槛过滤零推荐：策略返回的是"元信息条目"（无 code，携带最高分标的），
+    # 单独在此渲染，避免落入下方按 code 的逐条渲染产生 N/A 行（2026-09-14）
+    if recommendations[0].get('no_qualified'):
+        lines.append("  🚫 今日无评分达标标的（min_score 质量门槛过滤）")
+        _top = recommendations[0].get('top_candidate') or {}
+        if _top:
+            lines.append(f"  📌 最高分标的（未达门槛，仅供观察）: "
+                         f"{_top.get('code', '')} {_top.get('name', '')} "
+                         f"⭐ {_top.get('score', 0):.2f}/100")
+            lines.append(f"     距门槛 {recommendations[0].get('min_score', 0):.0f} 差 "
+                         f"{_top.get('gap', 0):.2f} 分")
+        lines.append("")
         return "\n".join(lines)
 
     # 市场环境诊断（跳过交易但仍有信息的场景）

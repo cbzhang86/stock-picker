@@ -61,10 +61,17 @@ class PredictionTracker:
                     t20_date TEXT,
                     t20_close REAL,
                     t20_return REAL,
+                    status TEXT,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (prediction_id) REFERENCES predictions(id)
                 )
             """)
+
+            # 增量迁移（2026-09-07 论证后实施）：存量库补 status 列
+            # （no_data 终态：连续回填无 K 线的停牌/退市票）
+            cols = {r[1] for r in c.execute("PRAGMA table_info(outcomes)").fetchall()}
+            if 'status' not in cols:
+                c.execute("ALTER TABLE outcomes ADD COLUMN status TEXT")
 
             c.execute("""
                 CREATE INDEX IF NOT EXISTS idx_predictions_date
@@ -86,12 +93,35 @@ class PredictionTracker:
             if conn:
                 conn.close()
 
+    def has_predictions(self, date: str, mode: str) -> bool:
+        """检查指定日期+模式是否已有预测记录。
+
+        批次级防重入口：调用方在写推荐循环前调用一次，
+        已有记录则跳过整批写入（防止 study-a 等二次运行污染 predictions 表）。
+        """
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            n = c.execute(
+                "SELECT COUNT(*) FROM predictions WHERE date = ? AND mode = ?",
+                (date, mode)
+            ).fetchone()[0]
+            return n > 0
+        finally:
+            if conn:
+                conn.close()
+
     def log_prediction(self, date: str, code: str, name: str, mode: str,
                        score: float, rating: str, buy_price: float,
                        model_version: str = 'v1',
                        factor_scores: dict = None) -> int:
         """
-        记录一次推荐
+        记录一次推荐。
+
+        注意：本方法不做防重（同一批推荐的第2/3条也会正常写入）。
+        批次级防重请先调用 has_predictions(date, mode) 判断，
+        见 eod_stock_picker.py run_short_term/run_long_term 的用法。
 
         返回 prediction_id
         """
@@ -99,12 +129,26 @@ class PredictionTracker:
         try:
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
+            # created_at 显式写入北京时间（2026-09-16 P2-3）
+            # 背景：建表用的是 `DEFAULT CURRENT_TIMESTAMP`，而 SQLite 的
+            # CURRENT_TIMESTAMP 恒为 UTC → 本列为 UTC(如 07:02) 与全工程
+            # 北京时间口径(15:02) 混用，事后取证与任何"基于 created_at 的
+            # 时效判断"都会失真。去重键用 date 字段故此前未造成数据错误。
+            # 注：存量行仍是 UTC，不做回填（无法无损判定历史行的真实时区）。
+            try:
+                from core.trading_calendar import beijing_now
+                _created_at = beijing_now().strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                from datetime import datetime
+                _created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             c.execute(
                 """INSERT INTO predictions
-                   (date, code, name, mode, score, rating, buy_price, model_version, factor_scores)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (date, code, name, mode, score, rating, buy_price, model_version,
+                    factor_scores, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (date, code, name, mode, score, rating, buy_price,
-                 model_version, json.dumps(factor_scores, ensure_ascii=False, default=str))
+                 model_version, json.dumps(factor_scores, ensure_ascii=False, default=str),
+                 _created_at)
             )
             conn.commit()
             prediction_id = c.lastrowid
@@ -232,6 +276,18 @@ class PredictionTracker:
         t20_date, t20_close = fetch_future(20)
         t20_return = round((t20_close - buy_price) / buy_price * 100, 2) if t20_close else None
 
+        # T2（2026-09-17）：按已回填的最高 T 档位写入正状态 filled_*，
+        # 使 outcomes 表从"全 NULL / 仅 no_data 墓碑"变为有 filled 正状态，
+        # 便于统计"已回填覆盖度"而非仅看 t1_return IS NOT NULL。
+        if t20_return is not None:
+            _fill_status = 'filled_t20'
+        elif t5_return is not None:
+            _fill_status = 'filled_t5'
+        elif t1_return is not None:
+            _fill_status = 'filled_t1'
+        else:
+            _fill_status = 'pending'
+
         conn = sqlite3.connect(self.db_path)
         try:
             c = conn.cursor()
@@ -239,11 +295,11 @@ class PredictionTracker:
                 """INSERT OR REPLACE INTO outcomes
                    (prediction_id, t1_date, t1_close, t1_return,
                     t5_date, t5_close, t5_return,
-                    t20_date, t20_close, t20_return)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    t20_date, t20_close, t20_return, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (prediction_id, t1_date, t1_close, t1_return,
                  t5_date, t5_close, t5_return,
-                 t20_date, t20_close, t20_return)
+                 t20_date, t20_close, t20_return, _fill_status)
             )
             conn.commit()
         finally:
@@ -321,6 +377,11 @@ class PredictionTracker:
         原谓词仅 `o.t1_close IS NULL` → T+1 写满后行离开 pending 池，
         T+5/T+20 永远不会被回填（即使到期）。改为 OR 任一个为 NULL，
         让 update_outcomes 的幂等 INSERT OR REPLACE 滚动补齐多阶结果。
+
+        终态标记（2026-09-07 论证后实施）：outcomes.status='no_data' 的行
+        （连续 30 次回填无 K 线的停牌/退市票终态）不再进入 pending 池——
+        它们的 t1_return 为 NULL，天然被 accuracy/drift/kill-switch 的
+        IS NOT NULL 过滤排除，不污染任何统计。
         """
         conn = None
         try:
@@ -330,9 +391,10 @@ class PredictionTracker:
                 """SELECT p.id, p.date, p.code, p.buy_price
                    FROM predictions p
                    LEFT JOIN outcomes o ON p.id = o.prediction_id
-                   WHERE o.t1_close IS NULL
+                   WHERE (o.t1_close IS NULL
                       OR o.t5_close IS NULL
-                      OR o.t20_close IS NULL
+                      OR o.t20_close IS NULL)
+                     AND (o.status IS NULL OR o.status != 'no_data')
                    ORDER BY p.date"""
             )
             rows = c.fetchall()
@@ -344,6 +406,107 @@ class PredictionTracker:
             {'id': r[0], 'date': r[1], 'code': r[2], 'buy_price': r[3]}
             for r in rows
         ]
+
+    def bump_backfill_attempts(self, prediction_id: int) -> int:
+        """回填尝试计数 +1（持久化）——2026-09-07 自动化审计发现的修复。
+
+        原设计用内存态 attempts，但 backfill 每次以独立进程运行，计数
+        恒为 1，导致"连续 30 次无 K 线 → 标记终态"永远不会触发
+        （实测剩余 37 条 pending、23 条滞留超 20 天）。改为落库计数。
+
+        predictions 表新增 backfill_attempts 列（存量库增量迁移、幂等）。
+        """
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(predictions)").fetchall()}
+            if 'backfill_attempts' not in cols:
+                conn.execute("ALTER TABLE predictions ADD COLUMN backfill_attempts INTEGER DEFAULT 0")
+            conn.execute(
+                "UPDATE predictions SET backfill_attempts = COALESCE(backfill_attempts, 0) + 1 "
+                "WHERE id = ?", (prediction_id,))
+            conn.commit()
+            n = conn.execute(
+                "SELECT backfill_attempts FROM predictions WHERE id = ?", (prediction_id,)).fetchone()
+            return int(n[0]) if n and n[0] is not None else 0
+        except Exception as e:
+            logger.warning(f"回填计数更新失败 pred={prediction_id}: {str(e)[:60]}")
+            return 0
+        finally:
+            if conn:
+                conn.close()
+
+    def mark_no_data(self, prediction_id: int):
+        """终态标记：连续多次回填仍无 K 线（停牌/退市票）→ 退出 pending 池。
+
+        2026-09-07 论证后实施（pending 永久滞留修复）：只写 outcomes.status，
+        t1_return 保持 NULL——所有统计口径（calc_accuracy/drift/kill-switch）
+        均按 t1_return IS NOT NULL 过滤，零污染。长停牌票复牌后如需恢复
+        统计，可人工清除 status 重新回填。
+        """
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            # 用 UPSERT 而非 INSERT OR REPLACE：后者会整行删除重插，
+            # 若该 prediction_id 已有部分回填数据（如 t1_close）会被清掉
+            conn.execute(
+                """INSERT INTO outcomes (prediction_id, status) VALUES (?, 'no_data')
+                   ON CONFLICT(prediction_id) DO UPDATE SET
+                     status='no_data', updated_at=CURRENT_TIMESTAMP""",
+                (prediction_id,))
+            conn.commit()
+            logger.info(f"prediction {prediction_id} 标记 no_data 终态（连续回填无 K 线）")
+        except Exception as e:
+            logger.warning(f"no_data 终态标记失败 pred={prediction_id}: {str(e)[:60]}")
+        finally:
+            if conn:
+                conn.close()
+
+    def revive_stale_no_data(self, stale_days: int = 7) -> list:
+        """no_data 终态低频重试（2026-09-12）：满 stale_days 天的 no_data 行
+        清除 status 重新进入 pending 池，探测复牌/缓存愈合。
+
+        背景：no_data 是"连续 30 次回填无 K 线"的终态，但 K 线缓存可能后来
+        才补上（如 9/3 招商南油/新亚电子被 4:00 K 线巡逻治愈后仍被终态挡住，
+        需人工清 status）。此方法让终态行每 7 天自动获得一次探测机会。
+
+        判定 = 纯 updated_at 间隔（2026-09-12 审查轮 REJECT 修复）：不设
+        attempts 上限——no_data 的唯一自然产生路径就是 bump 满 30 轮，
+        attempts<30 的复活条件会把自然终态行全部挡死（死代码）且复活行
+        重标后即死锁。真退市票每 7 天一次单票 get_kline 探测（缓存优先）
+        成本可忽略，不设放弃线。updated_at IS NULL 的行按最老行处理
+        （现实为 0 行：schema DEFAULT + 两个写点均显式写值，兜底防漂移）。
+
+        复活后：回填成功走 update_outcomes 的 INSERT OR REPLACE 整行重写
+        （status 列不在写入列表，自然归 NULL，行离开终态）；仍无 K 线则当夜
+        bump 一次即 >=30 → mark_no_data（updated_at 刷新），保持"每周一探"
+        节奏，不回到逐夜扫描池。
+
+        返回复活的 prediction_id 列表（供调用方日志/测试断言）。
+        """
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            # 先取复活集合（UPDATE 之后 status 已清，无从查询）
+            ids = [r[0] for r in conn.execute(
+                """SELECT o.prediction_id FROM outcomes o
+                   WHERE o.status = 'no_data'
+                     AND (o.updated_at IS NULL
+                          OR o.updated_at <= datetime('now', ?))""",
+                (f'-{stale_days} days',)).fetchall()]
+            if ids:
+                conn.executemany(
+                    "UPDATE outcomes SET status = NULL, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE prediction_id = ?", [(i,) for i in ids])
+                conn.commit()
+                logger.info(f"no_data 低频重试: 复活 {len(ids)} 条（满 {stale_days} 天）: {ids}")
+            return ids
+        except Exception as e:
+            logger.warning(f"no_data 复活失败(忽略): {str(e)[:80]}")
+            return []
+        finally:
+            if conn:
+                conn.close()
 
     def get_recent_predictions(self, limit: int = 20) -> pd.DataFrame:
         """获取最近N条推荐记录（含结果）"""

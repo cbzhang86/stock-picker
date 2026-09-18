@@ -18,6 +18,8 @@
 """
 
 import os
+import atexit
+import math
 import time
 import random
 import logging
@@ -39,6 +41,52 @@ os.environ['no_proxy'] = '*'
 
 logger = logging.getLogger(__name__)
 
+
+def sanitize_nan(obj):
+    """递归清洗 NaN/Inf → None（2026-09-05 审查 P2-7）
+
+    背景：Python 的 json.dumps 默认允许 NaN 字面量（不符合 JSON 标准），
+    SQLite JSON 列读回时 json.loads 会还原成 float('nan')，进入评分路径后
+    所有数值比较静默为 False，悄悄污染因子分。此函数在写入前把
+    float('nan')/float('inf')/float('-inf') 统一转为 None（JSON null）。
+    配合 json.dumps(..., allow_nan=False) 形成双保险：若清洗遗漏会直接抛错
+    （写入失败进日志），而不是把毒数据写进缓存。
+    """
+    if isinstance(obj, float):
+        return None if (obj != obj or obj in (float('inf'), float('-inf'))) else obj
+    if isinstance(obj, dict):
+        return {k: sanitize_nan(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_nan(v) for v in obj]
+    return obj
+
+# ── 线程级 sqlite 只读连接缓存（性能迭代 2026-09-06，见 _get_read_conn）──
+import threading as _threading
+_thread_local = _threading.local()
+
+
+def close_thread_conns():
+    """关闭当前线程复用的只读连接（长任务结束/进程退出前调用，释放 WAL 句柄）。"""
+    conns = getattr(_thread_local, 'conns', None)
+    if not conns:
+        return
+    for c in list(conns.values()):
+        try:
+            c.close()
+        except Exception:
+            pass
+    _thread_local.conns = {}
+
+
+atexit.register(close_thread_conns)
+
+# 模块级全市场行情二级缓存（跨 DataEngine 实例共享，键为分钟级快照）。
+# 2026-09-07 回访修复：改 TTLCache 有界（防长进程内存增长），返回副本
+# （防调用方原地修改污染共享缓存）
+from cachetools import TTLCache as _TTLCache
+_QUOTES_CACHE = _TTLCache(maxsize=8, ttl=300)
+
+
 # ── 东财防封：全局节流 + 会话复用 ────────────────────────────────
 # 参考 a-stock-data V3.2 的 em_get() 设计
 # 所有 eastmoney.com 接口一律走 em_get()：串行限流 + 复用 Keep-Alive 会话
@@ -57,7 +105,10 @@ def em_get(url: str, params: dict = None, headers: dict = None,
     所有 eastmoney.com 接口都应通过它请求，避免高频被封 IP。"""
     wait = EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
     if wait > 0:
-        time.sleep(wait + random.uniform(0.1, 0.5))
+        # 性能（2026-09-06）：随机抖动 0.1~0.5s → 0.05~0.25s。实测端到端
+        # em_get 29 次共睡眠 23.2s（平均 0.8s/次），抖动降档后单次间隔仍为
+        # 0.55~0.75s，防封余量保留，预计省 ~4s
+        time.sleep(wait + random.uniform(0.05, 0.25))
     try:
         return EM_SESSION.get(url, params=params, headers=headers, timeout=timeout, **kwargs)
     finally:
@@ -79,6 +130,15 @@ class DataEngine:
         self._lockup_cache_date = None
         self._lockup_cache_horizon = 0
         self._mootdx_client = None  # 懒加载，重用TCP连接
+        # 修复（2026-09-06 审查）：熔断标志原为类级可变字典，多实例会共享/交叉
+        # 污染熔断状态。改为 __init__ 中实例化副本（类级保留作为默认模板）
+        self._source_available = dict(DataEngine._source_available)
+        # 稳定性（2026-09-06 迭代）：客户端懒初始化锁——3 线程池并发下
+        # check-then-act 竞态会创建多个连接实例（mootdx TCP 客户端非线程安全）
+        self._client_init_lock = threading.Lock()
+        # 熔断分级：连续失败计数（单次瞬时/脏数据错误不再整源熔断一整天）
+        self._asharehub_fail_counts = {}
+        self._asharehub_fail_threshold = 3
         self._kline_cache_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), 'data', 'cache', 'kline_cache.db'
         )
@@ -109,8 +169,16 @@ class DataEngine:
         self._last_asharehub_call = 0.0
         self._asharehub_lock = threading.Lock()  # 节流 + 配额计数共用一把锁
         self._asharehub_budget = 100  # 日配额
+        # fin_cache 财务快照 TTL（天）：超过则视为过期，回源重查。
+        # 理由（2026-09-17 T1）：此前 fin_cache 无 TTL，"最新季报"缓存一旦写入
+        # 永不刷新 → 新季报发布后基本面/估值因子永久陈旧。季报披露期最长约 4 个月，
+        # 取 90 天留足余量，确保跨披露期必回源。
+        self._fin_cache_ttl_days = 90
         self._asharehub_budget_date = ""
         self._asharehub_budget_used = 0
+        # 2026-09-17 T3：文件锁不可用（只读盘等）降级为内存计数时置 True，
+        # 表示跨进程配额计数已不可靠（多进程会超发），供健康报告/调用方感知。
+        self._asharehub_lock_degraded = False
         # 配额持久化：跨进程共享同一账本（cron/手动/回测各自进程不再各算各的）
         self._asharehub_quota_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -124,6 +192,12 @@ class DataEngine:
             'baostock_kline':    {'available': True,  'last_error': None, 'label': 'Baostock K线'},
             'akshare_fund_flow': {'available': True,  'last_error': None, 'label': '主力资金流(同花顺+大单)'},
             'akshare_north_flow':{'available': True,  'last_error': None, 'label': '北向资金(asharehub持仓)'},
+            # 下方 3 个键于 2026-09-03 补齐：此前它们只登记在 _source_available（熔断）中，
+            # 未登记在此处，导致 _update_source_status() 的 `if source_key in self._source_status`
+            # 判断失败而静默丢弃 —— 这 3 个源的故障永远不会出现在健康报告中。
+            'ths_fund_flow':     {'available': True,  'last_error': None, 'label': '资金流(同花顺)'},
+            'big_deal':          {'available': True,  'last_error': None, 'label': '大单资金流(东财)'},
+            'lockup':            {'available': True,  'last_error': None, 'label': '限售解禁日历'},
             'ths_hot':           {'available': True,  'last_error': None, 'label': '同花顺强势股'},
             'eastmoney_blocks':  {'available': True,  'last_error': None, 'label': '东财板块归属'},
             'dragon_tiger':      {'available': True,  'last_error': None, 'label': '龙虎榜'},
@@ -155,9 +229,17 @@ class DataEngine:
                     code TEXT NOT NULL,
                     report_date TEXT NOT NULL,
                     eps REAL, roe REAL, profit REAL, income REAL,
-                    bvps REAL, PRIMARY KEY (code, report_date)
+                    bvps REAL, fetched_at TEXT,
+                    PRIMARY KEY (code, report_date)
                 )
             """)
+            # 迁移（2026-09-17 T1）：存量库 fin_cache 可能无 fetched_at 列，
+            # 补列以便 TTL 逻辑生效。SQLite 不支持 ALTER ... IF NOT EXISTS，
+            # 用 try/except 吞掉"列已存在"的 OperationalError。
+            try:
+                conn.execute("ALTER TABLE fin_cache ADD COLUMN fetched_at TEXT")
+            except Exception:
+                pass
             conn.commit()
         except Exception as e:
             logger.warning(f"K线缓存初始化失败: {e}")
@@ -231,10 +313,9 @@ class DataEngine:
 
     def _read_eastmoney_prefetch(self, table: str, code: str, max_age_days: int = 7) -> Optional[dict]:
         """读东财预取缓存。table: 'blocks' | 'dragon_tiger'。过期返回 None。"""
-        import sqlite3
-        conn = None
         try:
-            conn = sqlite3.connect(self._eastmoney_prefetch_path)
+            # 性能（2026-09-06）：复用线程级只读连接
+            conn = self._get_read_conn(self._eastmoney_prefetch_path)
             row = conn.execute(
                 "SELECT data, fetched_at FROM {} WHERE code = ?".format(table),
                 (str(code).zfill(6),)
@@ -246,9 +327,6 @@ class DataEngine:
                     return json.loads(row[0])
         except Exception:
             pass
-        finally:
-            if conn:
-                conn.close()
         return None
 
     def _write_eastmoney_prefetch(self, table: str, code: str, data: dict):
@@ -279,7 +357,8 @@ class DataEngine:
         try:
             import sqlite3, json
             from datetime import datetime
-            conn = sqlite3.connect(self._asharehub_prefetch_path)
+            # 性能（2026-09-06）：复用线程级只读连接
+            conn = self._get_read_conn(self._asharehub_prefetch_path)
             row = conn.execute(
                 f"SELECT data, fetched_at FROM {table} WHERE code=?",
                 (code,)
@@ -293,20 +372,52 @@ class DataEngine:
         except Exception as e:
             logger.warning(f"AShareHub预取缓存读取失败 {table}/{code}: {str(e)[:60]}")
             return None
-        finally:
-            if conn:
-                conn.close()
+
+    @staticmethod
+    def _is_shell_tech_record(data) -> bool:
+        """判定技术因子"壳记录"：所有数值因子字段都无有效值（2026-09-16）
+
+        上游 ASHareHub `technical-factors` 对部分股票返回只有 close_hfq 的
+        空壳记录（macd_* / rsi_* / cci 全为空）。实测占预取缓存 126 条中的
+        23 条（18.3%）。此类记录**不含任何可用信息**，写进缓存后会借 7 天
+        TTL 长期驻留，是 2026-09-16 流水线崩溃的直接弹药来源。
+        判定口径与 `TechnicalScorer.score_from_asharehub` 的消费字段一致。
+        """
+        if not isinstance(data, dict):
+            return True
+
+        def _finite(v):
+            return (isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and math.isfinite(v))
+        usable = ('macd_dif', 'macd_dea', 'macd', 'rsi_6', 'rsi_12', 'rsi_24', 'cci')
+        return not any(_finite(data.get(k)) for k in usable)
 
     def _write_asharehub_prefetch(self, table: str, code: str, data: dict) -> bool:
-        """写入预取缓存（预取脚本专用，INSERT OR REPLACE 覆盖）"""
+        """写入预取缓存（预取脚本专用，INSERT OR REPLACE 覆盖）
+
+        2026-09-16 P0-1 预防：`tech_factors` 写入前做 schema 校验，**拒收壳记录**
+        （MACD/RSI/CCI 全空的记录）。返回 False 表示未写入，调用方应计入 miss。
+        权衡：拒收意味着该股在下一个交易日会走实时请求（多做一次配额消耗，按
+        实测壳记录占比 18.3%、单批 30 只估算约 +5~6 次/日），换来的是不让
+        无信息记录占据缓存并借 TTL 长期驻留——记录本身不含数据，缓存与实时
+        取值的效果相同，因此"不缓存"只损失少量配额、不损失信息。
+        """
+        if table == 'tech_factors' and self._is_shell_tech_record(data):
+            logger.warning(
+                f"预取拒收壳记录 tech_factors/{code}: MACD/RSI/CCI 全空 "
+                f"（不写缓存，避免无信息记录借 TTL 驻留）")
+            return False
         conn = None
         try:
             import sqlite3, json
             from datetime import datetime
             conn = sqlite3.connect(self._asharehub_prefetch_path)
+            # P2-7：写入前清洗 NaN/Inf → None；allow_nan=False 兜底（遗漏即抛错不落盘）
+            safe_data = sanitize_nan(data)
             conn.execute(
                 f"INSERT OR REPLACE INTO {table} (code, data, fetched_at) VALUES (?, ?, ?)",
-                (code, json.dumps(data, ensure_ascii=False), datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                (code, json.dumps(safe_data, ensure_ascii=False, allow_nan=False),
+                 datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
             )
             conn.commit()
             return True
@@ -317,12 +428,37 @@ class DataEngine:
             if conn:
                 conn.close()
 
+    def _get_read_conn(self, path: str):
+        """性能（2026-09-06 迭代）：按线程复用只读 sqlite 连接。
+
+        背景：cProfile 实测 sqlite3.Connection.close 单次约 100ms（WAL 下
+        close 会触发 checkpoint），详评 50 只票 × 2 次读（kline + fin）
+        就是 ~10.7s，占端到端 168s 的 6.4%。改为线程级长连接后，
+        同一线程内后续读取不再开关连接。
+
+        线程安全：连接存于 threading.local，各线程独立（sqlite 默认
+        check_same_thread=True，不可跨线程共享）。写路径仍用独立短连接，
+        避免长事务与锁竞争。
+        """
+        conns = getattr(_thread_local, 'conns', None)
+        if conns is None:
+            conns = {}
+            _thread_local.conns = conns
+        conn = conns.get(path)
+        if conn is None:
+            import sqlite3
+            conn = sqlite3.connect(path, timeout=30)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except Exception:
+                pass
+            conns[path] = conn
+        return conn
+
     def _get_kline_from_cache(self, code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
         """从本地缓存读取K线"""
-        conn = None
         try:
-            import sqlite3
-            conn = sqlite3.connect(self._kline_cache_path)
+            conn = self._get_read_conn(self._kline_cache_path)
             df = pd.read_sql_query(
                 "SELECT date,open,high,low,close,volume,amount FROM kline_cache "
                 "WHERE code=? AND date>=? AND date<=? ORDER BY date",
@@ -337,9 +473,6 @@ class DataEngine:
         except Exception as e:
             logger.warning(f"K线缓存读取失败 {code}: {str(e)[:80]}")
             return None
-        finally:
-            if conn:
-                conn.close()
 
     def _save_kline_to_cache(self, code: str, df: pd.DataFrame):
         """将K线写入本地缓存"""
@@ -378,10 +511,7 @@ class DataEngine:
         old_timeout = socket.getdefaulttimeout()
         socket.setdefaulttimeout(10.0)
         try:
-            from mootdx.quotes import Quotes
-            if self._mootdx_client is None:
-                self._mootdx_client = Quotes.factory(market='std')
-            client = self._mootdx_client
+            client = self._get_mootdx_client()
             code6 = str(code).zfill(6)
             klines = client.bars(symbol=code6, category=4, offset=600)
             if klines is not None and len(klines) > 0:
@@ -580,9 +710,14 @@ class DataEngine:
         self._asharehub_budget_date = today
         self._asharehub_budget_used = 0
 
-    def _read_quota_file(self) -> int:
-        """锁内读取配额账本（文件锁已持有），返回今日已用次数（损坏/跨天归零）"""
-        today = datetime.now().strftime('%Y-%m-%d')
+    def _read_quota_file(self, today: str = None) -> int:
+        """锁内读取配额账本（文件锁已持有），返回今日已用次数（损坏/跨天归零）。
+
+        2026-09-17 T4：today 可由调用方传入，确保与 _write_quota_atomic 使用同一
+        日期口径（跨午夜场景读取与写盘不再各取各的"当前日期"）。
+        """
+        if today is None:
+            today = datetime.now().strftime('%Y-%m-%d')
         try:
             if os.path.exists(self._asharehub_quota_path):
                 with open(self._asharehub_quota_path, 'r', encoding='utf-8') as f:
@@ -593,9 +728,16 @@ class DataEngine:
             pass
         return 0
 
-    def _write_quota_atomic(self, used: int):
-        """原子写配额账本：temp 文件 + os.replace（账本文件不持有句柄，可被替换）"""
-        today = datetime.now().strftime('%Y-%m-%d')
+    def _write_quota_atomic(self, used: int, today: str = None):
+        """原子写配额账本：temp 文件 + os.replace（账本文件不持有句柄，可被替换）。
+
+        2026-09-17 T4：today 由调用方在进入函数时计算并传入，锁内不再重新取当前
+        时间 —— 否则 23:59 发起、00:01 写盘的请求会把账本日期写成次日，与读取时
+        的日期口径不一致导致跨午夜配额错乱/重复计数。today 缺省时回退到当前日期
+        （兼容其他调用点）。
+        """
+        if today is None:
+            today = datetime.now().strftime('%Y-%m-%d')
         tmp_path = self._asharehub_quota_path + '.tmp'
         try:
             with open(tmp_path, 'w', encoding='utf-8') as f:
@@ -614,6 +756,10 @@ class DataEngine:
         账本文件本身通过 temp+os.replace 原子替换。锁文件句柄常驻但不被替换，
         避免 Windows 上 os.replace 无法覆盖已打开文件的限制。
         """
+        # 2026-09-17 T4：进入函数即固定 today，作为读取与写盘的统一年份口径，
+        # 锁内不再各自 datetime.now()——杜绝 23:59 发起、00:01 写盘把账本日期写成
+        # 次日导致的跨午夜配额错乱。
+        today = datetime.now().strftime('%Y-%m-%d')
         path = self._asharehub_quota_path
         lock_path = path + '.lock'
         try:
@@ -632,16 +778,16 @@ class DataEngine:
                     import fcntl
                     fcntl.flock(fd, fcntl.LOCK_EX)
                 try:
-                    used = self._read_quota_file()
+                    used = self._read_quota_file(today)
                     if used >= self._asharehub_budget - 10:
                         # 配额已满：同步内存缓存 + 标记源状态（报告显示原因）
                         self._asharehub_budget_used = used
                         self._mark_asharehub_quota_exhausted()
                         return False
                     used += 1
-                    self._write_quota_atomic(used)
+                    self._write_quota_atomic(used, today)
                     self._asharehub_budget_used = used
-                    self._asharehub_budget_date = datetime.now().strftime('%Y-%m-%d')
+                    self._asharehub_budget_date = today
                     return True
                 finally:
                     if os.name == 'nt':
@@ -655,7 +801,11 @@ class DataEngine:
             # 文件锁不可用（如只读盘）：降级为内存计数。
             # 注意：调用方 _asharehub_budget_ok 已持线程锁，这里不能再
             # with self._asharehub_lock（非重入锁会死锁），直接改内存即可。
-            logger.warning(f"asharehub配额文件锁失败(降级内存计数): {str(e)[:60]}")
+            # 2026-09-17 T3：此前静默 warning，多进程会超发配额（各进程独立内存
+            # 计数互不可见）。升级为 error 并标记 lock_degraded=True，便于调用方/
+            # 健康报告感知"配额计数已不可靠"。
+            logger.error(f"asharehub配额文件锁失败(降级内存计数,多进程可能超发): {str(e)[:60]}")
+            self._asharehub_lock_degraded = True
             today = datetime.now().strftime('%Y-%m-%d')
             if self._asharehub_budget_date != today:
                 self._asharehub_budget_date = today
@@ -669,14 +819,21 @@ class DataEngine:
             return True
 
     def _mark_asharehub_quota_exhausted(self):
-        """配额耗尽：同步 _source_available 熔断 + _source_status 报告标注"""
+        """配额耗尽：同步 _source_available 熔断 + _source_status 报告标注
+
+        文案口径（2026-09-16 P2-3）：必须说明是**本地安全闸门**而非服务端配额。
+        真实闸门 = budget - 10（预留 10 次给手动验证），默认 90/100；原文案写
+        "日配额已用完(100次/天)"会让人误判为服务端 429 限流，从而去查上游状态。
+        """
         keys = ('asharehub_moneyflow', 'asharehub_tech_factors',
                 'asharehub_concepts', 'asharehub_financial')
+        gate = self._asharehub_budget - 10
+        msg = (f'AShareHub 已达本地安全闸门({gate}/{self._asharehub_budget}，'
+               f'预留 10 次)，因子降为中性')
         for k in keys:
             self._source_available[k] = False
             if hasattr(self, '_source_status'):
-                self._update_source_status(
-                    k, False, 'AShareHub 日配额已用完(100次/天)，因子降为中性')
+                self._update_source_status(k, False, msg)
 
     def _asharehub_budget_ok(self) -> bool:
         """检查 ASHareHub 日配额是否还有余额，消耗一次。
@@ -710,13 +867,21 @@ class DataEngine:
         cache_key = f"quotes_{datetime.now().strftime('%Y-%m-%d_%H:%M')}"
         if cache_key in self.cache:
             return self.cache[cache_key]
+        # 模块级二级缓存（跨 DataEngine 实例共享，见下方写入处说明）
+        if cache_key in _QUOTES_CACHE:
+            cached_df = _QUOTES_CACHE[cache_key]
+            self.cache[cache_key] = cached_df
+            return cached_df.copy()
 
         codes = self._get_all_codes()
         if not codes:
             return pd.DataFrame()
 
         results = []
-        batch_size = 200
+        # 性能（2026-09-06）：批大小 200 → 400。实测腾讯单请求 400 只与 200 只
+        # 耗时相同（~0.28s），批次间 0.1s 节流次数由 26 次降为 13 次，
+        # 每次全市场拉取省约 4s（端到端实测 sleep 占 8.1s → ~4s）
+        batch_size = 400
         total = len(codes)
 
         for i in range(0, total, batch_size):
@@ -779,9 +944,14 @@ class DataEngine:
             return pd.DataFrame()
         df = pd.DataFrame(results)
         self.cache[cache_key] = df
+        # 性能（2026-09-06）：模块级共享。短线与长线策略各自持有独立
+        # DataEngine 实例，实例内 TTL 缓存不共享 → 同一分钟内全市场 5213 只
+        # 被拉取两次（各约 7s）。改为模块级二级缓存（同样按分钟失效，
+        # 数据陈旧 ≤1 分钟，与单实例行为一致）
+        _QUOTES_CACHE[cache_key] = df
         self._update_source_status('tencent_quote', True)
         logger.info(f"全市场行情: {len(df)} 只股票")
-        return df
+        return df.copy()
 
     # ========== 3. 个股K线（mootdx → Sina → baostock 三源回退） ==========
 
@@ -829,20 +999,27 @@ class DataEngine:
         _probe_start = (pd.Timestamp(start_date) - pd.Timedelta(days=60)).strftime('%Y-%m-%d')
         cached = self._get_kline_from_cache(code, _probe_start, end_date)
         if cached is not None and not cached.empty:
-            # 缓存残缺检测：完整缓存内相邻交易日间隔 > 7 自然日 → 视为残缺（缺口），
-            # fall through 到 mootdx 补抓。这比行数比例更准：
+            # 缓存残缺检测：完整缓存内相邻交易日间隔 > 8 个工作日 → 视为残缺
+            # （缺口），fall through 到 mootdx 补抓。这比行数比例更准：
             #  - 短窗口（几天）行数少是正常，但相邻间隔能暴露"中间缺了一整段"
             #  - 停牌会形成长间隔，但 outcome 计算本来就需要完整交易日序列，
             #    残缺的缓存不该被直接使用（置 None 由 tracker 处理）
+            # 修复（2026-09-06）：原用自然日间隔 >7 天，A股国庆/春节长假（8-11
+            # 自然日）必然误报"残缺"导致全市场重抓。改为按工作日间隔计算
+            # （np.busday_count 排除周末，需 datetime64[D] 输入），阈值 10 个
+            # 工作日：A股休市最长约 9 个工作日（国庆中秋极端调休），不引入
+            # 节假日历的前提下取 10 不会误报；而"缓存零散缺段"的真实缺口
+            # 通常达数周~数月，仍能稳定检出。
             # 注意：裁切回原窗口前先检测。若检测通过，仅返回原窗口数据。
             dates_sorted = cached['date'].sort_values().reset_index(drop=True)
             if len(dates_sorted) >= 2:
-                gaps = dates_sorted.diff().dt.days.dropna()
-                max_gap = gaps.max() if not gaps.empty else 0
-                if max_gap > 7:
+                _dv = dates_sorted.values.astype('datetime64[D]')
+                bday_gaps = np.busday_count(_dv[:-1], _dv[1:])
+                max_gap = int(bday_gaps.max()) if bday_gaps.size else 0
+                if max_gap > 10:
                     logger.warning(
                         f"K线缓存残缺 {code}: 缓存 {len(cached)} 行（探测范围 {_probe_start}~{end_date}），"
-                        f"最大相邻间隔 {int(max_gap)} 天，fall through 重抓 mootdx"
+                        f"最大相邻间隔 {max_gap} 个工作日，fall through 重抓 mootdx"
                     )
                     # 不 return，继续走 mootdx → 缓存会被 mootdx 实际结果覆写
                 else:
@@ -850,7 +1027,7 @@ class DataEngine:
                     window = cached[(cached['date'] >= pd.Timestamp(start_date)) &
                                     (cached['date'] <= pd.Timestamp(end_date))]
                     if not window.empty:
-                        return window
+                        return self._ensure_kline_indicators(window)
                     # 窗口内无数据（缓存有更早/更晚的数据但窗口空）→ fall through
                     logger.warning(
                         f"K线缓存 {code} 窗口 [{start_date}~{end_date}] 无数据，fall through 重抓 mootdx"
@@ -860,7 +1037,7 @@ class DataEngine:
                 window = cached[(cached['date'] >= pd.Timestamp(start_date)) &
                                 (cached['date'] <= pd.Timestamp(end_date))]
                 if not window.empty:
-                    return window
+                    return self._ensure_kline_indicators(window)
 
         # 2. mootdx (TCP 通达信，最快，永不封IP)
         df = self._fetch_kline_mootdx(code, start_date, end_date)
@@ -940,6 +1117,23 @@ class DataEngine:
         df['volume_ratio'] = df['volume_ratio'].fillna(1)
         return df
 
+    def _ensure_kline_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """确保 K 线已补算技术指标；幂等（指标列已存在则跳过），不改变
+        _calc_kline_indicators 的计算逻辑。
+
+        用途：统一 get_kline 的所有返回路径（含缓存命中路径），避免同一 DataFrame
+        在冷热缓存下出现列集不一致（缺陷3 修复：缓存命中路径原先直接返回 window，
+        缺 pct_chg/ma5/ma10/ma20/avg_volume_5/volume_ratio）。缓存表本身只存 8 个
+        原始列，故命中路径必须在此补算。
+        """
+        if df is None or df.empty:
+            return df
+        _indicator_cols = {'pct_chg', 'ma5', 'ma10', 'ma20',
+                           'avg_volume_5', 'volume_ratio'}
+        if _indicator_cols.issubset(set(df.columns)):
+            return df
+        return self._calc_kline_indicators(df)
+
     # ========== 4. 基本面财务快照（mootdx） ==========
 
     def get_financial_snapshot(self, code: str) -> Dict:
@@ -957,10 +1151,7 @@ class DataEngine:
             return cached
 
         try:
-            from mootdx.quotes import Quotes
-            if self._mootdx_client is None:
-                self._mootdx_client = Quotes.factory(market='std')
-            client = self._mootdx_client
+            client = self._get_mootdx_client()
 
             fin = client.finance(symbol=code6)
             if fin is not None and not fin.empty:
@@ -984,16 +1175,18 @@ class DataEngine:
                     'total_shares': total_shares,
                     'report_date': str(fin.iloc[-1].name)[:7] if hasattr(fin.iloc[-1], 'name') else '',
                 }
-                # 写入缓存
+                # 写入缓存（含 fetched_at，供 TTL 判定）
                 conn = None
                 try:
                     import sqlite3
+                    _now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     conn = sqlite3.connect(self._kline_cache_path)
                     conn.execute(
-                        "INSERT OR REPLACE INTO fin_cache (code,report_date,eps,roe,profit,income,bvps) "
-                        "VALUES (?,?,?,?,?,?,?)",
+                        "INSERT OR REPLACE INTO fin_cache "
+                        "(code,report_date,eps,roe,profit,income,bvps,fetched_at) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
                         (code6, result['report_date'], result['eps'], result['roe'],
-                         result['profit'], result['income'], result['bvps'])
+                         result['profit'], result['income'], result['bvps'], _now)
                     )
                     conn.commit()
                 except Exception as e:
@@ -1007,17 +1200,36 @@ class DataEngine:
         return {}
 
     def _get_fin_from_cache(self, code: str) -> Optional[Dict]:
-        """从SQLite缓存读取财务数据"""
-        conn = None
+        """从SQLite缓存读取财务数据（带 TTL）。
+
+        2026-09-17 T1：读取时比对 fetched_at，超过 _fin_cache_ttl_days 视为过期
+        → 返回 None 触发回源重查（新季报发布后基本面/估值因子不再永久陈旧）。
+        仅作用于"最新快照"缓存；fundamentals_history（point-in-time）不受影响。
+        """
         try:
-            import sqlite3
-            conn = sqlite3.connect(self._kline_cache_path)
+            # 性能（2026-09-06）：复用线程级只读连接（见 _get_read_conn）
+            conn = self._get_read_conn(self._kline_cache_path)
             cursor = conn.execute(
-                "SELECT eps,roe,profit,income,bvps,report_date FROM fin_cache "
+                "SELECT eps,roe,profit,income,bvps,report_date,fetched_at FROM fin_cache "
                 "WHERE code=? ORDER BY report_date DESC LIMIT 1", (code,)
             )
             row = cursor.fetchone()
             if row and row[0] is not None:
+                fetched_at = row[6]
+                if fetched_at:
+                    try:
+                        age = (datetime.now() - datetime.strptime(fetched_at, '%Y-%m-%d %H:%M:%S')).days
+                    except Exception:
+                        # 2026-09-18 审查补充：解析失败按不过期处理（避免误回源），
+                        # 但必须告警——静默容忍会让写库端的格式 bug 永远不被发现
+                        logger.warning(
+                            f"fin_cache.fetched_at 格式异常(按不过期处理): {code} "
+                            f"raw={str(fetched_at)[:30]}")
+                        age = 0  # 解析失败按不过期处理，避免误回源
+                    if age > self._fin_cache_ttl_days:
+                        logger.info(
+                            f"fin_cache 过期({age}天>{self._fin_cache_ttl_days}天) → 回源重查 {code}")
+                        return None
                 return {
                     'eps': float(row[0] or 0),
                     'roe': float(row[1] or 0),
@@ -1029,9 +1241,6 @@ class DataEngine:
         except Exception as e:
             logger.warning(f"fin_cache读取失败 {code}: {str(e)[:80]}")
             return None
-        finally:
-            if conn:
-                conn.close()
         return None
     # ========== 5. 技术指标快捷版 ==========
 
@@ -1080,7 +1289,9 @@ class DataEngine:
     _source_available = {
         'big_deal': True,         # stock_fund_flow_big_deal — 东财大单
         'ths_fund_flow': True,    # stock_fund_flow_individual — 同花顺全市场资金流（通）
-        'north_flow': True,       # northbound_holdings — 北向（asharehub/通）
+        # 键名 2026-09-03 统一为 akshare_north_flow，与 _source_status 对齐
+        # （此前此处为 'north_flow'，两个字典键名不一致，恢复/报告无法对应同一数据源）
+        'akshare_north_flow': True, # northbound_holdings — 北向（asharehub/通）
         'lockup': True,
         'asharehub_moneyflow': True, # AShareHub个股资金流（独立熔断）
         'asharehub_tech_factors': True, # AShareHub技术因子（独立熔断）
@@ -1118,6 +1329,70 @@ class DataEngine:
 
         return None
 
+    def _register_asharehub_failure(self, key: str, err: str):
+        """稳定性（2026-09-06 迭代）：熔断分级。
+
+        原实现：任何一次异常（网络抖动、脏响应 float('--')、JSON 解析失败）
+        都立即把整个 asharehub 子源熔断，且 _recover_sources 不恢复 asharehub 键
+        → 一个坏票让该源当天剩余全部候选股失效、因子全中性。
+        现分级：
+          - 致命错误（认证失败/配额 429/_key 无效）→ 立即熔断；
+          - 瞬态/脏数据错误 → 连续 >= threshold 次才熔断；成功一次即清零计数。
+        """
+        fatal_pat = ('401', '403', 'invalid token', 'unauthorized', '429')
+        err_low = str(err).lower()
+        if any(p in err_low for p in fatal_pat):
+            self._source_available[key] = False
+            self._update_source_status(key, False, f'致命错误熔断: {str(err)[:60]}')
+            return
+        cnt = self._asharehub_fail_counts.get(key, 0) + 1
+        self._asharehub_fail_counts[key] = cnt
+        if cnt >= self._asharehub_fail_threshold:
+            logger.warning(f"asharehub源 {key} 连续失败 {cnt} 次 → 熔断")
+            self._source_available[key] = False
+            self._update_source_status(key, False, f'连续失败{cnt}次熔断: {str(err)[:50]}')
+
+    def _register_asharehub_success(self, key: str):
+        self._asharehub_fail_counts[key] = 0
+
+    def _get_asharehub_client(self):
+        """获取 AShareHub 客户端——线程级实例（2026-09-07 回访修复）。
+
+        修复：双检锁（2026-09-06）只保证"只创建一个实例"，但 3 线程池内
+        并发调用 client.moneyflow/technical_factors 等 HTTP 方法时并未
+        串行化，共享 session 会被多线程交错使用。改为 threading.local
+        每线程一个实例（HTTP 客户端轻量，3 线程 = 3 个会话；配额账本
+        独立于客户端实例，不受影响）。
+        """
+        client = getattr(_thread_local, 'asharehub_client', None)
+        if client is None:
+            with self._client_init_lock:
+                client = getattr(_thread_local, 'asharehub_client', None)
+                if client is None:
+                    from asharehub import AShareHub
+                    client = AShareHub(
+                        api_key=os.environ.get('ASHAREHUB_API_KEY', ''),
+                        version='v2'
+                    )
+                    _thread_local.asharehub_client = client
+        return client
+
+    def _get_mootdx_client(self):
+        """获取 mootdx 客户端——线程级实例（2026-09-07 回访修复）。
+
+        同 _get_asharehub_client：mootdx TCP 客户端非线程安全（代码注释
+        自认），双检锁只防重创建、不防并发使用。改为每线程独立 TCP 连接。
+        """
+        client = getattr(_thread_local, 'mootdx_client', None)
+        if client is None:
+            with self._client_init_lock:
+                client = getattr(_thread_local, 'mootdx_client', None)
+                if client is None:
+                    from mootdx.quotes import Quotes
+                    client = Quotes.factory(market='std')
+                    _thread_local.mootdx_client = client
+        return client
+
     def _get_capital_flow_asharehub(self, code: str) -> Optional[float]:
         """AShareHub 个股资金流（按订单规模），独立熔断
 
@@ -1128,25 +1403,21 @@ class DataEngine:
         if not self._asharehub_budget_ok():
             return None
         try:
-            from asharehub import AShareHub
-            if self._asharehub_client is None:
-                self._asharehub_client = AShareHub(
-                    api_key=os.environ.get('ASHAREHUB_API_KEY', ''),
-                    version='v2'
-                )
+            client = self._get_asharehub_client()
             code6 = str(code).zfill(6)
             symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
-            df = self._asharehub_client.moneyflow(symbol=symbol, limit=1)
+            df = client.moneyflow(symbol=symbol, limit=1)
             if df is not None and not df.empty:
                 # net_mf_amount 单位为万元，转为元
                 net_amount_yuan = float(df.iloc[0]['net_mf_amount']) * 10000
                 if abs(net_amount_yuan) > 0:
+                    self._register_asharehub_success('asharehub_moneyflow')
                     return net_amount_yuan
             return None
         except Exception as e:
             logger.warning(f"asharehub资金流失败 {code}: {str(e)[:60]}")
-            self._source_available['asharehub_moneyflow'] = False
-            self._update_source_status('asharehub_moneyflow', False, str(e)[:60])
+            # 熔断分级（2026-09-06 迭代）：单次瞬时/脏数据错误不再整源熔断
+            self._register_asharehub_failure('asharehub_moneyflow', str(e))
         return None
 
     def get_technical_factors_asharehub(self, code: str) -> Optional[dict]:
@@ -1165,18 +1436,17 @@ class DataEngine:
         if not self._asharehub_budget_ok():
             return None
         try:
-            from asharehub import AShareHub
-            if self._asharehub_client is None:
-                self._asharehub_client = AShareHub(
-                    api_key=os.environ.get('ASHAREHUB_API_KEY', ''),
-                    version='v2'
-                )
+            client = self._get_asharehub_client()
             code6 = str(code).zfill(6)
             symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
-            df = self._asharehub_client.technical_factors(symbol=symbol, limit=1)
+            df = client.technical_factors(symbol=symbol, limit=1)
             if df is not None and not df.empty:
                 row = df.iloc[-1]
-                return {
+                # 2026-09-16 P1-3：出口统一走 sanitize_nan，把 NaN/±Inf 归一为 None，
+                # 使 live 路径与「写缓存(sanitize_nan) → 读缓存(json.loads)」的形态
+                # 完全等价。此前 live 返回 NaN、缓存返回 None，同一份数据两条路径
+                # 消费行为不一致（NaN 在比较中恒 False，静默落入 else 分支）。
+                return sanitize_nan({
                     'macd_dif': float(row.get('macd_dif', 0)),
                     'macd_dea': float(row.get('macd_dea', 0)),
                     'macd': float(row.get('macd', 0)),
@@ -1185,12 +1455,11 @@ class DataEngine:
                     'rsi_24': float(row.get('rsi_24', 50)),
                     'close_hfq': float(row.get('close_hfq', 0)),
                     'cci': float(row.get('cci', 0)),
-                }
+                })
             return None
         except Exception as e:
             logger.warning(f"asharehub技术因子失败 {code}: {str(e)[:60]}")
-            self._source_available['asharehub_tech_factors'] = False
-            self._update_source_status('asharehub_tech_factors', False, str(e)[:60])
+            self._register_asharehub_failure('asharehub_tech_factors', str(e))
         return None
 
     def get_concept_members(self, code: str) -> Optional[list]:
@@ -1212,12 +1481,7 @@ class DataEngine:
         if not self._asharehub_budget_ok():
             return None
         try:
-            from asharehub import AShareHub
-            if self._asharehub_client is None:
-                self._asharehub_client = AShareHub(
-                    api_key=os.environ.get('ASHAREHUB_API_KEY', ''),
-                    version='v2'
-                )
+            client = self._get_asharehub_client()
             code6 = str(code).zfill(6)
             symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
             # 2026-08-17 修复：con_symbol 才是"查该股票所属概念"的参数。
@@ -1225,7 +1489,7 @@ class DataEngine:
             # 导致 concept_names 恒 None → hot_theme 恒 65（50基准+15板块顶格，缺概念加分）。
             # 返回列: trade_date/symbol/con_symbol/name — symbol 列才是概念指数代码(BK)，
             # name 列是股票自身名称（同名重复），所以按 symbol 去重取概念数。
-            df = self._asharehub_client.concept_members(con_symbol=symbol, limit=200)
+            df = client.concept_members(con_symbol=symbol, limit=200)
             if df is not None and not df.empty:
                 # 返回含历史多日快照（实测单只 4681 行），取最新 trade_date 当日去重
                 if 'trade_date' in df.columns:
@@ -1245,8 +1509,7 @@ class DataEngine:
             return None
         except Exception as e:
             logger.warning(f"asharehub概念板块失败 {code}: {str(e)[:60]}")
-            self._source_available['asharehub_concepts'] = False
-            self._update_source_status('asharehub_concepts', False, str(e)[:60])
+            self._register_asharehub_failure('asharehub_concepts', str(e))
         return None
 
     def get_financial_indicators(self, code: str) -> Optional[dict]:
@@ -1265,15 +1528,10 @@ class DataEngine:
         if not self._asharehub_budget_ok():
             return None
         try:
-            from asharehub import AShareHub
-            if self._asharehub_client is None:
-                self._asharehub_client = AShareHub(
-                    api_key=os.environ.get('ASHAREHUB_API_KEY', ''),
-                    version='v2'
-                )
+            client = self._get_asharehub_client()
             code6 = str(code).zfill(6)
             symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
-            df = self._asharehub_client.financial_indicators(symbol=symbol, limit=1)
+            df = client.financial_indicators(symbol=symbol, limit=1)
             if df is not None and not df.empty:
                 row = df.iloc[-1]
                 return {
@@ -1292,8 +1550,7 @@ class DataEngine:
             return None
         except Exception as e:
             logger.warning(f"asharehub财务指标失败 {code}: {str(e)[:60]}")
-            self._source_available['asharehub_financial'] = False
-            self._update_source_status('asharehub_financial', False, str(e)[:60])
+            self._register_asharehub_failure('asharehub_financial', str(e))
         return None
 
     def _get_ths_fund_flow(self, code: str) -> Optional[float]:
@@ -1361,9 +1618,21 @@ class DataEngine:
                 buy_sum = df[buy_mask].groupby('股票代码')['成交金额'].sum()
                 sell_sum = df[sell_mask].groupby('股票代码')['成交金额'].sum()
                 net = buy_sum.subtract(sell_sum, fill_value=0)
+                # 修复（2026-09-05 审查 D8）：akshare stock_fund_flow_big_deal 的成交额
+                # 单位是"万元"（成交量单位是"股"，见 akshare 官方文档），此前未换算，
+                # 导致回退链量纲混杂：ASHareHub 源返回元（net_mf_amount×1e4）、
+                # THS 源返回元（亿/万后缀换算），唯独本源返回万元 —— 同一只票在
+                # 不同回退路径下 main_fund_accumulated 相差 1e4 倍，直接摧毁
+                # calc_main_fund_score 绝对阈值与横截面百分位排序。×1e4 统一为元。
+                net = net * 1e4
                 self._big_deal_cache = net
                 # 保留原始 df 用于尾盘成交结构分析
-                self._big_deal_raw = df.copy()
+                # 排序：保证 get_tail_end_stats 中 iloc[-1] 一定是当日最后一笔成交
+                # （akshare 返回顺序不保证，且 na_position='first' 让无效时间行沉不下去）
+                self._big_deal_raw = df.sort_values('成交时间', na_position='first').copy()
+                # 预建 分组索引（仅存行标签，避免逐股 O(N) 全表扫描）
+                self._big_deal_code_groups = self._big_deal_raw.groupby(
+                    '股票代码', sort=False).groups
                 self._update_source_status('akshare_fund_flow', True)
                 logger.info(f"全市场大单数据已加载: {len(net)} 只股票，每只约{len(df)//len(net)}笔大单")
 
@@ -1412,7 +1681,11 @@ class DataEngine:
             return {'available': False}
 
         code_str = str(code).zfill(6)
-        stock_deals = self._big_deal_raw[self._big_deal_raw['股票代码'] == code_str]
+        # 修复（2026-09-05 审查）：逐股索引预建后 O(1) 定位，替代 170 次 ×O(N) 全表布尔扫描
+        idx = getattr(self, '_big_deal_code_groups', {}).get(code_str)
+        if idx is None or len(idx) == 0:
+            return {'available': False}
+        stock_deals = self._big_deal_raw.loc[idx]
         if stock_deals.empty:
             return {'available': False}
 
@@ -1429,32 +1702,52 @@ class DataEngine:
         tail_mask = time_str.str.contains(r'14:3[0-9]|14:4[0-9]|14:5[0-9]', na=False)
         tail_deals = stock_deals[tail_mask]
         tail_volume = tail_deals['成交金额'].sum()
-        tail_buy = tail_deals[buy_mask & tail_mask]['成交金额'].sum()
-        tail_sell = tail_deals[~buy_mask & tail_mask]['成交金额'].sum()
+        # 修复（2026-09-05 审查）：原先 tail_deals[buy_mask & tail_mask] 触发
+        # "Boolean Series key will be reindexed" —— 掩码索引与已过滤 DataFrame 不对齐，
+        # 依赖 pandas 隐式重索引（重复索引时会直接报错）。改为在 tail_deals 上
+        # 直接求性质掩码，语义完全等价（买=含'买|主'，卖=其余），零重索引。
+        tail_prop = tail_deals['大单性质'].str.contains('买|主', na=False)
+        tail_buy = tail_deals[tail_prop]['成交金额'].sum()
+        tail_sell = tail_deals[~tail_prop]['成交金额'].sum()
         tail_net = tail_buy - tail_sell
 
         # 1. 尾盘成交占比
         tail_volume_ratio = tail_volume / total_volume if total_volume > 0 else 0
 
         # 2. 尾盘资金逆转
-        tail_reversal = (tail_net > 0 and total_net < 0)
+        # 修复（2026-09-05 审查）：bool() 强转 —— numpy bool 标量无法被 json.dump 序列化
+        tail_reversal = bool(tail_net > 0 and total_net < 0)
 
         # 3. 收盘位置（用大单的成交均价近似VWAP）
         #    price_position > 0.67 表示收盘在均价上方（强势收尾）
-        vwap = stock_deals['成交金额'].sum() / stock_deals['成交量'].sum() \
-               if stock_deals['成交量'].sum() > 0 else 0
+        # 修复（2026-09-05 审查 D7）：原 vwap = Σ成交金额/Σ成交量。
+        # akshare stock_fund_flow_big_deal 官方文档：成交量单位是"股"、成交额单位
+        # 是"万元"（同花顺实页样例验证 51.57元×14662股=75.61万元 吻合），
+        # 万元/股 = 真实均价/1e4 → price_position ≈ +9999 恒成立，
+        # "强势收尾"子信号对所有有大单数据的票永远误触发（白拿 +6 分）。
+        # 改为量加权均价 Σ(价格×量)/Σ量 —— 单位无关，成交价格列恒为元。
+        vol_sum = stock_deals['成交量'].sum()
+        if vol_sum > 0:
+            vwap = float((stock_deals['成交价格'] * stock_deals['成交量']).sum() / vol_sum)
+        else:
+            vwap = 0.0
         last_price = stock_deals['成交价格'].iloc[-1] if not stock_deals.empty else 0
         price_position = (last_price - vwap) / vwap if vwap > 0 else 0
 
+        # 修复（2026-09-05 审查）：pandas sum()/numpy 标量统一转 Python 原生类型，
+        # 保证返回值可直接 JSON 序列化（np.int64 会让 json.dumps 直接 TypeError）
+        # 修复（2026-09-05 审查 D8）：成交金额列为万元口径，统一换算为元，
+        # 与 main_fund_accumulated（ASHareHub/THS 源）保持一致；tail_reversal
+        # 与 tail_volume_ratio 基于符号/比值，不受常数缩放影响。
         return {
             'available': True,
-            'tail_volume_ratio': round(tail_volume_ratio, 4),
-            'total_net': round(total_net, 2),
-            'tail_net': round(tail_net, 2),
+            'tail_volume_ratio': round(float(tail_volume_ratio), 4),
+            'total_net': round(float(total_net) * 1e4, 2),
+            'tail_net': round(float(tail_net) * 1e4, 2),
             'tail_reversal': tail_reversal,
-            'vwap': round(vwap, 2),
-            'last_price': last_price,
-            'price_position': round(price_position, 4),
+            'vwap': round(float(vwap), 2),
+            'last_price': float(last_price),
+            'price_position': round(float(price_position), 4),
         }
 
     def get_north_flow_accumulated(self, code: str, days: int = 10) -> Optional[float]:
@@ -1465,7 +1758,7 @@ class DataEngine:
         熔断：
           - 独立于 big_deal / ths_fund_flow，互不影响
         """
-        if not self._source_available.get('north_flow', True):
+        if not self._source_available.get('akshare_north_flow', True):
             return None
         if not self._asharehub_budget_ok():
             return None
@@ -1474,14 +1767,11 @@ class DataEngine:
             from asharehub import AShareHub
             if self._asharehub_client is None:
                 import os as _os
-                self._asharehub_client = AShareHub(
-                    api_key=_os.environ.get('ASHAREHUB_API_KEY', ''),
-                    version='v2'
-                )
+                self._asharehub_client = self._get_asharehub_client()
 
             code6 = str(code).zfill(6)
             symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
-            client = self._asharehub_client
+            client = self._get_asharehub_client()
 
             # 拉取足够的历史数据（按季度频率，拉120条足够）
             cache_key = f"nb_{code6}"
@@ -1527,7 +1817,7 @@ class DataEngine:
 
         except Exception as e:
             logger.warning(f"asharehub北向失败 {code}: {str(e)[:60]}")
-            self._source_available['north_flow'] = False
+            self._source_available['akshare_north_flow'] = False
             self._update_source_status('akshare_north_flow', False, str(e)[:60])
         return None
 
@@ -1646,6 +1936,65 @@ class DataEngine:
 
     # ========== 8. 同花顺强势股 + 题材归因（a-stock-data §3.1） ==========
 
+    def get_limit_up_emotion(self, trade_date: str = None) -> Optional[dict]:
+        """打板情绪三指标（2026-09-07 P1 论证后实施）——基于 akshare 东财涨停三池。
+
+        免费数据源（东财 push2ex，市场级数据，每次 3 次调用、0 个股配额）：
+          - 封板率   = 涨停数 / (涨停数 + 炸板数)
+          - 连板晋级率 = 今日连板(≥2板)数 / 昨日涨停数
+          - 昨日涨停溢价 = 昨日涨停股今日平均涨跌幅(%)
+
+        返回 {'available': True, 'seal_rate': 0-100, 'promotion_rate': 0-100,
+              'prev_premium': ±%}；任一数据缺失/异常返回 None（调用方回退旧口径）。
+        结果按 trade_date 缓存（市场级数据当日不变）。
+        """
+        import akshare as ak
+        from core.trading_calendar import beijing_now
+        if trade_date is None:
+            trade_date = beijing_now().strftime('%Y-%m-%d')
+        ymd = trade_date.replace('-', '')
+        cache_key = f"zt_emotion_{ymd}"
+        cached = getattr(self, '_zt_emotion_cache', {})
+        if cache_key in cached:
+            return cached[cache_key]
+
+        result = None
+        try:
+            zt = ak.stock_zt_pool_em(date=ymd)
+            zb = ak.stock_zt_pool_zbgc_em(date=ymd)
+            prev = ak.stock_zt_pool_previous_em(date=ymd)
+            n_zt, n_zb, n_prev = len(zt), len(zb), len(prev)
+            if n_zt + n_zb == 0 or n_prev == 0:
+                logger.warning(f"涨停三池数据为空 {trade_date}: zt={n_zt} zb={n_zb} prev={n_prev}")
+                result = None
+            else:
+                seal_rate = n_zt / (n_zt + n_zb) * 100.0
+                promo_num = 0
+                if n_zt and '连板数' in zt.columns:
+                    promo_num = int((pd.to_numeric(zt['连板数'], errors='coerce') >= 2).sum())
+                promotion_rate = promo_num / n_prev * 100.0
+                prev_premium = None
+                if '涨跌幅' in prev.columns:
+                    prem = pd.to_numeric(prev['涨跌幅'], errors='coerce').dropna()
+                    if len(prem):
+                        prev_premium = float(prem.mean())
+                if prev_premium is None:
+                    result = None
+                else:
+                    result = {'available': True,
+                              'seal_rate': round(seal_rate, 1),
+                              'promotion_rate': round(promotion_rate, 1),
+                              'prev_premium': round(prev_premium, 2),
+                              'n_zt': n_zt, 'n_zb': n_zb, 'n_prev': n_prev}
+        except Exception as e:
+            logger.warning(f"涨停三池获取失败 {trade_date}: {type(e).__name__} {str(e)[:50]}")
+            result = None
+
+        cached[cache_key] = result
+        # 2026-09-07 回访修复：有界化，只保留最近 5 个交易日，防长进程膨胀
+        self._zt_emotion_cache = dict(sorted(cached.items())[-5:])
+        return result
+
     def get_ths_hot_stocks(self, date: str = None) -> pd.DataFrame:
         """同花顺当日强势股 + 题材归因 reason tags"""
         if date is None:
@@ -1666,6 +2015,36 @@ class DataEngine:
             if not rows:
                 self._update_source_status('ths_hot', False, 'empty')
                 return pd.DataFrame()
+
+            # schema 漂移检测（2026-09-16 P2-1）
+            # 背景：上游 2026-09 起只返回 id/name/code/reason/date/market 六个字段，
+            # 旧 schema 的行情字段（close/zhangfu/huanshou/chengjiaoe/ddejingliang…）
+            # 全部消失。此前消费端 `row.get('涨幅%', 0)` 键不存在即静默回落 0，
+            # 简报"题材热度 TOP10"整列渲染成 `+0.0% ➖`，无异常、无告警、源状态仍报"可用"。
+            # 现分级处置：
+            #   - reason（题材归因，唯一被消费的功能性字段）缺失 → 真不可用，熔断；
+            #   - 仅行情字段缺失 → 数据仍可用，但必须"响一声"（WARNING + 状态备注），
+            #     让漂移可被事后追溯，而不是静默产出伪 0 值。
+            _expected_market_fields = (
+                "close", "zhangdie", "zhangfu", "huanshou",
+                "chengjiaoe", "chengjiaoliang", "ddejingliang")
+            if not any("reason" in r for r in rows[:20]):
+                self._update_source_status(
+                    'ths_hot', False, 'schema_changed: 缺少题材归因(reason)字段')
+                logger.warning("同花顺强势股接口 schema 变更：reason 字段缺失，题材热度不可用")
+                return pd.DataFrame()
+            _present = {k for k in _expected_market_fields
+                        if any(k in r for r in rows[:50])}
+            if len(_present) < len(_expected_market_fields) * 0.5:
+                _missing = sorted(set(_expected_market_fields) - _present)
+                logger.warning(
+                    f"同花顺强势股接口字段漂移：期望 {len(_expected_market_fields)} 个"
+                    f"行情字段，实际仅 {len(_present)} 个 → 缺失 {_missing}。"
+                    f"题材热度将不再展示涨跌幅（不伪造 0.0%）。")
+                self._update_source_status(
+                    'ths_hot', True, f'schema_changed: 缺失 {_missing}')
+            else:
+                self._update_source_status('ths_hot', True)
             df = pd.DataFrame(rows)
             rename_map = {
                 "name": "名称", "code": "代码", "reason": "题材归因",
@@ -1675,7 +2054,6 @@ class DataEngine:
                 "market": "市场",
             }
             df = df.rename(columns=rename_map)
-            self._update_source_status('ths_hot', True)
             return df
         except Exception as e:
             self._update_source_status('ths_hot', False, str(e)[:60])
@@ -1687,6 +2065,19 @@ class DataEngine:
         if ths_df.empty or '题材归因' not in ths_df.columns:
             return []
         from collections import Counter, defaultdict
+
+        def _opt_pct(v):
+            """涨幅可缺失（2026-09-16 P2-1：上游已不再提供该字段）。
+            缺失必须是 None —— 绝不能回落 0，否则展示层会把它渲染成
+            `+0.0%`，把"没有数据"伪装成"涨幅为零"。"""
+            if isinstance(v, bool) or v is None:
+                return None
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None
+            return f if f == f else None   # NaN → None
+
         theme_stocks = defaultdict(list)
         for _, row in ths_df.iterrows():
             reason = str(row.get('题材归因', ''))
@@ -1696,11 +2087,15 @@ class DataEngine:
                     theme_stocks[tag].append({
                         'code': str(row.get('代码', '')).zfill(6),
                         'name': row.get('名称', ''),
-                        'pct_chg': row.get('涨幅%', 0),
+                        'pct_chg': _opt_pct(row.get('涨幅%')),
                     })
         result = []
         for theme, stocks in sorted(theme_stocks.items(), key=lambda x: len(x[1]), reverse=True):
-            top_stocks = sorted(stocks, key=lambda s: float(s['pct_chg'] or 0), reverse=True)[:3]
+            # 有涨幅的按涨幅降序排在前，无涨幅的保持上游原始顺序（稳定排序）
+            def _rank_key(s):
+                v = s.get('pct_chg')
+                return (1, v) if isinstance(v, float) else (0, 0.0)
+            top_stocks = sorted(stocks, key=_rank_key, reverse=True)[:3]
             result.append({
                 'theme': theme,
                 'count': len(stocks),
@@ -1806,9 +2201,11 @@ class DataEngine:
             self._lockup_cache_date = today
             self._lockup_cache_horizon = days_ahead
             logger.info(f"[lockup] 已缓存 {len(cache)} 只票未来 {days_ahead} 天解禁日历")
+            self._update_source_status('lockup', True)
         except Exception as e:
             logger.warning(f"解禁日历缓存失败: {str(e)[:80]}")
             self._source_available['lockup'] = False
+            self._update_source_status('lockup', False, str(e)[:80])
             self._lockup_cache = {}
             self._lockup_cache_date = None
 
@@ -1847,6 +2244,10 @@ class DataEngine:
         datacenter_url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 
         records = []
+        # 修复（2026-09-06 审查）：seats/institution 初始化上移——原先在 try 块
+        # 之后才赋值，em_get 返回 None 的提前 return 会触发 NameError
+        seats = {"buy": [], "sell": []}
+        institution = {"buy_amt": 0, "sell_amt": 0, "net_amt": 0}
         try:
             params = {
                 "reportName": "RPT_DAILYBILLBOARD_DETAILSNEW",
@@ -1870,9 +2271,6 @@ class DataEngine:
                 })
         except Exception as e:
             logger.warning(f"龙虎榜记录失败 {code}: {str(e)[:60]}")
-
-        seats = {"buy": [], "sell": []}
-        institution = {"buy_amt": 0, "sell_amt": 0, "net_amt": 0}
 
         if records:
             latest = records[0]["date"]
@@ -1930,7 +2328,12 @@ class DataEngine:
 
     @staticmethod
     def _safe_float(val) -> float:
+        # 修复（2026-09-06 迭代）：NaN 原样穿透——float('nan') 不进 except 且
+        # bool(nan) 为 True，nan<=0 为 False，会绕过所有行情防护继续污染计算
         try:
-            return float(val) if val else 0.0
+            f = float(val) if val else 0.0
+            if f != f:  # NaN 检测（NaN != NaN）
+                return 0.0
+            return f
         except (ValueError, TypeError):
             return 0.0

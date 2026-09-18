@@ -22,7 +22,13 @@
 
 import numpy as np
 import pandas as pd
-from typing import Dict
+from typing import Dict, List
+import logging
+
+from core.fundamental_provider import FundamentalProvider
+from core.event_provider import EventProvider
+
+logger = logging.getLogger(__name__)
 
 
 class FactorLibrary:
@@ -217,7 +223,9 @@ class FactorLibrary:
     @staticmethod
     def calc_hot_theme_score(is_hot_stock: bool, blocks: dict = None,
                              concept_names: list = None,
-                             stock_name: str = '') -> float:
+                             stock_name: str = '',
+                             concept_count_bonus: bool = False,
+                             breakdown: dict = None) -> float:
         """
         热门题材加分 — 三源融合：同花顺热点 + 板块归属 + AShareHub概念板块
 
@@ -225,6 +233,10 @@ class FactorLibrary:
         blocks: 板块归属结果（东财 slist，含 boards[].change_pct / lead_stock）
         concept_names: AShareHub概念板块名称列表
         stock_name: 股票名称，用于判断是否为板块龙头
+        concept_count_bonus: 概念数量加分开关（P1-G，2026-09-05 审查报告）。
+            默认关闭——"≥10 概念 +15"从未经 OOS IC 验证，概念多 ≠ 题材热
+            （冷门票往往被动挂靠大量概念，与板块涨幅加权的设计初衷冲突）。
+        breakdown: 可选 dict，传入时回填各加分项明细（供因子归因/诊断）。
         返回: 0-100 分，仅供报告引用，实际加分由 ScoringModel 权重控制
 
         板块归属部分采用「涨幅加权 + 龙头加成」（2026-08-13 改）：
@@ -237,6 +249,8 @@ class FactorLibrary:
         score = 50.0
         if is_hot_stock:
             score += 20  # 强势股且有题材归因标签
+            if breakdown is not None:
+                breakdown['hot_stock'] = 20
         if blocks and blocks.get('total', 0) > 0:
             boards = blocks.get('boards') or []
             if boards:
@@ -259,25 +273,91 @@ class FactorLibrary:
                 if sector_chgs:
                     top3 = sorted(sector_chgs, reverse=True)[:3]
                     avg_chg = sum(top3) / len(top3)
-                    score += min(max(0.0, avg_chg) * 5, 15)
+                    bonus = min(max(0.0, avg_chg) * 5, 15)
+                    score += bonus
+                    if breakdown is not None:
+                        breakdown['sector_momentum'] = round(bonus, 2)
                 # 龙头加成：lead_stock 与股票名称匹配（名称≥3字符防短名误伤）
                 if stock_name and len(stock_name) >= 3:
                     for b in boards:
                         lead = str(b.get('lead_stock', '') or '').strip()
                         if lead and (lead == stock_name or lead in stock_name or stock_name in lead):
                             score += 5
+                            if breakdown is not None:
+                                breakdown['lead_stock'] = 5
                             break
 
-        # AShareHub 概念板块增强（全市场覆盖，覆盖面远超同花顺强势股）
-        if concept_names:
+        # AShareHub 概念板块增强（P1-G：默认关闭，未经 OOS 验证的加分项）
+        if concept_count_bonus and concept_names:
             n_concepts = len(concept_names)
             if n_concepts >= 10:
                 score += 15  # 多概念覆盖，板块效应强
+                if breakdown is not None:
+                    breakdown['concept_count'] = 15
             elif n_concepts >= 5:
                 score += 10
+                if breakdown is not None:
+                    breakdown['concept_count'] = 10
             elif n_concepts >= 2:
                 score += 5
+                if breakdown is not None:
+                    breakdown['concept_count'] = 5
         return min(score, 100)
+
+    def calc_limit_up_streak(self, kline_df, code: str = '') -> int:
+        """T3 新因子（2026-09-06）：连板数——连续收于涨停价的天数（含今日）。
+
+        板宽按代码前缀判定：300/301/688/689=20%，43/83/87/92（北交所，当前
+        宇宙外，防御性保留）=30%，其余 10%。阈值用 9.5/19.6/29.4%（与
+        short_term 涨停统计同口径，容忍四舍五入）。
+
+        无 K 线或不足 2 行返回 0；非涨停返回 0。
+        """
+        if kline_df is None or len(kline_df) < 2:
+            return 0
+        try:
+            code6 = str(code).zfill(6)
+            if code6.startswith(('300', '301', '688', '689')):
+                thresh = 19.6
+            elif code6.startswith(('43', '83', '87', '88', '92')):
+                thresh = 29.4
+            else:
+                thresh = 9.5
+            close = pd.to_numeric(kline_df['close'], errors='coerce')
+            pct = close.pct_change() * 100
+            streak = 0
+            for v in reversed(pct.dropna().tolist()):
+                if v >= thresh:
+                    streak += 1
+                else:
+                    break
+            return streak
+        except Exception as e:
+            logger.warning(f"连板数计算失败: {str(e)[:50]}")
+            return 0
+
+    def calc_vol_surge_5d(self, kline_df) -> float:
+        """T3 新因子（2026-09-06）：量能趋势——今日成交量 / 近5日均量。
+
+        >1 表示尾盘放量（抢筹结构候选信号），<1 缩量。
+        数据不足（<6 行）或除零返回 50（中性，映射为百分位式语义）。
+        返回值是原始比值 ×50 上限 100（比值 2.0 及以上 = 100），
+        便于未来直接当 0-100 分用。
+        """
+        if kline_df is None or len(kline_df) < 6:
+            return 50.0
+        try:
+            vol = pd.to_numeric(kline_df['volume'], errors='coerce').dropna()
+            if len(vol) < 6 or vol.iloc[-1] <= 0:
+                return 50.0
+            base = vol.iloc[-6:-1].mean()
+            if base <= 0:
+                return 50.0
+            ratio = float(vol.iloc[-1]) / float(base)
+            return round(min(ratio * 50.0, 100.0), 1)
+        except Exception as e:
+            logger.warning(f"量能趋势计算失败: {str(e)[:50]}")
+            return 50.0
 
     @staticmethod
     def calc_dragon_tiger_score(dragon_tiger: dict) -> float:
@@ -467,6 +547,48 @@ class FactorLibrary:
 
         return min(score, 100)
 
+    # ── 批量预加载（避免逐股查 SQLite） ───────────────────────
+
+    @staticmethod
+    def attach_tdx_signals(stocks: List[Dict],
+                           fund_provider: FundamentalProvider = None,
+                           event_provider: EventProvider = None,
+                           as_of: str = None,
+                           event_days: int = 30) -> None:
+        """
+        批量预加载通达信估值/基本面 + 事件催化信号
+
+        给每只股票 dict 附加：
+          stock['fundamentals']     → 估值/基本面 dict（含 pe/pb/roe/...）
+          stock['recent_events']    → 近 N 天事件列表
+
+        入参 provider 用 None 时自动创建默认实例。
+        as_of 必须传"决策日"——实盘传今天，回测传 backtest_date，
+        否则事件衰减用 datetime.now() 计算会破坏回测的口径。
+        """
+        if not stocks:
+            return
+        fund_provider = fund_provider or FundamentalProvider()
+        event_provider = event_provider or EventProvider()
+
+        codes = [str(s['code']).zfill(6) for s in stocks]
+        # P1-I（2026-09-05 审查报告）：回测必须传 as_of 走 point-in-time 历史表。
+        # 此前 get_many 无 as_of —— 回测读最新估值快照 = 前视泄漏。
+        # 历史表无数据时返回空（因子中性化），缺失显式可见优于未来数据。
+        funds = fund_provider.get_many(codes, as_of=as_of)
+        for s in stocks:
+            code = str(s['code']).zfill(6)
+            s['fundamentals'] = funds.get(code)
+
+        # 事件逐股查（事件缓存对单股很轻，未做批量接口）
+        for s in stocks:
+            code = str(s['code']).zfill(6)
+            try:
+                s['recent_events'] = event_provider.get_recent(code, days=event_days,
+                                                                as_of=as_of)
+            except Exception:
+                s['recent_events'] = []
+
     # ========== 综合评分 ==========
 
     def compute_all_factors(self, stock_data: Dict, mode: str = 'short') -> Dict:
@@ -500,10 +622,24 @@ class FactorLibrary:
         rps_value = stock_data.get('rps_20', 50)
         factors['momentum'] = self.calc_rps_score(rps_value)
 
+        # 反转因子（2026-09-17 T8，P3-3）：= momentum 百分位取反。
+        # 依据：2.2 年全市场 OOS IC +0.0298 (t=+2.11)，walk-forward 均值 +0.0474，
+        # 三折符号稳定。当前权重 0.00（config 已登记），待 OOS 复核后由
+        # calibrate_weights 审批调整，不影响现有评分。
+        factors['reversal_20d'] = 100.0 - factors.get('momentum', 50.0)
+
+        # 小市值因子（2026-09-18 R-B）：横截面百分位（市值越小分越高），
+        # 由 rank_stocks 写入 _size_percentile；缺失（回测快照/数据缺失）→ 中性 50。
+        # 当前权重 0（v1.json/config 已登记），启用契约见 rank_stocks 注释。
+        _size_pct = stock_data.get('_size_percentile')
+        factors['size'] = min(_size_pct * 100.0, 100.0) if _size_pct is not None else 50.0
+
         # 技术形态 — 双源评分（K线自算 + AShareHub API 校验）
+        # 修复（2026-09-06 审查）：get_kline 全源失败时返回空 DataFrame（非 None），
+        # 原守卫 `is not None` 会被空 DF 绕过，需显式排除空表
         kline_df = stock_data.get('kline_df')
         asharehub_tech = stock_data.get('asharehub_tech')
-        if kline_df is not None or asharehub_tech is not None:
+        if (kline_df is not None and not kline_df.empty) or asharehub_tech is not None:
             from core.technical_scorer import TechnicalScorer
             tech_scorer = TechnicalScorer()
             tech_result = tech_scorer.score_dual_source(kline_df, asharehub_tech)
@@ -544,7 +680,15 @@ class FactorLibrary:
             elif pp < -0.02:
                 tail_bonus -= 3   # 收盘低于均价，弱势收尾
 
-        factors['volume_price'] = np.clip(base_vp * 0.7 + tail_bonus, 0, 100)
+        # 修复（2026-09-05 审查 P2-3）：×0.7 只应在有尾盘数据时使用 —— 它的
+        # 作用是压缩 base_vp 给 tail_bonus 腾空间。旧公式对无尾盘数据的票
+        # 也乘 0.7，把"数据可得性"（与 ASHareHub 配额相关）变成了结构性
+        # 封顶：base_vp 上限 85 时无数据票最高 59.5 分，有数据票可达 ~89.5，
+        # 同样的量价形态仅因数据源覆盖不同得分差 30。
+        if tail.get('available'):
+            factors['volume_price'] = np.clip(base_vp * 0.7 + tail_bonus, 0, 100)
+        else:
+            factors['volume_price'] = np.clip(base_vp, 0, 100)
 
         # 风险 — 风控通过时 score_penalty=0 → risk_score=100
         factors['risk'] = stock_data.get('risk_score', 100)
@@ -559,6 +703,23 @@ class FactorLibrary:
         factors['dragon_tiger'] = self.calc_dragon_tiger_score(
             stock_data.get('dragon_tiger')
         )
+
+        # 通达信新因子（2026-09-05 新增）
+        # 估值/基本面 + 事件催化 — 由 attach_tdx_signals 预加载后挂载
+        # 无数据时返回中性 50，与权重表里 0 权重一致，不污染总分
+        factors['valuation_fundamental'] = FundamentalProvider.score(
+            stock_data.get('fundamentals'))
+        factors['event_catalyst'] = EventProvider.score(
+            stock_data.get('recent_events'),
+            reference_date=stock_data.get('_decision_date'))
+
+        # T3 因子扩容（2026-09-06 第一梯队）：零依赖自算因子，仅用 kline_df，
+        # 不耗任何 API 配额。默认不在权重表（score_stock 按 weights 遍历）→
+        # 完全不影响现有评分，仅随 factor_raw 采集积累样本，供未来 OOS 校准启用。
+        kline_for_new = stock_data.get('kline_df')
+        factors['limit_up_streak'] = self.calc_limit_up_streak(
+            kline_for_new, stock_data.get('code', ''))
+        factors['vol_surge_5d'] = self.calc_vol_surge_5d(kline_for_new)
 
         if mode == 'long':
             # 基本面因子：优先用 AShareHub 财务指标，回退到 mootdx/baostock

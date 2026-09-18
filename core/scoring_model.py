@@ -62,24 +62,31 @@ class ScoringModel:
     - 单股票评分 + 批量排序
     """
 
-    # 默认权重（与 config.yml 保持同步，作为 fallback）
-    # 短线：北向因子降权0%（2024-08起数据停公开），权重让给主力资金
-    # 长线：北向因子降权0%（同上），权重让给基本面
+    # 默认权重（fallback 兜底，2026-09-06 审查修复：与 data/weights/v1.json
+    # 对齐。原先 DEFAULT 与 v1.json 严重矛盾（hot_theme 0.10 vs 0.50），
+    # 一旦 v1.json 丢失会静默回退到 DEFAULT 导致选股行为 5× 漂移）。
+    # 真正生效权重以 get_weights() 为准：v1.json > config.yml > 此处兜底。
     # risk 不进权重表，由 penalty 路径独立扣分（见 ActiveWeight 与 penalty 注释）
     DEFAULT_WEIGHTS = {
         'short': {
-            'capital_flow': 0.35,  # 25→35: 吸收北向10%全部让给主力资金
-            'north_flow': 0.00,
-            'momentum': 0.25,
-            'technical': 0.15,
-            'volume_price': 0.10,
-            'hot_theme': 0.10,
-            'dragon_tiger': 0.05,
+            # 2026-09-18 权重优化（2.2 年 OOS + IC 衰减分析，与 v1.json/config.yml 同步）：
+            # hot_theme 0.50→0.42→0.35（IC 连续 2 月下降，月度复检 2026-09）、
+            # reversal_20d 新增 0.42→0.49（承接让渡，IC 上升）
+            # （IC +0.0298 且上升）、capital_flow 0.15→0.05（coverage 2.3%+衰减）、
+            # technical/volume_price/momentum 探索位 0.03、dragon_tiger 0.02。
+            'capital_flow': 0.05,
+            'north_flow': 0.00,   # 2024-08 起北向官方停发，仅东财估算口径
+            'momentum': 0.03,
+            'technical': 0.03,
+            'volume_price': 0.03,
+            'hot_theme': 0.35,
+            'reversal_20d': 0.49,
+            'dragon_tiger': 0.02,
         },
         'long': {
-            'fundamental': 0.40,  # 30→40: 吸收一半北向
+            'fundamental': 0.40,
             'north_flow': 0.00,
-            'momentum': 0.25,    # 15→25: 吸收另一半北向
+            'momentum': 0.25,
             'valuation': 0.20,
             'institutional': 0.15,
         }
@@ -97,8 +104,14 @@ class ScoringModel:
         loaded = self._load_weights(model_version)
         if loaded:
             self.weights = loaded
-            if weights and weights != loaded:
-                logger.warning(f"v1.json 权重与 config.yml 不一致！config 权重被忽略。")
+            # 2026-09-14 整体审查 P3 附带修复：原比较 `weights != loaded` 恒为真——
+            # loaded 是 {short:…, long:…} 嵌套结构、weights 是扁平的单一模式权重，
+            # 两者永不相等 → 该告警长期是假阳性（被文档列为"已知无害告警"）。
+            # 改为语义等价比较（缺失键视为 0、容差 1e-9），使告警只在**真不一致**时出现。
+            if weights and not any(
+                    self._weights_equivalent(weights, v)
+                    for v in loaded.values() if isinstance(v, dict)):
+                logger.warning("v1.json 权重与 config.yml 不一致！config 权重被忽略。")
             logger.info(f"权重从 {model_version}.json 加载")
         elif weights:
             self.weights = weights
@@ -106,6 +119,24 @@ class ScoringModel:
         else:
             self.weights = self.DEFAULT_WEIGHTS
             logger.info("权重从 DEFAULT_WEIGHTS 加载")
+
+    @staticmethod
+    def _weights_equivalent(a: Dict, b: Dict, tol: float = 1e-9) -> bool:
+        """权重语义等价比较（2026-09-14 整体审查新增）。
+
+        用于判断"config.yml 传入的权重"与"v1.json 中某一模式的权重"是否一致：
+          - 缺失键视为 0（v1.json 不收录零权重因子，config.yml 会显式写 0.00）；
+          - None / 非数值一律按 0 处理；
+          - 浮点比较带容差。
+        """
+        keys = set(a) | set(b)
+        try:
+            return all(
+                abs(float(a.get(k) or 0) - float(b.get(k) or 0)) <= tol
+                for k in keys
+            )
+        except (TypeError, ValueError):
+            return False
 
     def _load_weights(self, version: str) -> Optional[Dict]:
         """从文件加载权重"""
@@ -172,7 +203,16 @@ class ScoringModel:
         weights = self.get_weights(mode)
 
         # 计算各因子得分
-        factors = self.factor_lib.compute_all_factors(stock_data, mode)
+        # P2-K hook（2026-09-05 审查报告）：横截面标准化由 rank_stocks 批量注入
+        # _factor_scores（缓存批量现算结果）+ _factors_override（标准化后的分值）。
+        # 仅当 config short_term.sell.standardize=true 时注入；单股直调路径不受影响。
+        factors = stock_data.get('_factor_scores') \
+            or self.factor_lib.compute_all_factors(stock_data, mode)
+        override = stock_data.get('_factors_override')
+        if override:
+            for k, v in override.items():
+                if k in factors and v is not None:
+                    factors[k] = v
 
         # 判断各因子是否有真实数据支撑，将"数据不可用"的因子权重重分配给活跃因子
         # 防止 45% 权重输出恒定 50 分导致总分被压缩
@@ -190,6 +230,24 @@ class ScoringModel:
             if factor_name == 'capital_flow' and stock_data.get('main_fund_accumulated') is None:
                 is_neutral = True
             if factor_name == 'north_flow' and stock_data.get('north_flow_accumulated') is None:
+                is_neutral = True
+            # 通达信新因子（2026-09-05 新增）
+            if factor_name == 'valuation_fundamental' and stock_data.get('fundamentals') is None:
+                is_neutral = True
+            if factor_name == 'event_catalyst' and not stock_data.get('recent_events'):
+                is_neutral = True
+            # 小市值（2026-09-18 R-B）：无市值数据 → 数据不可用（权重让渡）
+            if factor_name == 'size' and stock_data.get('total_market_cap') is None:
+                is_neutral = True
+            # 热点题材（2026-09-05 审查 P1-2）：hot_theme 依赖 is_hot_stock /
+            # blocks / concept_names 三源。三者全部缺失（回测快照无热点历史、
+            # 或实盘字段意外丢失）→ 数据不可用，权重让渡给活跃因子。
+            # 注意区分"查过但不是热点"（is_hot_stock=False 存在）——那是真实
+            # 信号，不算缺失，否则实盘 hot_theme 永远失效。
+            if factor_name == 'hot_theme' \
+                    and 'is_hot_stock' not in stock_data \
+                    and not stock_data.get('blocks') \
+                    and not stock_data.get('concept_names'):
                 is_neutral = True
 
             factor_scores[factor_name] = (factor_score, weight, is_neutral)
@@ -241,11 +299,15 @@ class ScoringModel:
         risk_check = stock_data.get('risk_check', {})
         risk_penalty = 0.0
         risk_note = ''
+        hard_block = False
         if risk_check:
             if not risk_check.get('passed', True):
-                # 硬拦截：risk_filter 已在前置拦下，这里是为了双保险
-                risk_penalty = risk_check.get('score_penalty', 0)
-                risk_note = 'risk_check 未通过'
+                # 硬拦截（2026-09-05 审查 P2-6 统一语义）：risk_filter 保证
+                # 未通过 ⇒ penalty ≥ 0.8。旧实现把硬失败也按 ×0.5 折减，
+                # 与 rank_stocks 的"直接淘汰"不一致 —— 同一只票走批量路径
+                # 被剔除、走单票路径却还能拿 ~57 分。统一为硬失败 = 0 分。
+                hard_block = True
+                risk_note = 'risk_check 未通过（硬拦截）'
             else:
                 # passed=True 但 score_penalty 不为 0：软风险扣分
                 # penalty < 0.4 → ×0.2（轻度软风险）
@@ -256,8 +318,28 @@ class ScoringModel:
                 if risk_penalty > 0:
                     risk_note = f"软风险扣分(penalty={risk_penalty})"
 
-        risk_coeff = 0.2 if risk_penalty < 0.4 else 0.5
-        score = weighted_score * (1 - risk_penalty * risk_coeff)
+        if hard_block:
+            score = 0.0
+        else:
+            risk_coeff = 0.2 if risk_penalty < 0.4 else 0.5
+            score = weighted_score * (1 - risk_penalty * risk_coeff)
+
+        # 追高惩罚（2026-09-07 P1 论证后实施，子代理结论：做成风控覆盖项而非
+        # 独立加权因子——独立因子会与 hot_theme 0.50 重复计数）。
+        # 华泰月度跟踪证实 A 股短线呈反转效应（沪深300 池 1 个月反转 IC 27.69%）：
+        # 当日涨幅 >7% 的票次日均值回归风险高。惩罚 = clip((pct-7)/(9.5-7),0,1)×0.5，
+        # 即 7%→0%、9.5% 及以上→最多砍 50%。factor_raw 实测仅 1.2% 候选票
+        # 涨幅>7%，正常场景几乎不触发（风险覆盖而非常规打分）。
+        chase_pct = stock_data.get('pct_chg')
+        try:
+            chase_pct = float(chase_pct) if chase_pct is not None else None
+        except (TypeError, ValueError):
+            chase_pct = None
+        if mode == 'short' and chase_pct is not None and chase_pct > 7.0:
+            chase_penalty = min((chase_pct - 7.0) / 2.5, 1.0) * 0.5
+            score *= (1 - chase_penalty)
+            logger.info(f"追高惩罚 {stock_data.get('code')}: 当日涨幅 {chase_pct:.1f}% "
+                        f"→ 分数 ×{1-chase_penalty:.2f}")
 
         # 转百分制 + 截断
         final_score = round(min(max(score, 0), 100), 2)
@@ -273,8 +355,20 @@ class ScoringModel:
         if mode == 'short':
             tp = self.sell_config.get('take_profit', 0.02)
             sl = abs(self.sell_config.get('stop_loss', -0.02))
+            # P2-N（2026-09-05 审查报告）：波动率自适应止损。
+            # stop_mode='atr' → 止损距离 = max(atr_mult × ATR14, 固定止损距离)：
+            # 高波动票止损更宽（减少噪音止损），下限仍不低于固定止损距离。
+            # 默认 'fixed' 保持历史行为。ATR 缺失（无 K 线）回退固定止损。
+            if self.sell_config.get('stop_mode', 'fixed') == 'atr':
+                atr = self._atr14(stock_data)
+                if atr is not None and price > 0:
+                    sl_dist = max(self.sell_config.get('atr_mult', 1.0) * atr, sl * price)
+                    stop_price = round(price - sl_dist, 2)
+                else:
+                    stop_price = round(price * (1 - sl), 2)
+            else:
+                stop_price = round(price * (1 - sl), 2)
             target_price = round(price * (1 + tp), 2)
-            stop_price = round(price * (1 - sl), 2)
         else:
             target_price = round(price * 1.15, 2)   # 长线 +15%
             stop_price = round(price * 0.92, 2)     # 长线 -8%
@@ -296,7 +390,32 @@ class ScoringModel:
             'reasoning': reasoning,
             'mode': mode,
             'model_version': self.model_version,
+            'risk_blocked': hard_block,
         }
+
+    @staticmethod
+    def _atr14(stock_data: Dict) -> Optional[float]:
+        """从 kline_df 计算 14 日 ATR（TR 简单均值）。
+
+        P2-N 配套：stop_mode='atr' 时的波动率输入。无 K 线或行数 <15 时
+        返回 None（调用方回退固定止损）——缺失显式处理，不用猜测值。
+        """
+        df = stock_data.get('kline_df')
+        if df is None or len(df) < 15:
+            return None
+        try:
+            import pandas as pd
+            high = df['high'].astype(float)
+            low = df['low'].astype(float)
+            close = df['close'].astype(float)
+            prev_close = close.shift(1)
+            tr = pd.concat([high - low,
+                            (high - prev_close).abs(),
+                            (low - prev_close).abs()], axis=1).max(axis=1)
+            atr = float(tr.tail(14).mean())
+            return atr if atr > 0 else None
+        except Exception:
+            return None
 
     def _make_decision(self, score: float, mode: str) -> str:
         """生成决策建议"""
@@ -412,16 +531,23 @@ class ScoringModel:
 
         price = stock_data.get('price', 0)
         if mode == 'short':
+            # 从 sell_config 读取，避免 config.yml 调整后简报文案与实际参数脱节
+            # （此前此处硬编码 1.02 / 0.98，与 score_stock 中的 sell_config 不一致）
+            tp = self.sell_config.get('take_profit', 0.02)
+            sl = abs(self.sell_config.get('stop_loss', -0.02))
             reasoning += (f"短线交易价值。"
-                         f"目标{price*1.02:.2f}（+2%止盈），止损{price*0.98:.2f}（-2%止损）。")
+                         f"目标{price*(1+tp):.2f}（+{tp*100:.0f}%止盈），"
+                         f"止损{price*(1-sl):.2f}（-{sl*100:.0f}%止损）。")
         else:
+            # 长线止盈止损：config.yml 未提供 long_term.sell 段，沿用既有约定值
             reasoning += (f"中长期配置价值。"
                          f"目标{price*1.15:.2f}（+15%），止损{price*0.92:.2f}（-8%）。")
 
         return reasoning
 
     def rank_stocks(self, stocks_data: List[Dict], mode: str = 'short',
-                    top_n: int = 3, min_score: float = 60) -> List[Dict]:
+                    top_n: int = 3, min_score: float = 60,
+                    diagnostics: Dict = None) -> List[Dict]:
         """
         批量选股评分 + 排序
 
@@ -430,6 +556,10 @@ class ScoringModel:
           mode: 'short' / 'long'
           top_n: 最多返回N只
           min_score: 最低评分阈值
+          diagnostics: 可选出参 dict。调用方传入后，若全部候选被门槛过滤清零，
+                       会写入 top_unqualified（最高分标的的 code/name/score/
+                       min_score/gap/candidates），供简报在"无推荐"时展示。
+                       不传时行为与历史实现完全一致。
 
         返回：评分降序排列的推荐列表
         """
@@ -448,6 +578,28 @@ class ScoringModel:
                     # 百分位 = 有多少股票 <= 该值 / 总数
                     rank = sum(1 for v in main_values if v <= mv) / len(main_values)
                     s['_capital_flow_percentile'] = rank
+
+        # R-B（2026-09-18）：小市值因子横截面百分位——市值越小分越高。
+        # 依据 study-vault F09 洞察（小市值 = A 股最稳健截面因子，现有 9 因子
+        # 无规模维度）。权重 0 链路先行：OOS 面板（kline 构建）无市值数据，
+        # 验证条件 = 市值历史快照积累 ≥60 交易日后跑 OOS，再由 calibrate_weights
+        # 审批加权（与 valuation_fundamental / event_catalyst 同一启用契约）。
+        mcap_values = [s.get('total_market_cap') for s in stocks_data
+                       if s.get('total_market_cap')]
+        if mcap_values:
+            for s in stocks_data:
+                mv = s.get('total_market_cap')
+                if mv:
+                    # 大市值秩（市值<=该值占比）取反 → 小市值百分位
+                    big_rank = sum(1 for v in mcap_values if v <= mv) / len(mcap_values)
+                    s['_size_percentile'] = 1.0 - big_rank
+
+        # P2-K（2026-09-05 审查报告）：横截面因子标准化（实验开关）。
+        # 批量预计算因子分 → 每个因子横截面 rank 0-100 → 写入 _factors_override，
+        # score_stock 的 hook 会用其覆盖原始因子分。默认关闭（保持历史行为）；
+        # 启用后必须重跑 --mode oos 与 calibrate_weights（口径变化）。
+        if self.sell_config.get('standardize', False):
+            self._apply_factor_standardization(stocks_data, mode)
 
         results = []
         for stock in stocks_data:
@@ -470,6 +622,28 @@ class ScoringModel:
         # 过滤最低分并限制数量
         qualified = [r for r in results if r['score'] >= min_score]
 
+        # 可观测性（2026-09-07 评分审查）：全部被门槛过滤时，记录最高分与
+        # 差距——否则"没有评分达标"无法区分"没有好票"与"门槛过高"
+        if not qualified and results:
+            top = results[0]
+            logger.warning(
+                f"min_score 过滤清零: 最高分 {top['score']:.1f}（{top.get('code')} "
+                f"{top.get('name', '')}），距门槛 {min_score} 差 {min_score - top['score']:.1f} 分"
+                f"（候选 {len(results)} 只）")
+            # 2026-09-14：把"最高分标的"外送给调用方——简报在无推荐时展示它，
+            # 用于区分"市场确实没有好票"与"门槛相对当前评分尺度偏高"。
+            # diagnostics=None（默认）时不产生任何副作用，回测等调用方不受影响。
+            if diagnostics is not None:
+                _top_score = float(top.get('score', 0.0))
+                diagnostics['top_unqualified'] = {
+                    'code': top.get('code', ''),
+                    'name': top.get('name', ''),
+                    'score': round(_top_score, 2),
+                    'min_score': round(float(min_score), 2),
+                    'gap': round(float(min_score) - _top_score, 2),
+                    'candidates': len(results),
+                }
+
         # 防凑数：如果第3名与第1名分差超过20分，裁掉尾巴
         if len(qualified) >= 3:
             top_score = qualified[0]['score']
@@ -479,3 +653,47 @@ class ScoringModel:
         # 如果只剩1只且评分很好，也是合理结果（不硬凑到3只）
 
         return qualified[:top_n]
+
+    def _apply_factor_standardization(self, stocks_data: List[Dict],
+                                      mode: str) -> None:
+        """P2-K：对当日候选池批量做横截面因子标准化（原地写入 stock dict）。
+
+        流程：批量现算因子分（缓存到 _factor_scores，score_stock 直接复用，
+        不重复计算）→ 逐因子横截面 rank 0-100 → 写入 _factors_override。
+        样本 <5 的因子跳过（标准化无意义）；NaN/None 不参与、保持原中性逻辑。
+        """
+        from core.factor_standardizer import cross_sectional_standardize
+        for s in stocks_data:
+            try:
+                s['_factor_scores'] = self.factor_lib.compute_all_factors(s, mode)
+            except Exception as e:
+                logger.warning(f"{s.get('code')} 标准化预计算失败（该股走原始分）: {str(e)[:60]}")
+                s['_factor_scores'] = {}
+        if not stocks_data:
+            return
+        factor_names = list(stocks_data[0].get('_factor_scores', {}).keys())
+        # 修复（2026-09-06 审查）：risk 不是加权因子（penalty 路径独立处理），
+        # 恒中性值进标准化只会制造虚假名次，排除
+        factor_names = [f for f in factor_names if f != 'risk']
+        n_std = 0
+        for fname in factor_names:
+            vals = {}
+            for s in stocks_data:
+                v = (s.get('_factor_scores') or {}).get(fname)
+                if v is not None:
+                    try:
+                        fv = float(v)
+                        if fv == fv:  # NaN 过滤
+                            vals[str(s.get('code'))] = fv
+                    except (TypeError, ValueError):
+                        pass
+            if len(vals) < 5:
+                continue
+            std = cross_sectional_standardize(vals, method='rank')
+            for s in stocks_data:
+                code = str(s.get('code'))
+                if std.get(code) is not None:
+                    s.setdefault('_factors_override', {})[fname] = std[code]
+            n_std += 1
+        logger.info(f"横截面因子标准化启用: {n_std}/{len(factor_names)} 个因子 "
+                    f"已按候选池 rank 0-100 重排（standardize=true）")

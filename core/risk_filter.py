@@ -110,15 +110,18 @@ class RiskFilter:
             reasons.append(f'成交额不足 ({amount/1e4:.0f}万 < {self.min_amount/1e4:.0f}万)')
             penalty = max(penalty, 0.5)
 
-        # 3. 涨停封死检查（根据板块涨跌幅限制）
+        # 3. 涨停封死检查（2026-09-05 审查报告 P0-E）
+        #    原逻辑 `pct_chg >= threshold and limit_up > 0` 为死代码：limit_up_amount
+        #    无任何数据源填充，恒为 0，涨停股从未被过滤 → 回测收益虚高（涨停价买不进）。
+        #    修复：改用代理规则 pct_chg >= 板块上限×0.98 直接硬过滤（回测/实盘统一口径）：
+        #    10%板→9.8%、20%板→19.6%、30%板→29.4%，接近涨停即视为次日无法以合理价格成交。
         if self.exclude_limit_up:
             pct_chg = stock_info.get('pct_chg', 0) or 0
-            limit_up = stock_info.get('limit_up_amount', 0) or 0
             code = stock_info.get('code', '')
             board_limit = self.get_board_limit(code)
-            threshold = board_limit * 0.95  # 留5%容差：10%→9.5%, 20%→19%, 30%→28.5%
-            if pct_chg >= threshold and limit_up > 0:
-                reasons.append(f'涨停封死(板{board_limit:.0f}%)')
+            proxy_threshold = board_limit * 0.98
+            if pct_chg >= proxy_threshold:
+                reasons.append(f'接近涨停(板{board_limit:.0f}%, {pct_chg:.2f}%≥{proxy_threshold:.2f}%)')
                 penalty = max(penalty, 0.8)
 
         # 4. 跌停检查（根据板块涨跌幅限制）
@@ -149,6 +152,16 @@ class RiskFilter:
             if lockup_check['triggered']:
                 reasons.append(lockup_check['reason'])
                 penalty = max(penalty, 1.0)
+
+        # 8. 最低上市天数（2026-09-17 T12）：config 的 min_listing_days 此前仅在
+        #    __init__ 读取、check_stock 从未使用 → 新上市次新股（上市 < N 天）未过滤。
+        #    上游在 stock_info 传入 listing_days 时校验；缺失则跳过（不误伤）。
+        #    说明：data_engine 当前无上市日期查询接口，故依赖上游提供 listing_days；
+        #    若后续接入 get_stock_basic_info 可在此回退查询（TODO）。
+        listing_days = stock_info.get('listing_days')
+        if listing_days is not None and self.min_listing_days and listing_days < self.min_listing_days:
+            reasons.append(f'上市不足({listing_days}天 < {self.min_listing_days}天)')
+            penalty = max(penalty, 0.8)
 
         passed = len(reasons) == 0 or penalty < 0.8  # 惩罚>=0.8则直接过滤
 
