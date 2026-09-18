@@ -72,17 +72,20 @@ class ScoringModel:
     DEFAULT_WEIGHTS = {
         'short': {
             # 2026-09-18 权重优化（2.2 年 OOS + IC 衰减分析，与 v1.json/config.yml 同步）：
-            # hot_theme 0.50→0.42→0.35（IC 连续 2 月下降，月度复检 2026-09）、
-            # reversal_20d 新增 0.42→0.49（承接让渡，IC 上升）
-            # （IC +0.0298 且上升）、capital_flow 0.15→0.05（coverage 2.3%+衰减）、
-            # technical/volume_price/momentum 探索位 0.03、dragon_tiger 0.02。
-            'capital_flow': 0.02,
+            # 基线（组合最优，已复现）：hot_theme 0.42 / reversal_20d 0.42（等权），
+            # momentum 0.03（与 rev 共线 ρ=−1，净反转暴露 = 0.42−0.03 = 0.39），
+            # capital_flow 0.05、technical/volume_price 0.03、dragon_tiger 0.02。
+            # 回测证据（长窗口 4-8月，当前引擎同口径）：
+            #   基线 0.42/0.42（净 0.39）→ -18.28%（A/B 验证最优）
+            #   v3 0.46/0.46（噪声压缩至 0.08）→ -22.19%（差 4pp，噪声分散作用被削弱）
+            #   偏移 0.35/0.49 → -38.20%（差 20pp，hot 降权有害）
+            'capital_flow': 0.05,
             'north_flow': 0.00,   # 2024-08 起北向官方停发，仅东财估算口径
-            'momentum': 0.00,
-            'technical': 0.02,
-            'volume_price': 0.02,
-            'hot_theme': 0.46,
-            'reversal_20d': 0.46,
+            'momentum': 0.03,
+            'technical': 0.03,
+            'volume_price': 0.03,
+            'hot_theme': 0.42,
+            'reversal_20d': 0.42,
             'dragon_tiger': 0.02,
         },
         'long': {

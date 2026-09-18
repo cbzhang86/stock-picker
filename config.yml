@@ -49,16 +49,16 @@ short_term:
     # - technical/volume_price/momentum：弱负 IC（-0.0179~-0.0298 符号稳定）→ 探索位 0.03
     # - capital_flow 0.15→0.05：coverage 2.3% + 衰减最剧烈（+0.034 → -0.021）
     # - dragon_tiger 0.02：噪声（t=-0.31）
-    capital_flow: 0.02          # 主力资金流（IC 翻负 + coverage 2.3% → 降至最低探索位）
+    capital_flow: 0.05          # 主力资金流（IC 翻负 + coverage 2.3% → 降至最低探索位）
     north_flow: 0.00            # 北向资金（2024-08 政策停公开，因子返回中性 50）
-    momentum: 0.00              # 动量（2026-09-18 审查 P2-1：与 reversal_20d 完全共线 ρ=−1 → 置 0，
+    momentum: 0.03              # 动量（2026-09-18 审查 P2-1：与 reversal_20d 完全共线 ρ=−1 → 置 0，
                                 # 净动量暴露已包含在 reversal_20d 中）
-    technical: 0.02             # 技术形态（弱负 IC，压缩噪声暴露）
-    volume_price: 0.02          # 量价配合（弱负 IC，压缩噪声暴露）
-    hot_theme: 0.46             # 题材热度（2026-09-18 最佳配置：回滚至 A/B 验证的 hot/rev 等权基线，
+    technical: 0.03             # 技术形态（弱负 IC，压缩噪声暴露）
+    volume_price: 0.03          # 量价配合（弱负 IC，压缩噪声暴露）
+    hot_theme: 0.42             # 题材热度（2026-09-18 最佳配置：回滚至 A/B 验证的 hot/rev 等权基线，
                                 # 0.35/0.49 偏移在回测中恶化 20pp；IC 衰减由月度复检持续监测）
     dragon_tiger: 0.02          # 龙虎榜信号（噪声）
-    reversal_20d: 0.46          # 反转因子（2026-09-18 最佳配置：与 hot_theme 等权 0.45/0.45，
+    reversal_20d: 0.42          # 反转因子（2026-09-18 最佳配置：与 hot_theme 等权 0.45/0.45，
                                 # 回滚至 A/B 验证的 hot/rev 平衡配比；IC +0.0298 且上升）
     size: 0.00                  # 小市值因子（权重 0 链路先行，对标 Barra Size）
     liquidity: 0.00             # 流动性因子（2026-09-18 对标 Barra Liquidity）：量比×换手率百分位
