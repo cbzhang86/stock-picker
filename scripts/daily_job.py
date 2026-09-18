@@ -333,6 +333,14 @@ def main() -> int:
         if vrc != 0:
             logger.warning(f"估值快照写入返回 {vrc}（不影响主任务结果）")
 
+    # 月度滚动复检（2026-09-18 P5③）：每月 1 日执行 IC 趋势检测 + 降权提案。
+    # 开关 maintenance.monthly_review（默认开）。失败不影响主任务退出码。
+    if datetime.now().day == 1 and _maintenance_flag('monthly_review', True):
+        logger.info("每月 1 日 → IC 月度滚动复检（降权提案，只读不自动改权重）")
+        mrc = _run('monthly_review.py')
+        if mrc != 0:
+            logger.warning(f"月度复检返回 {mrc}（不影响主任务结果）")
+
     return main_rc
 
 

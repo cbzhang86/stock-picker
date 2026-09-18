@@ -681,6 +681,18 @@ class FactorLibrary:
         # 风险 — 风控通过时 score_penalty=0 → risk_score=100
         factors['risk'] = stock_data.get('risk_score', 100)
 
+        # 流动性因子（2026-09-18 对标 Barra Liquidity）：量比 + 换手率 → 横截面百分位。
+        # 由 rank_stocks 写入 _liquidity_percentile；缺失（回测快照/无行情）→ 中性 50。
+        # 当前权重 0（v1.json/config 已登记），启用契约：OOS IC 确认 + calibrate 审批。
+        _liq_pct = stock_data.get('_liquidity_percentile')
+        factors['liquidity'] = min(_liq_pct * 100.0, 100.0) if _liq_pct is not None else 50.0
+
+        # 波动率因子（2026-09-18 对标 Barra Volatility）：20 日日收益率标准差 →
+        # 横截面百分位取反（低波动高分，Barra 低波动溢价）。由 rank_stocks 写入
+        # _volatility_percentile；缺失 → 中性 50。
+        _vol_pct = stock_data.get('_volatility_percentile')
+        factors['volatility'] = (1.0 - _vol_pct) * 100.0 if _vol_pct is not None else 50.0
+
         # 新信号因子 — 同花顺热点/板块归属/AShareHub概念/龙虎榜
         factors['hot_theme'] = self.calc_hot_theme_score(
             stock_data.get('is_hot_stock', False),

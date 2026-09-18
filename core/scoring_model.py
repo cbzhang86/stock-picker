@@ -19,6 +19,8 @@ import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
+import numpy as np
+import pandas as pd
 
 from core.factor_library import FactorLibrary
 
@@ -593,6 +595,50 @@ class ScoringModel:
                     # 大市值秩（市值<=该值占比）取反 → 小市值百分位
                     big_rank = sum(1 for v in mcap_values if v <= mv) / len(mcap_values)
                     s['_size_percentile'] = 1.0 - big_rank
+
+        # R-C（2026-09-18 对标 Barra Liquidity）：流动性因子横截面百分位——
+        # 量比与换手率的均值百分位（高流动性=高换手=高分）。
+        # 权重 0 链路先行（对标 Barra Liquidity 因子，当前缺失维度）。
+        # 启用条件：OOS IC 确认 + calibrate 审批（与 size 同一契约）。
+        liq_vals = []
+        for s in stocks_data:
+            vr = s.get('volume_ratio')
+            to = s.get('turnover')
+            if vr and vr > 0 and to is not None:
+                try:
+                    liq_vals.append((s, float(vr) * float(to)))
+                except (TypeError, ValueError):
+                    pass
+        if liq_vals:
+            liq_sorted = sorted(v for _, v in liq_vals)
+            n = len(liq_sorted)
+            for s, combined in liq_vals:
+                rank = sum(1 for _, v in liq_vals if v <= combined) / n
+                s['_liquidity_percentile'] = rank
+
+        # R-D（2026-09-18 对标 Barra Volatility）：波动率因子——20 日日收益率标准差
+        # 横截面百分位取反（低波动=高分，Barra 低波动溢价）。
+        # 由 kline 数据计算，rank_stocks 已有 kline_df 可算。
+        for s in stocks_data:
+            kline = s.get('kline_df')
+            if kline is not None and isinstance(kline, pd.DataFrame) and len(kline) >= 20:
+                try:
+                    close = kline['close'].astype(float)
+                    rets = close.pct_change().dropna()
+                    if len(rets) >= 20:
+                        vol_20d = float(rets.tail(20).std())
+                        if vol_20d > 0:
+                            s['_volatility_raw'] = vol_20d
+                except Exception:
+                    pass
+        vol_raws = [(s, s['_volatility_raw']) for s in stocks_data
+                    if '_volatility_raw' in s]
+        if vol_raws:
+            sorted_vols = sorted(v for _, v in vol_raws)
+            n_v = len(sorted_vols)
+            for s, v in vol_raws:
+                rank = sum(1 for _, x in vol_raws if x <= v) / n_v
+                s['_volatility_percentile'] = rank  # 高波动 → 高百分位 → 低分
 
         # P2-K（2026-09-05 审查报告）：横截面因子标准化（实验开关）。
         # 批量预计算因子分 → 每个因子横截面 rank 0-100 → 写入 _factors_override，
