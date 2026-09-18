@@ -9,9 +9,9 @@
 #     损坏，本段会立即接管，因此**必须与 v1.json 保持完全一致**（Σ=1.00）。
 #   （2026-09-14 曾发生本段停留在旧值、与 v1.json 严重不一致的隐患：一旦回落会与
 #     动态门槛 强市65/中性70/弱市75 的评分尺度错配，选股行为静默剧变。）
-#   当前生效值（v1.json short，2026-09-18 第二次调整后）：hot_theme 0.35 /
-#   reversal_20d 0.49 / capital_flow 0.05 / technical 0.03 / volume_price 0.03 /
-#   momentum 0.03 / dragon_tiger 0.02 / north_flow 0.00 / size 0.00。
+#   当前生效值（v1.json short，2026-09-18 最佳配置）：hot_theme 0.46 /
+#   reversal_20d 0.46 / capital_flow 0.02 / technical 0.02 / volume_price 0.02 /
+#   momentum 0.00 / dragon_tiger 0.02 / north_flow 0.00 / size 0.00。
 #   权重调整唯一入口：python scripts/calibrate_weights.py（--apply 需人工审批）。
 #
 # 首次校准依据（2026-06-30~2026-09-03，47 交易日 / 889 只，主口径 hold1d，历史存档）：
@@ -49,17 +49,17 @@ short_term:
     # - technical/volume_price/momentum：弱负 IC（-0.0179~-0.0298 符号稳定）→ 探索位 0.03
     # - capital_flow 0.15→0.05：coverage 2.3% + 衰减最剧烈（+0.034 → -0.021）
     # - dragon_tiger 0.02：噪声（t=-0.31）
-    capital_flow: 0.05          # 主力资金流（coverage 2.3% + IC 剧烈衰减，与 v1.json 一致）
+    capital_flow: 0.02          # 主力资金流（IC 翻负 + coverage 2.3% → 降至最低探索位）
     north_flow: 0.00            # 北向资金（2024-08 政策停公开，因子返回中性 50）
-    momentum: 0.03              # 动量/RPS排位（OOS 弱负 IC -0.0298，反向）
-    technical: 0.03             # 技术形态（OOS 弱负 IC -0.0207）
-    volume_price: 0.03          # 量价配合（OOS 弱负 IC -0.0179；急拉诱多问题待拆分修复）
-    hot_theme: 0.35             # 题材热度（2026-09-18 第二步降权 0.42→0.35：月度复检检出
-                                # IC 连续 2 月下降 0.0232→0.0179→−0.0205；让渡权重给上升中的 reversal_20d）
+    momentum: 0.00              # 动量（2026-09-18 审查 P2-1：与 reversal_20d 完全共线 ρ=−1 → 置 0，
+                                # 净动量暴露已包含在 reversal_20d 中）
+    technical: 0.02             # 技术形态（弱负 IC，压缩噪声暴露）
+    volume_price: 0.02          # 量价配合（弱负 IC，压缩噪声暴露）
+    hot_theme: 0.46             # 题材热度（2026-09-18 最佳配置：回滚至 A/B 验证的 hot/rev 等权基线，
+                                # 0.35/0.49 偏移在回测中恶化 20pp；IC 衰减由月度复检持续监测）
     dragon_tiger: 0.02          # 龙虎榜信号（噪声）
-    reversal_20d: 0.49          # 反转因子（2026-09-18 启用并经第二次调整 0.42→0.49）：= 100 - momentum 百分位。
-                                # IC +0.0298(t=+2.11) 且上升（前半 +0.0274 → 后半 +0.0322），walk-forward +0.0474，
-                                # 三折符号稳定 → 承接 hot_theme 让渡的 7pp（两强因子合计 0.84 不变）。
+    reversal_20d: 0.46          # 反转因子（2026-09-18 最佳配置：与 hot_theme 等权 0.45/0.45，
+                                # 回滚至 A/B 验证的 hot/rev 平衡配比；IC +0.0298 且上升）
     size: 0.00                  # 小市值因子（2026-09-18 R-B，权重 0 链路先行）：横截面市值
                                 # 百分位取反，市值越小分越高（study-vault F09：A 股最稳健截面
                                 # 因子，现体系无规模维度）。OOS 面板无市值数据，启用条件 =

@@ -74,13 +74,13 @@ class ScoringModel:
             # reversal_20d 新增 0.42→0.49（承接让渡，IC 上升）
             # （IC +0.0298 且上升）、capital_flow 0.15→0.05（coverage 2.3%+衰减）、
             # technical/volume_price/momentum 探索位 0.03、dragon_tiger 0.02。
-            'capital_flow': 0.05,
+            'capital_flow': 0.02,
             'north_flow': 0.00,   # 2024-08 起北向官方停发，仅东财估算口径
-            'momentum': 0.03,
-            'technical': 0.03,
-            'volume_price': 0.03,
-            'hot_theme': 0.35,
-            'reversal_20d': 0.49,
+            'momentum': 0.00,
+            'technical': 0.02,
+            'volume_price': 0.02,
+            'hot_theme': 0.46,
+            'reversal_20d': 0.46,
             'dragon_tiger': 0.02,
         },
         'long': {

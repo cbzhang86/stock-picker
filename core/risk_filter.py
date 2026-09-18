@@ -42,6 +42,10 @@ class RiskFilter:
         self.min_listing_days = self.config.get('min_listing_days', 60)
         self.exclude_st = self.config.get('exclude_st', True)
         self.exclude_limit_up = self.config.get('exclude_limit_up', True)
+        # 当日涨幅区间硬过滤（2026-09-18 审查 P1-1）：西部证券尾盘策略研报
+        # 实证 2%-5% 为"资金已表态但未透支"的黄金区间。默认 0=关闭（待 A/B 验证）。
+        self.pct_chg_min = self.config.get('pct_chg_min', 0)   # 最低涨幅%（0=关闭）
+        self.pct_chg_max = self.config.get('pct_chg_max', 0)   # 最高涨幅%（0=关闭）
 
     # 7. 限售解禁检查（需外部传入 data_engine，未启用则为 0）
     def check_lockup(self, code: str, data_engine=None) -> Dict:
@@ -162,6 +166,21 @@ class RiskFilter:
         if listing_days is not None and self.min_listing_days and listing_days < self.min_listing_days:
             reasons.append(f'上市不足({listing_days}天 < {self.min_listing_days}天)')
             penalty = max(penalty, 0.8)
+
+        # 9. 当日涨幅区间硬过滤（2026-09-18 审查 P1-1）：2%-5% 为尾盘策略黄金区间。
+        #    pct_chg_min/pct_chg_max 任一 > 0 即启用；0 = 关闭。
+        pct = stock_info.get('pct_chg')
+        if pct is not None:
+            try:
+                pct = float(pct)
+                if self.pct_chg_min > 0 and pct < self.pct_chg_min:
+                    reasons.append(f'涨幅不足({pct:.1f}% < {self.pct_chg_min}%)')
+                    penalty = max(penalty, 0.8)
+                if self.pct_chg_max > 0 and pct > self.pct_chg_max:
+                    reasons.append(f'涨幅过高({pct:.1f}% > {self.pct_chg_max}%)')
+                    penalty = max(penalty, 0.8)
+            except (TypeError, ValueError):
+                pass
 
         passed = len(reasons) == 0 or penalty < 0.8  # 惩罚>=0.8则直接过滤
 
