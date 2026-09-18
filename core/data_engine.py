@@ -41,6 +41,12 @@ os.environ['no_proxy'] = '*'
 
 logger = logging.getLogger(__name__)
 
+# 东财 datacenter 公开 Web token（2026-09-18 全项目审查 P3）：原硬编码在多处 URL 中，
+# 现集中定义并支持环境变量覆盖（限流/吊销时可替换）。该 token 是东财网页端公开值，
+# 非私密凭据；仍不应散落在业务代码里。
+EASTMONEY_WEB_TOKEN = os.environ.get('EASTMONEY_TOKEN',
+                                     '894050c76af8597a853f5b408b759f5d')
+
 
 def sanitize_nan(obj):
     """递归清洗 NaN/Inf → None（2026-09-05 审查 P2-7）
@@ -240,6 +246,14 @@ class DataEngine:
                 conn.execute("ALTER TABLE fin_cache ADD COLUMN fetched_at TEXT")
             except Exception:
                 pass
+            # 2026-09-18 审查修复（性能 P2）：kline_cache 主键为 (code,date)，
+            # `WHERE date>=? AND date<=?` 无可用索引 → 对 300 万行**全表 SCAN**
+            # （面板构建/回测预热/预取均受影响，EXPLAIN 已实测确认）。补 date 索引。
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_kline_date "
+                             "ON kline_cache(date)")
+            except Exception as e:
+                logger.warning(f"kline date 索引创建失败（不影响功能，仅性能）: {str(e)[:60]}")
             conn.commit()
         except Exception as e:
             logger.warning(f"K线缓存初始化失败: {e}")
@@ -528,7 +542,12 @@ class DataEngine:
             return None
         except Exception as e:
             logger.warning(f"mootdx K线失败 {code}: {str(e)[:50]}")
-        return None
+            return None
+        finally:
+            # 2026-09-18 审查修复（P2-8）：socket.setdefaulttimeout 是**进程级**全局设置，
+            # 原实现设置后从不复原 → 污染同进程内所有后续网络调用（长进程 cron / 测试）。
+            # 用 finally 保证任何路径（含异常/提前 return）都恢复原值。
+            socket.setdefaulttimeout(old_timeout)
 
     def _fetch_kline_sina(self, code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
         """
@@ -724,8 +743,10 @@ class DataEngine:
                     data = json.load(f)
                 if data.get('date') == today:
                     return int(data.get('used', 0))
-        except Exception:
-            pass
+        except Exception as e:
+            # 2026-09-18 审查 P2-7：配额账本读失败若静默归 0 → 可能超发（触发服务端
+            # 429 → 因子静默中性化）。这里必须"响一声"，便于事后归因。
+            logger.warning(f"配额账本读取失败（按 0 计数，存在超发风险）: {str(e)[:80]}")
         return 0
 
     def _write_quota_atomic(self, used: int, today: str = None):
@@ -1837,8 +1858,8 @@ class DataEngine:
             url = ("https://datacenter-web.eastmoney.com/securities/api/data/v1/get"
                    "?reportName=RPT_MUTUAL_NETINFLOW_DETAILS"
                    "&columns=DIRECTION_TYPE,TRADE_DATE,NET_INFLOW_SH,NET_INFLOW_SZ,NET_INFLOW_BOTH,TIME_TYPE"
-                   "&token=894050c76af8597a853f5b408b759f5d"
-                   "&client=WEB"
+                   + "&token=" + EASTMONEY_WEB_TOKEN
+                   + "&client=WEB"
                    "&filter=(DIRECTION_TYPE=%222%22)(TIME_TYPE=%221%22)"
                    "&sortColumns=TRADE_DATE&sortTypes=-1&pageSize=1")
             headers = {

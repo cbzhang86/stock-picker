@@ -96,6 +96,11 @@ class BacktestEngine:
         #     使"弱市压缩 0.5 / 波动保险丝 / 连亏压缩 / 拥挤度分档"等仓位机制**第一次可被
         #     回测验证**。⚠️ 与 normalized 不可直接比较历史净值（口径不同），A/B 需同口径。
         self.sizing_mode = str(self.config.get('sizing_mode', 'normalized')).lower()
+        # 涨跌停可成交性建模（2026-09-18 全项目审查 P2-2 修复）：
+        #   买入端：T+1 开盘价 ≥ 涨停价 → 视为不可买入（涨停封板无卖单），跳过该笔；
+        #   持有端：一字跌停（open/high 均 ≤ 跌停价）→ 当日无法卖出，顺延到下一交易日。
+        #   默认 True（更接近真实约束）；置 false 可复现历史口径（早期回测未建模）。
+        self.tradability_check = bool(self.config.get('tradability_check', True))
         if self.sizing_mode not in ('normalized', 'absolute'):
             logger.warning(f"未知 sizing_mode={self.sizing_mode}，回落 normalized")
             self.sizing_mode = 'normalized'
@@ -524,6 +529,48 @@ class BacktestEngine:
         return result
 
     # ── 成交假设（架构对标 #5）────────────────────────────────
+
+    @staticmethod
+    def _limit_pct(code: str) -> float:
+        """涨跌停幅度（2026-09-18 审查 P2-2）：与 risk_filter/策略口径一致。"""
+        c = str(code).zfill(6)
+        if c.startswith(('300', '301', '688', '689')):
+            return 0.20          # 创业板/科创板 20cm
+        if c.startswith(('4', '8', '92')):
+            return 0.30          # 北交所 30cm
+        return 0.10              # 主板 10cm
+
+    def _limit_price(self, code: str, prev_close: float, up: bool) -> float:
+        """涨/跌停价（A 股按前收盘价 × (1±幅度) 四舍五入到分）。"""
+        pct = self._limit_pct(code)
+        pct = pct if up else -pct
+        try:
+            return round(float(prev_close) * (1 + pct), 2)
+        except (TypeError, ValueError):
+            return float('nan')
+
+    def _buy_blocked_by_limit_up(self, code: str, prev_close, fill) -> bool:
+        """买入端：开盘价 ≥ 涨停价 → 封板无卖单，不可买入（保守建模）。"""
+        if not self.tradability_check or not prev_close or not fill:
+            return False
+        lp = self._limit_price(code, prev_close, up=True)
+        return bool(lp == lp and fill >= lp - 1e-6)
+
+    def _exit_blocked_by_limit_down(self, code: str, prev_close, o, h) -> bool:
+        """持有端：一字跌停（open 与 high 均在跌停价） → 当日无买盘，无法卖出。
+
+        只拦"一字跌停"（open<=跌停 且 high<=跌停）；盘中触及跌停但曾打开
+        （high > 跌停价）仍可按规则成交——这是保守但不过度悲观的假设。
+        """
+        if not self.tradability_check or not prev_close:
+            return False
+        ld = self._limit_price(code, prev_close, up=False)
+        if ld != ld:
+            return False
+        try:
+            return float(o) <= ld + 1e-6 and float(h) <= ld + 1e-6
+        except (TypeError, ValueError):
+            return False
 
     def _slippage_for(self, order_value) -> float:
         """按【单笔委托金额】取分层滑点，与 scripts/capacity_check.py::lookup_slippage 同语义。
@@ -1102,6 +1149,14 @@ class BacktestEngine:
                     fill = float(row['open'])
                     if fill <= 0:
                         continue
+                    # 成交可行性（2026-09-18 审查 P2-2）：T+1 开盘即涨停 → 无卖单，不可买入。
+                    # 该笔直接放弃（不进入 still_pending，避免无限顺延；实盘亦无法追入）。
+                    if self._buy_blocked_by_limit_up(
+                            rec['code'],
+                            float(klines[key].iloc[row_i - 1]['close']) if row_i > 0 else None,
+                            fill):
+                        logger.debug(f"跳过买入 {rec['code']}@{d}：开盘涨停不可成交")
+                        continue
                     # 缺陷1：先算 allocated 再取滑点（单笔委托金额为入参）；
                     # 缺陷2：allocated 以固定 base_equity 为基数（与循环顺序无关）。
                     # 仓位口径分叉（2026-09-18）：normalized=按当日委托合计归一化
@@ -1166,6 +1221,15 @@ class BacktestEngine:
                 pos['held_days'] += 1
                 row = klines[pos['key']].iloc[row_i]
                 o, h, l = float(row['open']), float(row['high']), float(row['low'])
+                # 成交可行性（2026-09-18 审查 P2-2）：一字跌停当日无买盘，无法卖出 →
+                # 顺延到下一交易日（持仓与浮亏照常按收盘价盯市）。
+                if self._exit_blocked_by_limit_down(
+                        code,
+                        float(klines[pos['key']].iloc[row_i - 1]['close']) if row_i > 0 else None,
+                        o, h):
+                    pos['last_close'] = float(row['close'])
+                    logger.debug(f"卖出顺延 {code}@{d}：一字跌停无法成交")
+                    continue
                 fill = pos['fill_price']
                 tp_price = fill * (1 + tp)
                 # 止损线（P2-N）：atr 模式 = min(固定止损价, fill - atr_mult×ATR14)，

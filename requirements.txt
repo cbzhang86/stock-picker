@@ -1,12 +1,22 @@
-# 核心依赖
-mootdx>=0.10.0            # 通达信 TCP 行情（K线+财务快照，永不封IP）
-requests>=2.28.0          # HTTP API 直连（腾讯行情/同花顺热点/东财）
-pandas>=2.0.0             # 数据处理与 DataFrame 操作
+# stock-picker-v2 依赖清单（2026-09-18 审查修复：补齐缺失依赖 + 设版本上限）
+#
+# 版本策略：给**上限**防止主/次版本静默升级导致行为漂移（如 pandas 3.x 语义变更
+# 会改变因子计算与回测结果）；下限保证 API 可用。如需完全可复现，请用
+# `pip freeze > constraints.txt` 锁定精确版本（本机实测组合：pandas 3.0.1 /
+# numpy 2.4.6 / scipy 1.17.1 / sklearn 1.9.0 / akshare 1.18.39 / mootdx 0.11.7）。
 
-# 辅助依赖
-numpy>=1.24.0             # 因子计算
-scikit-learn>=1.2.0       # Ridge 回归权重优化
-akshare>=1.14.0           # A 股代码列表 + 大单资金流数据
-cachetools>=5.3.0         # 实时行情内存缓存 (TTLCache)
-pyyaml>=6.0               # 配置文件加载 (config.yml)
-asharehub>=0.6.0          # 北向资金持仓数据（需免费 API Key：https://asharehub.com/console/register）
+# ---- 核心依赖（缺失会导致主流程不可用）----
+mootdx>=0.10.0,<0.12         # 通达信 TCP 行情（K线+财务快照，永不封IP）
+requests>=2.28.0,<3.0        # HTTP API 直连（腾讯行情/同花顺热点/东财）
+pandas>=2.0.0,<4.0           # 数据处理与 DataFrame 操作
+numpy>=1.24.0,<3.0           # 因子计算
+scikit-learn>=1.2.0,<2.0     # Ridge 回归权重优化
+akshare>=1.14.0,<2.0         # A股代码列表 + 大单资金流 + 历史估值（backfill_valuation_history）
+cachetools>=5.3.0,<8.0       # 实时行情内存缓存 (TTLCache)
+pyyaml>=6.0,<7.0             # 配置文件加载 (config.yml)
+asharehub>=0.6.0,<1.0        # 北向资金持仓数据（需免费 API Key：https://asharehub.com/console/register）
+scipy>=1.10.0,<2.0           # IC/统计检验（oos_validator、因子分析脚本）
+
+# ---- 可选依赖（均函数内懒加载：缺失只影响对应功能，不阻断主流程）----
+baostock>=0.8.8,<1.0         # 仅前复权回退路径（core/data_engine.py adjust='qfq'）
+matplotlib>=3.7,<4.0         # 仅 scripts/mc_bootstrap.py 图表输出

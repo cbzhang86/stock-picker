@@ -251,8 +251,10 @@ class BacktestStore:
                 if d.get(k):
                     try:
                         d[k] = json.loads(d[k])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # 2026-09-18 审查 P2-7：溯源字段解析失败必须留痕（否则回测
+                        # 可复现性悄悄降级：config/滑点快照变成原始字符串）。
+                        logger.warning(f"run_meta 字段 {k} 解析失败（保留原值）: {str(e)[:60]}")
             return d
         except Exception as e:
             logger.warning(f"run_meta 读取失败: {str(e)[:60]}")

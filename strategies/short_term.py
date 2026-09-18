@@ -1472,6 +1472,18 @@ class ShortTermStrategy(BaseStrategy):
             weight_desc = '+'.join(parts) if parts else '见 data/weights/v1.json'
         except Exception:
             weight_desc = '见 data/weights/v1.json'
-        return (f"短线尾盘策略: T+0尾盘选股 → T+1开盘卖出。"
+        # 卖出规则从 config 实时读取（避免文档与配置脱节；2026-09-18 审查 P1-2 修复）
+        try:
+            _sell = (self.config or {}).get('sell') or {}
+            _tp = float(_sell.get('take_profit', 0.02) or 0.02)
+            _sl = float(_sell.get('stop_loss', -0.02) or -0.02)
+            _td = int(_sell.get('time_stop_days', 3) or 3)
+        except (TypeError, ValueError):
+            _tp, _sl, _td = 0.02, -0.02, 3
+        return (f"短线尾盘策略: T+0 尾盘选股（14:50），买入时点与卖出一律按 "
+                f"config.yml 的约定执行——backtest 口径为 T+1 开盘买入，"
+                f"实盘为尾盘买入（两者相差一个隔夜跳空，见 oos_validator 说明）；"
+                f"卖出按 config.yml > sell 规则（止盈 {_tp:.0%} / 止损 {_sl:.0%} / "
+                f"T+{_td} 时间止损）。"
                 f"实际生效因子权重: {weight_desc}。"
                 f"含市场环境评估，极差市自动跳过。")

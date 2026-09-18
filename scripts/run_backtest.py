@@ -95,6 +95,9 @@ def main():
                         metavar='SPEC',
                         help='覆盖拥挤度分档仓位（R1 A/B）："off" 关闭，或 '
                              '"1.5:0.25,0.5:0.5" 形式。不修改 config.yml')
+    parser.add_argument('--tradability', choices=['on', 'off'], default=None,
+                        help='涨跌停可成交性建模开关（A/B 用，默认读 config）：'
+                             'off = 复现历史口径（不建模涨停不可买/跌停不可卖）')
     parser.add_argument('--sizing-mode', choices=['normalized', 'absolute'], default=None,
                         help='仓位口径：normalized=按当日委托合计归一化（默认，尺度不变，'
                              '只衡量选股质量）/ absolute=按 alloc%% 绝对投入（未投出留现金，'
@@ -203,6 +206,9 @@ def main():
         logger.info("仓位机制栈已全部关闭（weak_market/vol_breaker/losing_streak/crowding）")
     elif getattr(args, 'position_scaling', None) == 'on':
         logger.info("仓位机制栈保持开启（使用 config 配置）")
+    if getattr(args, 'tradability', None):
+        full_config['tradability_check'] = (args.tradability == 'on')
+        logger.info(f"涨跌停可成交性建模: {args.tradability}")
     if getattr(args, 'sizing_mode', None):
         full_config['sizing_mode'] = args.sizing_mode
         logger.info(f"仓位口径覆盖: sizing_mode={args.sizing_mode}")

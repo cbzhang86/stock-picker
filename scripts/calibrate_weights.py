@@ -45,7 +45,7 @@ import logging
 import os
 import sys
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -387,7 +387,9 @@ def _enforce_weight_bounds(weights: Dict[str, float],
 def calibrate(consensus: Dict[str, Dict], current_weights: Dict[str, float],
               gamma: float = IC_GAMMA,
               max_single: float = MAX_SINGLE_WEIGHT,
-              min_single: float = MIN_SINGLE_WEIGHT) -> (Dict[str, float], Dict):
+              min_single: float = MIN_SINGLE_WEIGHT,
+              include_candidates: bool = False,
+              collinear_groups: Sequence[Sequence[str]] = None) -> (Dict[str, float], Dict):
     """
     由因子证据生成权重（带先验收缩）
 
@@ -405,11 +407,37 @@ def calibrate(consensus: Dict[str, Dict], current_weights: Dict[str, float],
     IC 分配会让单期噪声主导配置；完全不动则等于无视证据。λ 会随样本积累
     自动提高。
 
+    参数：
+      include_candidates（2026-09-18 审查 P1-5 修复）：默认 False = 仅对 current_weights
+        中已有因子分配权重（历史行为）。置 True 时把"OOS 已验证为正、但尚未进入
+        v1.json"的新因子也纳入候选池（起始基准权重取 min_single），使其能拿到
+        权重提案——修复"新因子永远进不了校准"的闭环断点。
+      collinear_groups（2026-09-18 审查 P2-1）：完全共线的因子组（如
+        ('momentum', 'reversal_20d') 因 reversal=100−momentum）。组内只保留
+        证据方向更强者参与 IC 分配，避免同一信号被重复计数（另一成员在输出中
+        保留原权重并在明细里标注 collinear_skipped）。
+
     返回：(权重, 过程明细)
     """
-    universe = [f for f in current_weights if f in consensus]
+    candidates = set()
+    if include_candidates:
+        candidates = {f for f, v in (consensus or {}).items()
+                      if (v or {}).get('score', 0) > 0}
+    universe = [f for f in (set(current_weights) | candidates) if f in consensus]
+    # 共线去重：组内保留 IC 得分更高者
+    collinear_note = {}
+    if collinear_groups:
+        for group in collinear_groups:
+            present = [f for f in group if f in universe]
+            if len(present) < 2:
+                continue
+            keep = max(present, key=lambda f: (consensus.get(f, {}) or {}).get('score', 0))
+            for f in present:
+                if f != keep:
+                    universe.remove(f)
+                    collinear_note[f] = keep
     if not universe:
-        return {}, {}
+        return {}, {'collinear_skipped': collinear_note} if collinear_note else {}
 
     # 1. IC 侧权重
     scores = {f: max(0.0, consensus[f]['score']) ** gamma for f in universe}
@@ -551,6 +579,9 @@ def calibrate(consensus: Dict[str, Dict], current_weights: Dict[str, float],
         'coverage_gated': sorted(gated) if gated else [],
     })
 
+    # 共线去重结果并入明细（2026-09-18 审查 P2-1）
+    if collinear_note:
+        detail['collinear_skipped'] = collinear_note
     return {f: round(w, 4) for f, w in sorted(merged.items(), key=lambda x: -x[1])}, detail
 
 
@@ -739,6 +770,14 @@ def main():
                              '重跑即含）；ICIR 模式内置单因子上限与准入门槛，样本不足自动回退等权')
     parser.add_argument('--icir-cap', type=float, default=0.30,
                         help='icir 模式单因子权重上限（默认 0.30）')
+    # 2026-09-18 审查 P1-5 修复：允许把"OOS 已验证为正但尚未进 v1.json"的新因子
+    # 纳入候选池（否则新因子永远拿不到权重提案，闭环断点）。
+    parser.add_argument('--include-candidates', action='store_true',
+                        help='把 OOS 验证为正的新因子也纳入候选（默认关闭＝仅已生效因子）')
+    # 2026-09-18 审查 P2-1：完全共线因子组，组内只保留证据更强者参与分配。
+    parser.add_argument('--collinear-groups', default='momentum:reversal_20d',
+                        help='共线因子组（逗号分隔多组，组内用冒号），如 '
+                             '"momentum:reversal_20d"；置空字符串可关闭去重')
     args = parser.parse_args()
 
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -838,7 +877,10 @@ def main():
         logger.info("当前权重来源: config.yml（v1.json 不存在或为空）")
 
     # 4. 校准
+    _cg = [g.split(':') for g in (args.collinear_groups or '').split(',') if ':' in g]
     proposed, detail = calibrate(consensus, current, gamma=args.gamma,
+                                 include_candidates=args.include_candidates,
+                                 collinear_groups=_cg,
                                  max_single=args.max_single)
     if not proposed:
         return

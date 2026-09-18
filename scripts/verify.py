@@ -25,6 +25,14 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# 东财公开 Web token：统一取自 core.data_engine（2026-09-18 审查 P3 外置，
+# 支持环境变量 EASTMONEY_TOKEN 覆盖）。导入失败时回退内联默认值，保证 verify 可独立运行。
+try:
+    from core.data_engine import EASTMONEY_WEB_TOKEN as _EM_TOKEN
+except Exception:  # pragma: no cover - 仅在异常环境触发
+    _EM_TOKEN = os.environ.get('EASTMONEY_TOKEN',
+                               '894050c76af8597a853f5b408b759f5d')
+
 # Make project root importable.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -138,7 +146,7 @@ def check_north_flow_freshness():
         url = ("https://datacenter-web.eastmoney.com/securities/api/data/v1/get"
                 "?reportName=RPT_MUTUAL_NETINFLOW_DETAILS"
                 "&columns=DIRECTION_TYPE,TRADE_DATE,NET_INFLOW_SH,NET_INFLOW_SZ,NET_INFLOW_BOTH"
-                "&token=894050c76af8597a853f5b408b759f5d&client=WEB"
+                "&token=" + _EM_TOKEN + "&client=WEB"
                 "&filter=(DIRECTION_TYPE=%222%22)(TIME_TYPE=%221%22)"
                 "&sortColumns=TRADE_DATE&sortTypes=-1&pageSize=1")
         r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)

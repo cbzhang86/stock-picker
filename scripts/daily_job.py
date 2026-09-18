@@ -275,6 +275,15 @@ def main() -> int:
     from core.trading_calendar import beijing_now
     today = beijing_now().strftime('%Y-%m-%d')
 
+    # 2026-09-18 审查 P1-3：predictions.db 每日备份（实盘唯一真源，此前无任何备份）。
+    # 放在主任务**之前**执行——即使当日选股流程失败/中断，也保证有可恢复快照。
+    # 失败仅 warning（备份属保障性任务，不应阻断选股）。开关 maintenance.daily_db_backup。
+    if _maintenance_flag('daily_db_backup', True):
+        logger.info("追加 predictions.db 每日备份（P1-3 修复）")
+        brc = _run('backup_predictions.py', ['--keep', '14'])
+        if brc != 0:
+            logger.warning(f"predictions.db 备份返回 {brc}（不影响主任务）")
+
     if args.time_mode == 'eod':
         main_rc = _run_eod()
     elif args.time_mode == 'prefetch':

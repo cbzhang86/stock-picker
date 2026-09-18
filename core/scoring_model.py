@@ -686,7 +686,9 @@ class ScoringModel:
                         if fv == fv:  # NaN 过滤
                             vals[str(s.get('code'))] = fv
                     except (TypeError, ValueError):
-                        pass
+                        # 2026-09-18 审查 P2-7：因子值不可解析会静默减少参与标准化的
+                        # 样本量（影响因子分位），留痕便于发现上游字段漂移。
+                        logger.debug(f"因子 {fname} 值不可解析，已跳过: {v!r}")
             if len(vals) < 5:
                 continue
             std = cross_sectional_standardize(vals, method='rank')

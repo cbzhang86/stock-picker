@@ -3,15 +3,18 @@
 # ============================================================
 
 # ---- 短线策略权重 ----
-# ⚠️ 唯一事实源声明（2026-09-05 审查报告 P0-A）：
-#   实际生效权重 = data/weights/v1.json（ScoringModel 加载优先级 v1.json > config.yml，
-#   见 SKILL.md 陷阱 21）。本段数值为 2026-09-05 校准的历史草稿，【不生效】，仅作追溯记录。
+# ⚠️ 权重加载优先级（见 SKILL.md 陷阱 21）：
+#   **data/weights/v1.json  >  本段 short_term.weights  >  ScoringModel.DEFAULT_WEIGHTS**
+#   → 本段是 **兜底（fallback）**：当 v1.json 存在时本段不生效；一旦 v1.json 丢失/
+#     损坏，本段会立即接管，因此**必须与 v1.json 保持完全一致**（Σ=1.00）。
+#   （2026-09-14 曾发生本段停留在旧值、与 v1.json 严重不一致的隐患：一旦回落会与
+#     动态门槛 强市65/中性70/弱市75 的评分尺度错配，选股行为静默剧变。）
 #   当前生效值（v1.json short，2026-09-18 第二次调整后）：hot_theme 0.35 /
 #   reversal_20d 0.49 / capital_flow 0.05 / technical 0.03 / volume_price 0.03 /
 #   momentum 0.03 / dragon_tiger 0.02 / north_flow 0.00 / size 0.00。
 #   权重调整唯一入口：python scripts/calibrate_weights.py（--apply 需人工审批）。
 #
-# 校准依据（2026-06-30~2026-09-03，47 交易日 / 889 只，主口径 hold1d）：
+# 首次校准依据（2026-06-30~2026-09-03，47 交易日 / 889 只，主口径 hold1d，历史存档）：
 #   hot_theme      OOS IC +0.0651 (t=+2.17) ← 唯一统计显著的有效因子
 #   capital_flow   OOS IC +0.0056 (t=+0.11) ← 三种口径方向一致，弱正
 #   dragon_tiger   OOS IC -0.0072            ← 噪声
@@ -158,6 +161,12 @@ model:
 # ---- 回测 ----
 backtest:
   initial_capital: 1000000       # 初始资金
+  # 仓位口径（2026-09-18）：normalized=按当日委托合计归一化（默认，尺度不变，
+  # 只衡量选股质量）/ absolute=按 alloc% 绝对投入（未投出留现金，超配按比例收缩）。
+  sizing_mode: normalized
+  # 涨跌停可成交性建模（2026-09-18 全项目审查 P2-2）：true = T+1 开盘涨停不买入、
+  # 持有期一字跌停不可卖（顺延到下一交易日）；false = 复现历史口径（未建模）。
+  tradability_check: true
   commission_rate: 0.0003         # 手续费万三
   slippage: 0.001                 # 滑点 0.1%
   # ---- 交易成本补全（2026-09-05 审查报告 P0-C：原配置漏计印花税/过户费，
@@ -192,3 +201,6 @@ maintenance:
   # 市值）与估值（PE/PB）因子积累 point-in-time 历史，累计 ≥60 交易日可进 OOS 验证。
   # 默认开；置 false 可关闭。
   daily_valuation_snapshot: true
+  # predictions.db 每日备份（2026-09-18 审查 P1-3）：sqlite backup API 一致快照 →
+  # data/backup/predictions_YYYYMMDD.db，保留最近 14 份。主任务前执行（失败不阻断）。
+  daily_db_backup: true

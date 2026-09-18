@@ -75,18 +75,6 @@ class FactorLibrary:
 
     # ========== 动量因子 ==========
 
-    @staticmethod
-    def calc_rps(close_series: pd.Series, period: int = 20) -> pd.Series:
-        """
-        RPS 动量排位（Relative Price Strength）
-
-        参考：Sequoia-X rps_breakout.py line 31-39
-        用法：close_series 是某时间截面所有股票的涨幅
-        """
-        returns = close_series.pct_change(period)
-        rps = returns.rank(pct=True) * 100
-        return rps
-
     def calc_rps_score(self, rps_value: float) -> float:
         """RPS 值 → 评分（0-100）"""
         return float(np.clip(rps_value, 0, 100))
@@ -624,8 +612,8 @@ class FactorLibrary:
 
         # 反转因子（2026-09-17 T8，P3-3）：= momentum 百分位取反。
         # 依据：2.2 年全市场 OOS IC +0.0298 (t=+2.11)，walk-forward 均值 +0.0474，
-        # 三折符号稳定。当前权重 0.00（config 已登记），待 OOS 复核后由
-        # calibrate_weights 审批调整，不影响现有评分。
+        # 三折符号稳定。2026-09-18 已启用并按月度复检调至 0.49（与 momentum 完全共线，
+        # 校准器已对二者做共线去重；勿再当作两个独立信号重复加权）。
         factors['reversal_20d'] = 100.0 - factors.get('momentum', 50.0)
 
         # 小市值因子（2026-09-18 R-B）：横截面百分位（市值越小分越高），

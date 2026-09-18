@@ -21,8 +21,13 @@
 - **因子口径对齐实盘**：momentum 用横截面 RPS 排位（不是原始涨幅）、
   capital_flow 用当日横截面百分位、volume_price 用与 factor_library 相同的
   量比映射函数 —— 避免"回测算 A 口径、实盘用 B 口径"的错位
-- **收益口径**：主口径 `open_t1 → close_t1`（尾盘选股 → T+1 开盘买 → 收盘卖，
-  与实盘成交一致）；同时输出 `close_t0 → open_t1` 隔夜口径做对照
+- **收益口径（重要：与实盘执行存在已知差异，勿混用）**：
+  主口径 `open_t1 → close_t1`（尾盘选股 → **T+1 开盘买入** → 当日收盘卖出）。
+  ⚠️ 该口径**不等于**实盘执行方式：实盘是**尾盘（14:50）买入**，两者相差一个
+  **隔夜跳空（close_t0 → open_t1，实测均值 −0.21%/笔，t=−1.14 不显著但方向为负）**；
+  即回测数字对应的是"次日开盘买入"策略，对"尾盘买入"实盘存在系统性偏差
+  （2026-09-18 全项目审查 P1-1 更正，原文误称"与实盘成交一致"）。
+  同时输出 `close_t0 → open_t1` 隔夜口径做对照。
 - **时间切分**：按日期排序切 train/test，只用训练集挑因子、在测试集上报 IC
 - **每日横截面 IC**：先在每个交易日内部算 Spearman 相关，得到 IC 时间序列，
   再对序列求均值/标准差 → ICIR、t 值。这比把全部日期池化算一个相关系数
@@ -463,6 +468,12 @@ class OOSValidator:
                     conn, params=(start_date, end_date))
                 if not hot.empty:
                     # 实盘口径：is_hot → +20（无 blocks/concepts 时的基线）
+                    # ⚠️ 2026-09-18 全项目审查 P2-3（已知口径差）：实盘
+                    # `factor_library.calc_hot_theme_score` 还会叠加"板块涨幅 +15 /
+                    # 板块龙头 +5"（可达 85-90 分），而 OOS 面板**无板块快照**，
+                    # 只能用 70/50 二值近似 → **OOS 会低估 hot_theme 的区分度**，
+                    # 进而可能低估其 IC 与应有权重。待 blocks/concepts 历史快照
+                    # 积累后应改用与实盘同口径复算（见 docs 全项目审查报告 P2-3）。
                     hot['hot_theme'] = 70.0
                     df = df.merge(hot[['date', 'code', 'hot_theme']],
                                   on=['date', 'code'], how='left')
