@@ -80,7 +80,7 @@ Solved by:
 7. **Portfolio Optimization** — score-weighted allocation, max 40% per stock, min 10% floor
 8. **Three Missing-Data Semantics** (V4.4) — a missing factor **cedes** its weight to factors that do have data (never faked as a neutral 50), an under-covered expert dimension **abstains**, everything else is counted as-is; every site declares which one applies, aligned with the NaN-dropping caliber used by OOS
 9. **Expert Ensemble Second Opinion** — 5 independent dimensions cross-checked against the main model: agreement nudges up, disagreement downweights, severe conflicts (Δ>25) flagged and position cut; dimension coverage below 40% means **abstention** instead of blind score-dragging (`MIN_EXPERT_COVERAGE=0.40`)
-10. **Portfolio Risk Triple** — max 2 stocks per sector + pairwise correlation cap 0.85 + volatility fuse (market median |chg| > 3% scales positions down)
+10. **Portfolio Risk Triple** — max 2 stocks per sector + pairwise correlation cap 0.85 + volatility fuse (market median abs-chg > 3% scales positions down)
 11. **Chase-high Penalty** — same-day gain >7% linearly cuts the score (up to -50%), grounded in the A-share short-term reversal effect
 12. **Postmortem Reconciliation Loop** (V4.4) — a structured note per Top-5 name daily (the LLM fills only thesis / key_factors / prediction / missed_risk), with realized outcome backfilled programmatically and cross-checked; a weekly hit rate ≤50% trips a circuit breaker; monthly distillation turns frequent tags on bad notes into candidate rules (LLM proposes hypotheses, quantitative validation decides adoption)
 
@@ -92,6 +92,7 @@ Solved by:
 4. V4.4 primary calibration path: `calibrate_weights.py` allocates by walk-forward OOS IC (pessimistic value across three return conventions, negative-IC zeroed, single-factor cap 0.50); `--apply` has a **dual gate** — manual approval plus explicit `--accept-ic-objective` (the IC objective is known to diverge from the tail-return criterion, so a human must reconcile them first). A refusal exits with code 2 and leaves `v1.json` untouched
 5. New weights persist to `v1.json` (load order v1.json > config.yml > DEFAULT_WEIGHTS), auto-loaded on next startup
 6. Collapse protection (skip if single factor ≥ 80%), missing columns auto-fill 0.5
+
 ---
 
 ## Quick Start
@@ -216,6 +217,7 @@ python scripts/verify.py
 Strong market **65** / neutral **70** / weak **75** (`config.yml` baseline 75, overridable via `dynamic_min_score`).
 
 ⚠️ After switching to Plan G the score distribution **divides rather than shifts** (the hot cluster concentrates higher, non-hot mass moves down): the weak-market 75 threshold's "days with a recommendation" rises from 92.5% to 97.5% (+5.0pp), while strong/neutral markets barely move. **The threshold values were NOT changed** — no threshold edits without real data; recalibration waits for ≥15 trading days of `run_context` observations (`recalibrate_thresholds.py --from-run-context`).
+
 ---
 
 ## Backtest Engine
@@ -301,6 +303,7 @@ All three must agree; changing one alone raises a warning (semantic comparison, 
 | Volatility **level** component | Superseded by the deviation | vol_dev ICIR 0.225 > vol_level 0.126 |
 | Equal-weight 4-leg (best-IC plan) | Rejected | Highest IC yet barely profitable (+0.13%/day, t=2.4) |
 | Coordinate-refined "train optimum" | Rejected | Higher train t (18.0), worse holdout (+1.754%) — a textbook overfitting signature |
+
 ---
 
 ## System Architecture
