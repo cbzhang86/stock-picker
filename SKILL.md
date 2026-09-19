@@ -87,6 +87,7 @@ v1.json > config.yml > DEFAULT_WEIGHTS，三层已同步一致，有测试锁定
 已同步为 G 值。权重改动唯一入口 `scripts/calibrate_weights.py`——按 OOS IC 校准，
 `--apply` 有双闸门：人工审批 + `--accept-ic-objective` 显式确认（IC 目标与 2026-09-19
 尾部收益判据存在已知分歧，--apply 前必须人工对照）；被拒时退出码 2 且不动 v1.json。
+
 **禁止手改数字。**
 
 **权重判据（本项目最重要的经验）**：不是 IC 有多高，而是"选出来的那几只赚不赚钱"
@@ -129,7 +130,11 @@ ensemble=model，不构成第二意见、不做任何调整）。
 
 - ASHareHub 4 端共享日配额 100 次（本地安全闸门 90，预留 10 次），用满静默降级 + 简报首屏警示，熔断 10 分钟自动恢复（`_recover_sources()`）
 - 独立熔断源：`_source_available` 8 个（big_deal / ths_fund_flow / north_flow / lockup / asharehub_moneyflow / asharehub_tech_factors / asharehub_concepts / asharehub_financial）；健康报告 `_source_status` 16 键全登记
-- **新增数据源/新因子必须同步登记**：两个字典键名一致（漏登记 = 熔断生效但报告全绿的静默缺陷，2026-09-03/09-19 两轮修复）；`_SOURCE_FACTOR_IMPACT` 降级影响表（K 线源故障波及 liq_dev / vol_dev / volatility / liquidity / reversal_20d，漏登记 = 警示严重低估）——两者均有守卫测试锁定**V4.4 新增架构（2026-09-18 ~ 09-19）**
+- **新增数据源/新因子必须同步登记**：两个字典键名一致（漏登记 = 熔断生效但报告全绿的静默缺陷，2026-09-03/09-19 两轮修复）；`_SOURCE_FACTOR_IMPACT` 降级影响表（K 线源故障波及 liq_dev / vol_dev / volatility / liquidity / reversal_20d，漏登记 = 警示严重低估）——两者均有守卫测试锁定
+
+---
+
+**V4.4 新增架构（2026-09-18 ~ 09-19）**
 
 - `core/factor_library.py` / `core/scoring_model.py` — liq_dev / vol_dev 偏离因子 + rank_stocks 百分位计算（kline_df 60 日窗口，零 AShareHub 配额）
 - `scripts/postmortem.py` — 复盘笔记系统：结构化落库（LLM 只填 thesis / missed_risk / key_factors / prediction 四字段）+ 程序回填 realized_outcome/verdict 防自评自嗨 + 周命中率 ≤50% 熔断 + 月度 bad 笔记蒸馏候选规则（LLM 产生假设，量化验证决定采纳）；笔记库 `data/cache/postmortem_notes.db`
