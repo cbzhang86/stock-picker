@@ -158,7 +158,9 @@ python scripts/recalibrate_thresholds.py --from-run-context
 
 # 健康检查（9 项）
 python scripts/verify.py
-```---
+```
+
+---
 
 ## 短线策略
 
@@ -254,7 +256,9 @@ python scripts/verify.py
 
 - 资金流 / 题材 / 龙虎榜 / 北向数据在回测中不可用 —— 当日大单不可回溯
 - mootdx 提供约 600 个交易日（~2.5 年），无法回测更早区间
-- 全区间回测（260 交易日）为 CPU 密集，需 6+ 小时；验证改动请用短窗口对比 `--list` 历史基准---
+- 全区间回测（260 交易日）为 CPU 密集，需 6+ 小时；验证改动请用短窗口对比 `--list` 历史基准
+
+---
 
 ## 权重体系
 
