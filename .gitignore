@@ -26,6 +26,9 @@ data/cache/codes_cache.json
 
 # 工作区 / 归档
 docs/
+
+# WorkBuddy 自动化运行时状态（记忆/工件，不属仓库内容）
+.workbuddy/
 stock-picker.code-workspace
 .claude/
 .env
