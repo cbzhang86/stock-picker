@@ -2,6 +2,11 @@
 
 数据源优先级速查、熔断机制、编码铁律、常见陷阱。每次操作前快速过一遍。
 
+> 版本：V4.4（稳定版 v-G，2026-09-19 代码冻结，观察期）。生效权重 = 方案G
+> （`data/weights/v1.json`：hot_theme 0.55 主导 + liq_dev 0.14 / reversal_20d 0.10 /
+> vol_dev 0.07 / volatility 0.06 + 噪声腿 0.08）。新系统：复盘笔记 `postmortem.py`、
+> 门槛重校 `recalibrate_thresholds.py`。完整陷阱清单（编号 1-31）见 SKILL.md。
+
 ---
 
 **数据源优先级（从高到低）**
@@ -89,21 +94,19 @@ _source_available = {
 **权重加载顺序**
 
 ```python
+# 生效权重唯一来源 = data/weights/v1.json（方案G，2026-09-19）
 # 正确 — 从 config.yml 的 weights 段加载
 weights_cfg = config.get('weights', config.get('weights_model'))
 ScoringModel(weights=weights_cfg if weights_cfg else None, sell_config=config.get('sell', {}))
-
-# 错误 — weights_model 在 config.yml 里不存在
-ScoringModel(weights=config.get('weights_model'))
 ```
 
 ScoringModel 权重加载优先级：
-1. `data/weights/v1.json`（优化器写入的，优先于 config 传入）
-2. 构造参数 `weights`（来自 config.yml 的 weights 段）
-3. `DEFAULT_WEIGHTS`（代码硬编码）
+1. `data/weights/v1.json`（方案G 生效层，优先于 config 传入）
+2. 构造参数 `weights`（来自 config.yml 的 weights 段，已同步为 G 值）
+3. `DEFAULT_WEIGHTS`（代码硬编码，已同步为 G 值）
 
-如果 v1.json 与 config 不一致，config 权重会被忽略并记录 warning。
-ScoringModel 不再写入 v1.json（仅优化器三段式写入）。
+三层已一致；不一致时 config 权重被忽略并记录 warning（语义比较，只报真不一致）。
+ScoringModel 不写入 v1.json——权重改动唯一入口 `calibrate_weights.py`（双闸门）。
 
 止盈止损值从 `sell_config` 读取（即 `config.yml` 的 `short_term.sell` 段），不再硬编码 2%/2%。
 
@@ -118,7 +121,7 @@ ScoringModel 不再写入 v1.json（仅优化器三段式写入）。
 5. **不要手动改 predictions.db** — SQLite 结构固定，改坏影响权重优化。
 6. **回测不要用 np.random** — 回测引擎已全部用真实 K 线。
 7. **不要同时跑多个策略实例** — mootdx TCP 连接和 SQLite 缓存有状态。
-8. **不要直接调 akshare 东财接口** — 境外网络不通，走大单缓存。
+8. **不要直接调 akshare 东财接口** — 直连会被 WAF 拦，走大单缓存 / em_get 限流。
 9. **Config 权重字段名是 `short_term.weights`** — 不是 `short_term.weights_model`。
 10. **Baostock 复权参数** — 回测用 `adjustflag='1'`（后复权），不是 `'2'`（前复权）。
 11. **北向回测语义** — 回测中北向因子恒定为 50（中性值），因北向数据不可回溯。
@@ -136,7 +139,32 @@ ScoringModel 不再写入 v1.json（仅优化器三段式写入）。
 
 ---
 
-**V2 速查（新架构补充）**
+**V4.4 速查（2026-09-18 ~ 09-19 新架构）**
+
+- `scripts/postmortem.py` — 复盘笔记（预测-对账闭环）：LLM 只填 thesis/missed_risk/key_factors/prediction；程序回填 realized_outcome/verdict；周命中率 ≤50% 熔断（退出码 1）；笔记库 `data/cache/postmortem_notes.db`
+- `scripts/recalibrate_thresholds.py` — 门槛重校双模式（`--from-run-context` 实测 / `--oos-proxy` OOS 代理），样本不足返回码 1 不产伪结论
+- `scripts/snapshot_valuation_daily.py` — 估值快照（2026-09-18 起每日积累，≥60 交易日启用 OOS）
+- `scripts/backup_predictions.py` — predictions.db 每日备份
+- `core/scoring_model.py` — 方案G 权重三层 + liq_dev/vol_dev 偏离因子 + rank_stocks 百分位（kline_df 60 日窗口，零 AShareHub 配额）
+- `core/expert_ensemble.py` — 覆盖率门控 `MIN_EXPERT_COVERAGE=0.40`（数据不足弃权 `low_coverage`，不再失明压分）
+- `scripts/calibrate_weights.py` — `--apply` 双闸门（人工审批 + `--accept-ic-objective`）；被拒退出码 2 且 v1.json 不动
+- 影子推荐：极端市况照常评分落库 `mode='shadow'` 但不下发（开关 `short_term.shadow_enabled`，默认 true）
+- 守卫测试 `tests/test_audit_fixes_20260919.py`（16 例）：让渡白名单 / 数据源依赖表 / 退出码三守卫
+- **回测口径**：open_t1 唯一有效（次日开盘买）；close_t0 已于 2026-09-17 移除
+
+**V4.4 陷阱补充（23-31，完整版见 SKILL.md）**
+
+23. **IC 不是权重的判据** — 等权 4 腿 IC 最高（0.0743）却几乎不赚钱；权重以 Top-N 尾部收益为准
+24. **liquidity ≠ liq_dev** — 原始 liquidity 84% 是小市值效应（相关 0.838）已证伪保持 0；起用正交的 liq_dev（相关 −0.088）
+25. **NaN 是 float** — `isinstance(v, float)` 判不出 NaN，过滤用 `math.isfinite`
+26. **缺失数据三语义** — 让渡/弃权/如实计入三选一显式声明，不能默认"缺失→中性 50"
+27. **close_t0 回测分支已移除** — 唯一口径 open_t1；权重论证 ret_hold1d 口径与回测不可直接混比
+28. **影子推荐 mode='shadow'** — 7 处统计读取硬滤 mode='short'；影子行不进正式统计但自动补收益
+29. **双写源与批次防重** — 防重按"批"粒度 `has_predictions(date, mode)`；`created_at` 是 UTC（+8h 才是北京时间）；报告侧无防重会被覆盖，对账以 db 为准
+30. **calibrate --apply 双闸门** — 人工审批 + `--accept-ic-objective`；被拒退出码 2
+31. **飞书消息 vs GitHub 文档格式** — 飞书禁表格 `|` 和 `###`；GitHub 文档标准 Markdown 正常
+
+**V2 速查（旧架构，仍生效）**
 
 - `core/expert_ensemble.py` — 5 维专家第二意见：一致微调、分歧降权、冲突（Δ>25）降仓
 - `core/oos_validator.py` — walk-forward OOS IC（三口径取悲观值 + daily_ics）
