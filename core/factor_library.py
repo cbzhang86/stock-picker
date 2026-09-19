@@ -693,6 +693,18 @@ class FactorLibrary:
         _vol_pct = stock_data.get('_volatility_percentile')
         factors['volatility'] = (1.0 - _vol_pct) * 100.0 if _vol_pct is not None else 50.0
 
+        # 缩量偏离因子（2026-09-19 方案G·OOS 实证 IC+0.0654/ICIR 0.535/t+12.81）：
+        # 当日成交额相对自身 60 日常态的偏离，偏离越低（缩量/地量）→ 分越高。
+        # 由 rank_stocks 写入 _liq_dev_percentile；缺失 → 中性 50。
+        _liq_dev_pct = stock_data.get('_liq_dev_percentile')
+        factors['liq_dev'] = (1.0 - _liq_dev_pct) * 100.0 if _liq_dev_pct is not None else 50.0
+
+        # 波动收敛偏离因子（2026-09-19 方案G·OOS 实证 IC+0.0263/ICIR 0.225/t+5.37）：
+        # 20 日波动率相对自身 60 日常态的偏离，偏离越低（波动收敛）→ 分越高。
+        # 由 rank_stocks 写入 _vol_dev_percentile；缺失 → 中性 50。
+        _vol_dev_pct = stock_data.get('_vol_dev_percentile')
+        factors['vol_dev'] = (1.0 - _vol_dev_pct) * 100.0 if _vol_dev_pct is not None else 50.0
+
         # 新信号因子 — 同花顺热点/板块归属/AShareHub概念/龙虎榜
         factors['hot_theme'] = self.calc_hot_theme_score(
             stock_data.get('is_hot_stock', False),

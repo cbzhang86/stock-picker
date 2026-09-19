@@ -30,8 +30,16 @@ _MEDALS = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣']
 _SOURCE_FACTOR_IMPACT = {
     'akshare_codes': ['全部因子'],       # 代码清单缺失 → 无法选股
     'tencent_quote': ['全部因子'],       # 实时行情缺失 → 无法评分
-    'mootdx_kline': ['technical', 'volume_price', 'momentum'],
-    'baostock_kline': ['technical', 'volume_price'],
+    # 2026-09-19（全项目深查 P1-2）：K 线派生的因子不止 technical/volume_price/momentum
+    # ——2026-09-19 方案G 启用的 liq_dev / vol_dev / volatility 同源（都依赖
+    # kline_df 的 amount/close 序列），合计权重 0.27。此前未登记 → K 线源故障时
+    # 简报"受影响因子权重合计"漏算近 1/3，违反契约 #3"新增数据源需登记"。
+    # 守卫测试 tests/test_source_factor_impact_20260919.py 确保未来新增因子不再漂移。
+    # liquidity 权重 0，登记以保持映射完整。
+    'mootdx_kline': ['technical', 'volume_price', 'momentum', 'reversal_20d',
+                     'liq_dev', 'vol_dev', 'volatility', 'liquidity'],
+    'baostock_kline': ['technical', 'volume_price', 'momentum', 'reversal_20d',
+                       'liq_dev', 'vol_dev', 'volatility', 'liquidity'],
     'akshare_fund_flow': ['capital_flow'],
     'ths_fund_flow': ['capital_flow'],
     'big_deal': ['capital_flow'],
@@ -113,7 +121,15 @@ def generate_market_briefing(recommendations: List[Dict],
     lines.append("")
 
     # ── 0. 数据源降级警示（2026-09-16 P1-1：必须在首屏，先于任何结论）──
-    snapshot = source_status if source_status else de.get_data_source_summary()
+    # 2026-09-19 深查 P2-2：source_status 缺失时回退到新建 DataEngine 的 summary
+    # （其 _source_status 恒全绿）→ 降级警示会静默消失。回退必须留痕。
+    if source_status:
+        snapshot = source_status
+    else:
+        snapshot = de.get_data_source_summary()
+        logger.warning(
+            "generate_market_briefing 未收到运行期 source_status（调用方漏传）→ "
+            "回退到新建实例的默认全绿状态，本次降级警示可能不完整，请检查调用侧")
     failed = {k: v for k, v in (snapshot or {}).items()
               if not v.get('available', True)}
     if failed:

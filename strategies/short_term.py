@@ -459,7 +459,9 @@ class ShortTermStrategy(BaseStrategy):
                 f"ensemble 完成: "
                 f"{sum(1 for r in recommendations if r.get('confidence')=='high')} 高一致 / "
                 f"{sum(1 for r in recommendations if r.get('confidence')=='medium')} 中度 / "
-                f"{sum(1 for r in recommendations if r.get('confidence')=='conflict')} 冲突"
+                f"{sum(1 for r in recommendations if r.get('confidence')=='conflict')} 冲突 / "
+                f"{sum(1 for r in recommendations if r.get('confidence')=='low_coverage')} 弃权"
+                f"（2026-09-19 覆盖率门控：维度数据不足的票不再被'失明专家'压分）"
             )
         except Exception as e:
             logger.warning(f"ExpertEnsemble 融合失败，降级到仅主模型分数: {str(e)[:120]}")

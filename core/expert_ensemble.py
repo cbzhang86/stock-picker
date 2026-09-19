@@ -66,18 +66,33 @@ HIGH_CONSENSUS_THRESHOLD = 10.0   # |Δ| ≤ 10 视为高一致性
 MEDIUM_CONSENSUS_THRESHOLD = 25.0 # |Δ| ≤ 25 为中度；超过即冲突
 CONFLICT_PENALTY = 8.0            # 冲突时扣分
 
+# 2026-09-19（用户决策"完善专家五维"）：覆盖率门控。
+# 生产日志证据（daily_job_20260917/18.log）：expert 恒 ≈48-50 vs model ≈74-75，
+# 几乎恒"冲突"——根因是 5 维中常只有 technical 有数据（权重 0.25），其余 4 维
+# 因基本面/估值/资金流/事件缺失退化为中性 50，把 expert 拉到 ≈50。
+# "失明专家"对高分票系统性打出 Δ≈−25 → 恒 conflict → −8 分 + 仓位系数 0.5，
+# 冲突的原因不是观点分歧而是数据缺失。
+# 修复 = 两招：
+#   ① 覆盖率门控：有数据维度权重占比 < MIN_EXPERT_COVERAGE 时专家弃权
+#     （confidence='low_coverage'，ensemble=model，仓位系数 1.0，不降不罚）
+#   ② 已覆盖维重归一：expert_score 只在有数据的维度上按权重归一，
+#     不再让缺失维的中性 50 稀释有数据的信号
+MIN_EXPERT_COVERAGE = 0.40   # ≈ 至少两个维度有真实数据（单维最高 0.25）
+
 
 @dataclass
 class ExpertVerdict:
     """单个股票的专家评分与融合结果"""
     code: str
-    expert_score: float           # 0-100，5 维加权得分
+    expert_score: float           # 0-100，已覆盖维加权得分（未覆盖时 = 50）
     model_score: float            # 0-100，7 因子加权得分（来自主模型）
     delta: float                  # expert - model
-    confidence: str               # 'high' / 'medium' / 'low' / 'conflict'
+    confidence: str               # 'high' / 'medium' / 'low' / 'conflict' / 'low_coverage'
     ensemble_score: float         # 融合后的最终建议分
-    expert_breakdown: Dict        # 5 维 raw_score 展开
+    expert_breakdown: Dict        # 5 维 raw_score 展开（含 covered 标记）
     notes: List[str]              # 推理与告警
+    coverage: float = 1.0         # 有数据维度的权重占比 0-1
+    abstained: bool = False       # 覆盖率不足 → 专家弃权
 
 
 class ExpertScorer:
@@ -97,15 +112,18 @@ class ExpertScorer:
     # ── 5 维独立打分（每维 0-100） ─────────────────────
 
     @staticmethod
-    def _fundamental_dim(stock: Dict) -> Tuple[float, str]:
+    def _fundamental_dim(stock: Dict) -> Tuple[float, str, bool]:
         """基本面（ROE 主导 + 增长）— 与 7 因子 valuation_fundamental 区分"""
         fund = stock.get('fundamentals') or {}
         if not fund:
-            return 50.0, '无基本面数据 → 中性'
+            return 50.0, '无基本面数据 → 中性', False
         score = 50.0
         roe = fund.get('roe')
         rev_g = fund.get('revenue_growth')
         prof_g = fund.get('profit_growth')
+        covered = roe is not None or rev_g is not None or prof_g is not None
+        if not covered:
+            return 50.0, '基本面字段全空 → 中性', False
 
         if roe is not None:
             if roe >= 25:    score += 25
@@ -122,17 +140,17 @@ class ExpertScorer:
                 score += 10
             elif rev_g < -10 or prof_g < -20:
                 score -= 15
-        return max(0, min(100, score)), f'ROE={roe}, rev_g={rev_g}, prof_g={prof_g}'
+        return max(0, min(100, score)), f'ROE={roe}, rev_g={rev_g}, prof_g={prof_g}', covered
 
     @staticmethod
-    def _technical_dim(stock: Dict) -> Tuple[float, str]:
+    def _technical_dim(stock: Dict) -> Tuple[float, str, bool]:
         """
         技术面 — 轻量评分，4 个子信号平均
         优先用调用方预填的完整 6 维技术分（tech_score_0_100），无则用 K 线派生字段拼装
         """
         full = stock.get('tech_score_0_100')
         if full is not None:
-            return float(full), f'6维技术分={full}'
+            return float(full), f'6维技术分={full}', True
 
         score = 50.0
         notes = []
@@ -140,6 +158,9 @@ class ExpertScorer:
         pct_chg = stock.get('pct_chg')       # 当日涨幅 %
         turnover = stock.get('turnover')     # 换手率 %
         amount_ratio = stock.get('amount_ratio')  # 量比
+        covered = any(v is not None for v in (rps, pct_chg, turnover, amount_ratio))
+        if not covered:
+            return 50.0, '无技术面字段 → 中性', False
 
         if rps is not None:
             if rps >= 80:    score += 12; notes.append(f'RPS={rps:.0f}强')
@@ -159,17 +180,17 @@ class ExpertScorer:
         if amount_ratio is not None and amount_ratio >= 2:
             score += 4; notes.append(f'量比{amount_ratio}放量')
 
-        return max(0, min(100, score)), ', '.join(notes) or '技术面中性'
+        return max(0, min(100, score)), ', '.join(notes) or '技术面中性', covered
 
     @staticmethod
-    def _capital_dim(stock: Dict) -> Tuple[float, str]:
+    def _capital_dim(stock: Dict) -> Tuple[float, str, bool]:
         """资金面 — 大单 + 北向 + 主力净流入（与 capital_flow 不同权重组合）"""
         main_fund = stock.get('main_fund_accumulated')
         north = stock.get('north_flow_accumulated')
 
         # 缺失数据用中性
         if main_fund is None and north is None:
-            return 50.0, '无资金流数据'
+            return 50.0, '无资金流数据', False
 
         score = 50.0
         notes = []
@@ -196,16 +217,16 @@ class ExpertScorer:
             elif north < -2000:
                 score -= 12; notes.append('北向<-2000w')
 
-        return max(0, min(100, score)), ', '.join(notes) or '资金面中性'
+        return max(0, min(100, score)), ', '.join(notes) or '资金面中性', True
 
     @staticmethod
-    def _valuation_dim(stock: Dict) -> Tuple[float, str]:
+    def _valuation_dim(stock: Dict) -> Tuple[float, str, bool]:
         """估值水位 — PE/PB 横截面百分位排名"""
         pe_rank = stock.get('pe_percentile')      # 0-100，越高越贵
         pb_rank = stock.get('pb_percentile')
 
         if pe_rank is None and pb_rank is None:
-            return 50.0, '无估值百分位'
+            return 50.0, '无估值百分位', False
 
         score = 50.0
         notes = []
@@ -221,26 +242,29 @@ class ExpertScorer:
             if pb_rank < 20:    score += 8
             elif pb_rank > 80:  score -= 8
 
-        return max(0, min(100, score)), ', '.join(notes) or '估值中性'
+        return max(0, min(100, score)), ', '.join(notes) or '估值中性', True
 
     @staticmethod
-    def _event_dim(stock: Dict) -> Tuple[float, str]:
+    def _event_dim(stock: Dict) -> Tuple[float, str, bool]:
         """事件催化 — 复用 EventProvider.score"""
         events = stock.get('recent_events') or []
         if not events:
-            return 50.0, '无近期事件'
+            return 50.0, '无近期事件', False
         s = EventProvider.score(events, reference_date=stock.get('_decision_date'))
         # 取最早一条的标题作为 note
         title = events[0].get('title', '')[:24]
-        return s, f'event_score={s:.1f}, top="{title}"'
+        return s, f'event_score={s:.1f}, top="{title}"', True
 
     # ── 综合打分 ─────────────────────────────────────
 
-    def score(self, stock: Dict) -> Tuple[float, Dict, List[str]]:
+    def score(self, stock: Dict) -> Tuple[float, Dict, List[str], float]:
         """
-        对单只股票给出专家 5 维评分
+        对单只股票给出专家 5 维评分（2026-09-19 起：已覆盖维重归一）
 
-        返回：(expert_score 0-100, breakdown dict, notes list)
+        返回：(expert_score 0-100, breakdown dict, notes list, coverage 0-1)
+          expert_score 只聚合有真实数据的维度（按其权重重归一），
+          缺失维不再以中性 50 稀释信号；全维缺失 → 50.0（coverage=0）。
+          coverage = 有数据维度的权重占比（0-1）。
         """
         dims = {
             'fundamental': self._fundamental_dim(stock),
@@ -251,18 +275,24 @@ class ExpertScorer:
         }
         breakdown = {}
         notes = []
-        expert_score = 0.0
+        weighted_sum = 0.0
+        covered_weight = 0.0
         for name, weight in EXPERT_WEIGHTS.items():
-            raw, note = dims[name]
-            expert_score += raw * weight
+            raw, note, covered = dims[name]
+            if covered:
+                weighted_sum += raw * weight
+                covered_weight += weight
             breakdown[name] = {
                 'raw_score': round(raw, 2),
                 'weight': weight,
                 'weighted': round(raw * weight, 2),
+                'covered': covered,
             }
             if note:
                 notes.append(f'[{name}] {note}')
-        return round(expert_score, 2), breakdown, notes
+        coverage = covered_weight / sum(EXPERT_WEIGHTS.values())
+        expert_score = (weighted_sum / covered_weight) if covered_weight > 0 else 50.0
+        return round(expert_score, 2), breakdown, notes, round(coverage, 4)
 
 
 class ExpertEnsemble:
@@ -290,9 +320,29 @@ class ExpertEnsemble:
         if model_score is None:
             model_score = stock.get('score', 50.0)
 
-        expert_score, breakdown, notes = self.scorer.score(stock)
+        expert_score, breakdown, notes, coverage = self.scorer.score(stock)
         delta = expert_score - model_score
         abs_delta = abs(delta)
+
+        # 覆盖率门控（2026-09-19）：数据不足 → 专家弃权，不参与融合、不降不罚。
+        # 这是"失明专家"修复的核心：看不见基本面的专家没有资格投反对票。
+        if coverage < MIN_EXPERT_COVERAGE:
+            ensemble_score = round(max(0, min(100, model_score)), 2)
+            notes.append(
+                f'⚠️ 专家弃权: 维度覆盖率 {coverage:.0%} < {MIN_EXPERT_COVERAGE:.0%}，'
+                f'有数据维度不足以构成第二意见 → ensemble=model，仓位不降')
+            return ExpertVerdict(
+                code=stock.get('code', ''),
+                expert_score=expert_score,
+                model_score=round(model_score, 2),
+                delta=round(delta, 2),
+                confidence='low_coverage',
+                ensemble_score=ensemble_score,
+                expert_breakdown=breakdown,
+                notes=notes,
+                coverage=coverage,
+                abstained=True,
+            )
 
         # 置信度分级
         if abs_delta <= HIGH_CONSENSUS_THRESHOLD:
@@ -327,6 +377,8 @@ class ExpertEnsemble:
             ensemble_score=ensemble_score,
             expert_breakdown=breakdown,
             notes=notes,
+            coverage=coverage,
+            abstained=False,
         )
 
     def fuse_batch(self, stocks: List[Dict]) -> List[ExpertVerdict]:
@@ -342,10 +394,12 @@ def confidence_to_weight_factor(confidence: str) -> float:
     medium  → 0.85 （中度分歧，轻度降仓）
     low     → 0.70 （轻度低置信，降仓）
     conflict→ 0.50 （冲突显著，强烈降仓）
+    low_coverage → 1.00 （专家弃权：数据不足，不构成第二意见，不做任何调整）
     """
     return {
         'high':     1.00,
         'medium':   0.85,
         'low':      0.70,
         'conflict': 0.50,
+        'low_coverage': 1.00,
     }.get(confidence, 1.00)

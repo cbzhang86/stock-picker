@@ -182,11 +182,15 @@ class TestScoringModel(unittest.TestCase):
 # ════════════════════════════ P0-B ExpertEnsemble ════════════════════════════
 
 class TestExpertEnsemble(unittest.TestCase):
-    """三档置信度融合：用 model_score 控制 Δ，stock 最小化（expert=50）"""
+    """三档置信度融合：用 model_score 控制 Δ（2026-09-19 起需全维覆盖，否则门控弃权）"""
 
     def setUp(self):
         self.ee = ExpertEnsemble()
-        self.stock = {'code': '600000'}   # 全维无数据 → expert_score = 50
+        # 契约更新（2026-09-19 覆盖率门控）：空 stock（coverage=0）现在会触发专家
+        # 弃权，不再走三档融合。为继续验证融合公式，改用"全维覆盖且恒 50 分"的
+        # 桩评分器 —— 与旧契约"空 stock → expert=50"在公式上等价。
+        self.ee.scorer = _AllNeutralScorer()
+        self.stock = {'code': '600000'}
 
     def test_high_consensus(self):
         v = self.ee.fuse(self.stock, model_score=50.0)     # Δ=0
@@ -225,9 +229,30 @@ class TestExpertEnsemble(unittest.TestCase):
         self.assertEqual(confidence_to_weight_factor('unknown'), 1.00)
 
     def test_expert_neutral_baseline(self):
-        """全维无数据时 expert_score 恰为 50（各维中性值）"""
-        verdict = self.ee.fuse(self.stock, model_score=50)
-        self.assertAlmostEqual(verdict.expert_score, 50.0, places=2)
+        """契约更新（2026-09-19 覆盖率门控）：全维无数据 → 专家弃权（low_coverage），
+        ensemble=model、仓位系数 1.0；不再让"失明的 50 分"对高分票投反对票"""
+        verdict = ExpertEnsemble().fuse({'code': '600000'}, model_score=74.0)
+        self.assertTrue(verdict.abstained, '全维无数据应弃权')
+        self.assertEqual(verdict.confidence, 'low_coverage')
+        self.assertAlmostEqual(verdict.ensemble_score, 74.0, places=2,
+                               msg='弃权时 ensemble 应等于 model 分')
+        self.assertEqual(confidence_to_weight_factor(verdict.confidence), 1.00,
+                         '弃权不应降仓')
+        self.assertLess(verdict.coverage, 0.40)
+
+
+class _AllNeutralScorer:
+    """全维覆盖且恒 50 分的桩评分器（供融合公式测试用，coverage=1.0 不触发门控）"""
+
+    def score(self, stock):
+        breakdown = {name: {'raw_score': 50.0, 'weight': w, 'weighted': 50.0 * w,
+                            'covered': True}
+                     for name, w in EXPERT_WEIGHTS.items()}
+        return 50.0, breakdown, ['stub: all dims neutral, covered'], 1.0
+
+
+# 桩评分器需要 EXPERT_WEIGHTS，延迟导入避免循环
+from core.expert_ensemble import EXPERT_WEIGHTS  # noqa: E402
 
 
 # ════════════════════════════ P1-G hot_theme gating ════════════════════════════

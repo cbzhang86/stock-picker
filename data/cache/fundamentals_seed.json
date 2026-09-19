@@ -1,0 +1,7 @@
+[
+  {"code": "600519", "name": "贵州茅台", "pe": 20.4166, "pb": 6.6173, "roe": 16.75, "div_yield": 3.91, "market_cap": 1662608474112, "source": "tdx_indicator_select", "update_date": "2026-09-05"},
+  {"code": "300750", "name": "宁德时代", "pe": 19.1058, "pb": 4.2810, "roe": 12.08, "div_yield": 2.34, "market_cap": 1623996366848, "source": "tdx_indicator_select", "update_date": "2026-09-05"},
+  {"code": "002594", "name": "比亚迪",   "pe": 27.0723, "pb": 3.3206, "roe": 4.86,  "div_yield": 0.41, "market_cap": 796843048960,  "source": "tdx_indicator_select", "update_date": "2026-09-05"},
+  {"code": "600183", "name": "生益科技", "pe": 64.2972, "pb": 18.0517, "roe": 18.17, "div_yield": 0.58, "market_cap": 333987971072,  "source": "tdx_indicator_select", "update_date": "2026-09-05"},
+  {"code": "002415", "name": "海康威视", "pe": 19.4465, "pb": 3.7889, "roe": 9.17,  "div_yield": 3.73, "market_cap": 319579062272,  "source": "tdx_indicator_select", "update_date": "2026-09-05"}
+]

@@ -1,0 +1,18 @@
+{
+  "short": {
+    "capital_flow": 0.15,
+    "north_flow": 0.0,
+    "momentum": 0.04,
+    "technical": 0.16,
+    "volume_price": 0.12,
+    "hot_theme": 0.5,
+    "dragon_tiger": 0.03
+  },
+  "long": {
+    "fundamental": 0.4,
+    "north_flow": 0.0,
+    "momentum": 0.25,
+    "valuation": 0.2,
+    "institutional": 0.15
+  }
+}

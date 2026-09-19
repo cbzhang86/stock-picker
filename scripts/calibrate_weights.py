@@ -764,6 +764,17 @@ def main():
     parser.add_argument('--out', help='报告输出路径')
     parser.add_argument('--apply', action='store_true',
                         help='写入 data/weights/v1.json（默认只出建议）')
+    # 2026-09-19（全项目深查 P2-1）：目标函数冲突闸门。
+    # 本脚本以「跨口径 IC 共识」为优化目标；而 2026-09-19 的权重实证（方案G）
+    # 证明 **IC ≠ 尾部收益** —— 等权 4 腿方案 IC 最高（0.0743）但 Top5 日均超额
+    # 仅 0.13%，而 IC 最低的纯 hot_theme 方案有 1.572%。若月末直接 --apply，
+    # IC 目标可能静默覆盖掉按尾部收益确认的 G 方案。
+    # 故 --apply 现在必须显式附带本开关（fail-closed），强制人工确认"接受用
+    # IC 目标覆盖当前权重"这一语义。
+    parser.add_argument('--accept-ic-objective', action='store_true',
+                        help='确认接受「用 IC 共识目标覆盖当前权重」（--apply 必需）。'
+                             '背景：IC 目标与 2026-09-19 尾部收益判据存在已知分歧，'
+                             '详见 docs/全项目深查报告_20260919.md P2-1')
     parser.add_argument('--method', choices=['consensus', 'icir'], default='consensus',
                         help='校准方法：consensus（默认，历史行为）/ icir（最大化 ICIR，'
                              '需 OOS 报告含 daily_ics 逐日序列——用最新 oos_validator '
@@ -779,6 +790,20 @@ def main():
                         help='共线因子组（逗号分隔多组，组内用冒号），如 '
                              '"momentum:reversal_20d"；置空字符串可关闭去重')
     args = parser.parse_args()
+
+    # 目标函数冲突闸门（2026-09-19 深查 P2-1）——前置到解析后立即判定（fail-fast），
+    # 避免跑完全部分析才拒绝写入。理由见下方 --accept-ic-objective 定义。
+    if args.apply and not args.accept_ic_objective:
+        print("=" * 72)
+        print("⛔ 拒绝写入：--apply 需要同时给出 --accept-ic-objective")
+        print("=" * 72)
+        print("原因：本校准器以「跨口径 IC 共识」为目标，而 2026-09-19 的实证证明")
+        print("      IC ≠ 尾部收益（等权方案 IC 最高却几乎不赚钱；纯 hot_theme IC")
+        print("      最低却有 +1.572%/日）。当前生效的 G 方案是按 Top-N 尾部收益")
+        print("      并经训练/持有切分确认的，直接 --apply 可能静默覆盖它。")
+        print("若确认要用 IC 目标覆盖当前权重：")
+        print("  python scripts/calibrate_weights.py --apply --accept-ic-objective")
+        return 2
 
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     reports_dir = os.path.join(project_root, 'data', 'reports')
@@ -895,7 +920,7 @@ def main():
     else:
         print(report)
 
-    # 5. 写入（显式 --apply）
+    # 5. 写入（显式 --apply；闸门已在参数解析后前置判定，此处仅执行）
     if args.apply:
         weights_dir = os.path.join(project_root, 'data', 'weights')
         os.makedirs(weights_dir, exist_ok=True)
@@ -929,4 +954,6 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    # 2026-09-19：必须透传 main() 的返回码 —— 否则闸门拒绝写入（return 2）会被
+    # 解释为 exit 0，自动化把"已拒绝"误判为"已成功"。
+    sys.exit(main())

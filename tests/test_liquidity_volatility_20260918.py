@@ -36,18 +36,21 @@ class TestLiquidityAndVolatility(unittest.TestCase):
                                msg='percentile 0.3（低波动）→ (1-0.3)*100 = 70 高分')
 
     def test_registered_in_v1_and_config(self):
+        """契约更新（2026-09-19 方案G）：volatility 启用 0.06；liquidity 维持 0
+        （OOS 证伪其 84% 是规模效应，由 liq_dev 0.14 替代）"""
         import json, io, re
         v1 = json.load(io.open(os.path.join(PROJECT_ROOT, 'data', 'weights', 'v1.json'),
                                encoding='utf-8'))
         short = v1['short']
-        for f in ('liquidity', 'volatility'):
-            self.assertIn(f, short, f'v1.json 缺 {f}')
-            self.assertAlmostEqual(short[f], 0.0)
+        self.assertAlmostEqual(short['liquidity'], 0.0,
+                               msg='liquidity（原始 log amount）84% 是规模效应，保持 0')
+        self.assertAlmostEqual(short['volatility'], 0.06,
+                               msg='volatility 已按方案 G 启用 0.06')
         self.assertAlmostEqual(sum(v for v in short.values()
                                    if isinstance(v, (int, float))), 1.0)
         cfg = io.open(os.path.join(PROJECT_ROOT, 'config.yml'), encoding='utf-8').read()
         self.assertIsNotNone(re.search(r'(?m)^\s*liquidity:\s*0\.00', cfg))
-        self.assertIsNotNone(re.search(r'(?m)^\s*volatility:\s*0\.00', cfg))
+        self.assertIsNotNone(re.search(r'(?m)^\s*volatility:\s*0\.06', cfg))
 
     def test_scoring_model_neutral_detection(self):
         """缺流动性/波动率数据 → 中性化标记（权重让渡路径可用）"""

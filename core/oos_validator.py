@@ -70,7 +70,17 @@ K_FACTORS = ['momentum', 'technical', 'volume_price',
              # 与华泰 A 股短线反转研究一致（沪深300 1 个月反转 IC 27.69%）。
              # 不是"赌它翻正"，而是**把已证实的反向信号显式翻转为正向因子**。
              # 华泰研报口径："反转因子"= 负动量，是 A 股长期 IC 最强的经典因子之一。
-             'reversal_20d']
+             'reversal_20d',
+             # 2026-09-19：对标 Barra 补充缺失的两类因子（波动率、流动性），
+             # 用 kline_cache 已有历史数据（2024-01~2026-09，5232只）即可验证，不必等
+             # P5 数据积累。方向（低波动/低流动性溢价是否成立）由 IC 决定。
+             'volatility', 'liquidity',
+             # 2026-09-19（方案G）：偏离成分因子 —— 把"水平"与"偏离"分离后的产物。
+             # 证伪证据：原始 liquidity(−log amount) 与 60 日滚动中位数（规模代理）
+             # 相关 0.838 → 84% 是小市值效应；剥离后的偏离成分 ICIR 反超
+             # （liq_dev 0.535 > 0.418，vol_dev 0.225 > vol_level 0.126）且与规模正交。
+             # 方向：偏离越低（缩量/波动收敛）→ 分越高，已由 IC 确认。
+             'liq_dev', 'vol_dev']
 # P1-I（2026-09-05 审查报告）：新因子 valuation_fundamental / event_catalyst
 # 此前不在验证清单 → "链路已通但永远拿不到 OOS 证据 → 永远不能给权重"死锁。
 SNAPSHOT_FACTORS = ['capital_flow', 'hot_theme', 'dragon_tiger',
@@ -291,6 +301,53 @@ class OOSValidator:
             vol_ratio = df['volume'] / vol_ma5.replace(0, np.nan)
             df['_vol_ratio'] = vol_ratio
             df['volume_price'] = self._volume_ratio_score_vec(vol_ratio)
+
+        # ── volatility：20 日日收益率标准差（波动率）→ 横截面百分位（高波动=高分）──
+        # 对标 Barra Volatility（BETA / RESVOL）。
+        # A 股"低波动异象"：若 IC 为负 → 高波动对应低收益 → 应取反（低波动高分）。
+        # 方向由 IC 决定（先按原始高波动=高分计算，便于看方向）。
+        if 'volatility' in factors:
+            ret_daily = df.groupby('code', sort=False)['close'].pct_change()
+            # 个股滚动 20 日标准差（窗口内不足 20 日为 NaN → IC 剔除）
+            vol20 = (ret_daily.groupby(df['code'], sort=False)
+                     .rolling(20).std().reset_index(level=0, drop=True))
+            df['_vol20'] = vol20
+            # 取反 → **低波动高分**（A 股低波动异象：IC 原始 −0.0435 (t=−2.51)，说明高波动=低收益；与生产 compute_all_factors 的"低波动高分"语义对齐）
+            df['volatility'] = 100.0 - (vol20.groupby(df['date']).rank(pct=True) * 100)
+
+        # ── liquidity：成交额（amount）→ 横截面百分位（高成交额=高分）──
+        # 对标 Barra Liquidity（换手率、Amihud）。
+        # A 股"低流动性溢价"（F09）：若 IC 为负 → 低成交额（低流动性）对应高收益
+        # → 应取反（低流动性高分）。方向由 IC 决定。
+        if 'liquidity' in factors:
+            # 用 log(amount) 平滑量纲（成交额跨度大），再做横截面百分位
+            amt = np.log1p(df['amount'].clip(lower=0))
+            df['_amt_log'] = amt
+            # 取反 → **低流动性(低成交额)高分**（A 股低流动性溢价 F09：IC 原始 −0.0517 (t=−3.80)，说明高成交额=低收益；与生产语义对齐）
+            df['liquidity'] = 100.0 - (amt.groupby(df['date']).rank(pct=True) * 100)
+
+        # ── liq_dev / vol_dev：偏离成分因子（2026-09-19 方案G）──
+        # 把 log(amount) 拆成持久水平（60日滚动中位数 ≈ 规模代理）与瞬时偏离，
+        # 只保留偏离部分（与规模正交，相关 -0.088）。方向：偏离越低 → 分越高。
+        if 'liq_dev' in factors:
+            code_g = df['code']
+            amt_log = np.log1p(df['amount'].clip(lower=0))
+            level60 = (amt_log.groupby(code_g, sort=False)
+                       .rolling(60, min_periods=30).median()
+                       .reset_index(level=0, drop=True))
+            dev = amt_log - level60
+            df['liq_dev'] = 100.0 - (dev.groupby(df['date']).rank(pct=True) * 100)
+
+        if 'vol_dev' in factors:
+            code_g = df['code']
+            ret_daily = df.groupby('code', sort=False)['close'].pct_change()
+            vol20 = (ret_daily.groupby(df['code'], sort=False)
+                     .rolling(20).std().reset_index(level=0, drop=True))
+            vol_level60 = (vol20.fillna(0).groupby(df['code'], sort=False)
+                           .rolling(60, min_periods=30).median()
+                           .reset_index(level=0, drop=True))
+            vdev = vol20 - vol_level60
+            df['vol_dev'] = 100.0 - (vdev.groupby(df['date']).rank(pct=True) * 100)
 
         # ── technical：对齐 TechnicalScorer 6 维的向量化近似 ──
         if 'technical' in factors:

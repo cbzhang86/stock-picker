@@ -2114,8 +2114,11 @@ class DataEngine:
         for theme, stocks in sorted(theme_stocks.items(), key=lambda x: len(x[1]), reverse=True):
             # 有涨幅的按涨幅降序排在前，无涨幅的保持上游原始顺序（稳定排序）
             def _rank_key(s):
+                # 2026-09-19 深查 P2-3：原用 isinstance(v, float) 判数值，
+                # 而 NaN 本身就是 float（契约 #1）→ NaN 会被当作"有涨幅"参与排序，
+                # 排序结果未定义。改用 math.isfinite（展示层排序，不影响评分）。
                 v = s.get('pct_chg')
-                return (1, v) if isinstance(v, float) else (0, 0.0)
+                return (1, v) if (isinstance(v, (int, float)) and math.isfinite(v)) else (0, 0.0)
             top_stocks = sorted(stocks, key=_rank_key, reverse=True)[:3]
             result.append({
                 'theme': theme,

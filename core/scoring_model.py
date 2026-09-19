@@ -71,22 +71,24 @@ class ScoringModel:
     # risk 不进权重表，由 penalty 路径独立扣分（见 ActiveWeight 与 penalty 注释）
     DEFAULT_WEIGHTS = {
         'short': {
-            # 2026-09-18 权重优化（2.2 年 OOS + IC 衰减分析，与 v1.json/config.yml 同步）：
-            # 基线（组合最优，已复现）：hot_theme 0.42 / reversal_20d 0.42（等权），
-            # momentum 0.03（与 rev 共线 ρ=−1，净反转暴露 = 0.42−0.03 = 0.39），
-            # capital_flow 0.05、technical/volume_price 0.03、dragon_tiger 0.02。
-            # 回测证据（长窗口 4-8月，当前引擎同口径）：
-            #   基线 0.42/0.42（净 0.39）→ -18.28%（A/B 验证最优）
-            #   v3 0.46/0.46（噪声压缩至 0.08）→ -22.19%（差 4pp，噪声分散作用被削弱）
-            #   偏移 0.35/0.49 → -38.20%（差 20pp，hot 降权有害）
-            'capital_flow': 0.05,
+            # 2026-09-19 方案G（保守混合，用户决策后定稿，与 v1.json/config.yml 同步）：
+            # 口径 = ret_hold1d（尾盘买入，与实盘一致）。
+            # 证据：2024-01~2026-09 全市场 OOS，Top5 日均超额 +1.845%（t=21.4）
+            # vs 旧基线（hot/rev 等权）+0.850%（t=9.4）。训练/持有切分寻优（500 组
+            # 随机搜索 + 坐标精修）持有期最优 +1.799% 未显著超越 G → G 已在持有期前沿。
+            # 核心增量 = liq_dev（缩量偏离）0.14 / vol_dev（波动收敛偏离）0.07。
+            # 噪声腿保留 0.08（用户决策"不归零"，实证代价 0.031 pp/日）。
+            'capital_flow': 0.01,
             'north_flow': 0.00,   # 2024-08 起北向官方停发，仅东财估算口径
-            'momentum': 0.03,
-            'technical': 0.03,
-            'volume_price': 0.03,
-            'hot_theme': 0.42,
-            'reversal_20d': 0.42,
-            'dragon_tiger': 0.02,
+            'momentum': 0.02,
+            'technical': 0.02,
+            'volume_price': 0.02,
+            'hot_theme': 0.55,
+            'liq_dev': 0.14,
+            'reversal_20d': 0.10,
+            'vol_dev': 0.07,
+            'volatility': 0.06,
+            'dragon_tiger': 0.01,
         },
         'long': {
             'fundamental': 0.40,
@@ -254,6 +256,34 @@ class ScoringModel:
                     and not stock_data.get('blocks') \
                     and not stock_data.get('concept_names'):
                 is_neutral = True
+
+            # 2026-09-19 补（全项目深查 P1-1）：K 线派生的四个新启用因子
+            # （liq_dev / vol_dev / volatility / liquidity）此前不在白名单里，
+            # 缺失时 factor_library 返回的中性 50 被当作**真实数据**计入权重，
+            # 与 OOS 验证口径（NaN 剔除，缺数据行不进 IC）不一致 ——
+            # 与"专家失明"同构：缺失数据伪装成有效信号参与加权。
+            # 判定依据 = 原始百分位是否写入（由 rank_stocks 计算）：
+            #   有百分位 → 真实横截面值（0-100）可参与排序
+            #   无百分位 → 数据不足（K 线行数不够 / 快照模式无行情）→ 让渡权重
+            _peri_map = {
+                'liq_dev': '_liq_dev_percentile',
+                'vol_dev': '_vol_dev_percentile',
+                'volatility': '_volatility_percentile',
+                'liquidity': '_liquidity_percentile',
+                'size': '_size_percentile',
+            }
+            if factor_name in _peri_map \
+                    and stock_data.get(_peri_map[factor_name]) is None:
+                is_neutral = True
+
+            # momentum / reversal_20d 的数据源是 rps_20，但 data_engine 在无 K 线时
+            # **返回恒 50 而非 None**（data_engine.py:1272），因此 rps_20 无法作为
+            # 可用性判据（用 None 判断永不触发，会给出虚假的安全感）。
+            # 正确修法是改 data_engine 返回 None 或按 kline_df 存在性判定 ——
+            # 那会改变动量腿（权重 0.12）在实盘/回测两条路径上的行为，属未经 OOS
+            # 验证的语义变更，故**本轮不动**，记为遗留项（见深查报告 P2-4）。
+            # 影响评估：无 K 线股票（无成交量/停牌）在候选池中占比很低，且
+            # raw_return_20=0 会落到横截面中位附近，偏差有界。
 
             factor_scores[factor_name] = (factor_score, weight, is_neutral)
             if is_neutral:
@@ -642,6 +672,65 @@ class ScoringModel:
             for s, v in vol_raws:
                 rank = sum(1 for _, x in vol_raws if x <= v) / n_v
                 s['_volatility_percentile'] = rank  # 高波动 → 高百分位 → 低分
+
+        # R-E（2026-09-19 方案G·OOS 实证）：缩量偏离因子——当日成交额相对自身常态的偏离。
+        # 证据（2024-01~2026-09，299.9万行/647天/5225只，ret_hold1d，剔除接近涨停）：
+        #   liq_dev IC +0.0654 / ICIR 0.535 / t +12.81，与规模代理（60日滚动中位数）
+        #   横截面相关仅 -0.088 → 与小市值效应正交，是独立 alpha（见
+        #   docs/因子扩容与权重论证_20260918.md 第二章）。
+        # 方向：偏离越低（当日缩量/地量）→ 分越高（在 factor_library 取反）。
+        # 注意与 _liquidity_percentile（量比×换手，高流动性高分）方向相反且口径不同：
+        # 原始 liquidity 的 OOS 证据属于 log(amount) 口径，84% 是规模效应（相关 0.838），
+        # 不能反向套用到 turnover 乘积口径 —— 故 liquidity 权重保持 0 不动，不加不反。
+        liq_raws = []
+        for s in stocks_data:
+            kline = s.get('kline_df')
+            if (kline is not None and isinstance(kline, pd.DataFrame)
+                    and 'amount' in kline.columns and len(kline) >= 30):
+                try:
+                    amt = np.log1p(
+                        pd.to_numeric(kline['amount'], errors='coerce').clip(lower=0).dropna())
+                    if len(amt) >= 30:
+                        # 与 OOS 面板同口径：60 日窗口含当日，min 30 日
+                        level = float(amt.tail(60).median())
+                        dev = float(amt.iloc[-1] - level)
+                        if np.isfinite(dev):
+                            s['_liq_dev_raw'] = dev
+                            liq_raws.append((s, dev))
+                except Exception:
+                    pass
+        if liq_raws:
+            n_liq = len(liq_raws)
+            for s, dev in liq_raws:
+                rank = sum(1 for _, x in liq_raws if x <= dev) / n_liq
+                s['_liq_dev_percentile'] = rank  # 高偏离（放量）→ 高百分位 → 低分
+
+        # R-F（2026-09-19 方案G·OOS 实证）：波动收敛偏离因子——20 日波动率相对自身
+        # 60 日常态的偏离。证据：vol_dev IC +0.0263 / ICIR 0.225 / t +5.37，
+        # 偏离成分优于水平成分（vol_level ICIR 仅 0.126）。方向：偏离越低
+        # （波动收敛）→ 分越高。
+        vol_dev_raws = []
+        for s in stocks_data:
+            kline = s.get('kline_df')
+            if (kline is not None and isinstance(kline, pd.DataFrame)
+                    and 'close' in kline.columns and len(kline) >= 50):
+                try:
+                    close = pd.to_numeric(kline['close'], errors='coerce').dropna()
+                    rets = close.pct_change()
+                    vol_series = rets.rolling(20).std().dropna()
+                    if len(vol_series) >= 30:
+                        level = float(vol_series.tail(60).median())
+                        dev = float(vol_series.iloc[-1] - level)
+                        if np.isfinite(dev):
+                            s['_vol_dev_raw'] = dev
+                            vol_dev_raws.append((s, dev))
+                except Exception:
+                    pass
+        if vol_dev_raws:
+            n_vd = len(vol_dev_raws)
+            for s, dev in vol_dev_raws:
+                rank = sum(1 for _, x in vol_dev_raws if x <= dev) / n_vd
+                s['_vol_dev_percentile'] = rank  # 高偏离（波动放大）→ 高百分位 → 低分
 
         # P2-K（2026-09-05 审查报告）：横截面因子标准化（实验开关）。
         # 批量预计算因子分 → 每个因子横截面 rank 0-100 → 写入 _factors_override，

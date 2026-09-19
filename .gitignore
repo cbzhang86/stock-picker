@@ -41,3 +41,8 @@ audit_data_consistency.md
 
 # 归档周报
 reports/backtest_weekly.md
+
+# 2026-09-19 补：备份库/分析缓存/临时对账文件不入库
+data/backup/*.db
+data/cache/*.pkl
+data/_bf_*.json
