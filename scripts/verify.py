@@ -2,7 +2,7 @@
 """
 verify.py — stock-picker system health check.
 
-Runs 9 checks covering data source connectivity, config consistency,
+Runs 10 checks covering data source connectivity, config consistency,
 quota headroom, cron health, Python deps, recent backtest freshness, etc.
 
 Each check prints a one-line status:  ✅ OK / ⚠️ WARN / 🔴 FAIL
@@ -342,6 +342,33 @@ def check_backtest_recent():
         return 'FAIL', f"BacktestEngine: {type(e).__name__}: {str(e)[:80]}"
 
 
+def check_run_context_freshness():
+    """run_context 快照完整性（2026-09-20 审查 P2-4，纯新增告警项）。
+
+    门槛重校（recalibrate_thresholds --from-run-context）要求每档位 ≥15 个
+    交易日的 run_context 数据；而 _emit_run_context 写盘失败只打 warning，
+    此前无任何监控 → 静默缺失要到重校日才发现。这里检查最近 10 个交易日的
+    run_context_YYYYMMDD.json 覆盖数，<8 份告 WARN（不 FAIL，不阻断 cron）。
+    """
+    try:
+        from core.trading_calendar import trading_days
+    except Exception:
+        return 'WARN', "trading_calendar 不可用，跳过 run_context 检查"
+    today = datetime.now().strftime('%Y-%m-%d')
+    start = (datetime.now() - timedelta(days=20)).strftime('%Y-%m-%d')
+    days = trading_days(start, today)
+    if not days:
+        return 'WARN', "交易日历不可用，跳过 run_context 检查"
+    recent = days[-10:]
+    have = [d for d in recent
+            if (DATA_REPORTS / f"run_context_{d.replace('-', '')}.json").exists()]
+    if len(have) >= 8:
+        return 'OK', f"run_context {len(have)}/{len(recent)} (近10交易日)"
+    missing = [d for d in recent if d not in set(have)]
+    return 'WARN', (f"run_context 仅 {len(have)}/{len(recent)} 份（近10交易日），"
+                    f"缺失: {', '.join(missing[-5:])} — 门槛重校数据可能静默缺失")
+
+
 # --- Runner ---------------------------------------------------------------
 
 CHECKS = [
@@ -351,6 +378,7 @@ CHECKS = [
     ("Weights consistency", check_weights_consistency),
     ("Cron health (24h)", check_cron_health),
     ("Reports freshness (7d)", check_data_reports_freshness),
+    ("Run-context freshness (10d)", check_run_context_freshness),
     ("Disk project size", check_disk_project),
     ("Strategy import", check_strategy_import),
     ("Backtest engine import", check_backtest_recent),

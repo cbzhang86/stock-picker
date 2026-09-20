@@ -60,8 +60,28 @@ def write_snapshot(conn, date: str, rows: list, fetched_at: str = None) -> int:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--date', default=None, help='快照日期（默认今天）')
+    ap.add_argument('--allow-non-trading-day', action='store_true',
+                    help='允许在非交易日写入快照（默认跳过，防止重复行污染 point-in-time 样本）')
     args = ap.parse_args()
     date = args.date or datetime.now().strftime('%Y-%m-%d')
+
+    # 交易日守卫（2026-09-20 审查 P2-1）：daily_job 每天无条件调用本脚本，
+    # 原先周末/节假日也会把上一交易日的行情快照再写一份（实测 09-19 周六 5219 行
+    # 与 09-18 几乎完全相同）。下游 point-in-time 用途（size/估值因子 OOS）会把
+    # 非交易日行当独立样本 → 自由度虚增、t 值失真。日历不可用（None）时按交易日
+    # 继续并在日志"响一声"，与工程其他守卫口径一致。
+    if not args.allow_non_trading_day:
+        try:
+            from core.trading_calendar import is_trading_day
+            _td = is_trading_day(date)
+        except Exception as e:
+            _td = None
+            print(f"⚠ 交易日历查询异常（按交易日继续）: {e}")
+        if _td is False:
+            print(f"{date} 为非交易日 → 跳过估值快照写入（--allow-non-trading-day 可强制）")
+            return 0
+        elif _td is None:
+            print("⚠ 交易日历不可用 → 无法执行非交易日守卫，按交易日继续")
 
     from core.data_engine import DataEngine
     de = DataEngine({})

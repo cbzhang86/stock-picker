@@ -26,6 +26,7 @@ def _run(env=None):
     if env is None or 'EVAL_TRIAL_MATRIX' not in env:
         e.pop('EVAL_TRIAL_MATRIX', None)
     return subprocess.run([PY, EVAL], capture_output=True, text=True,
+                          encoding='utf-8', errors='replace',
                           cwd=PROJECT_ROOT, env=e)
 
 

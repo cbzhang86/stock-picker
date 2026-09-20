@@ -123,7 +123,10 @@ class PredictionTracker:
         批次级防重请先调用 has_predictions(date, mode) 判断，
         见 eod_stock_picker.py run_short_term/run_long_term 的用法。
 
-        返回 prediction_id
+        返回 prediction_id；若命中 UNIQUE(date, code, mode) 唯一索引（并发/竞态
+    窗口：has_predictions 检查通过后另一进程先写入），返回 None 并记 warning
+    （2026-09-20 审查 P2-3：原裸 INSERT 会让第二个进程抛 IntegrityError，
+    连带 run_short_term 中断 → 当日简报不生成；冲突比"炸掉整个 eod"更可接受）。
         """
         conn = None
         try:
@@ -142,7 +145,7 @@ class PredictionTracker:
                 from datetime import datetime
                 _created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             c.execute(
-                """INSERT INTO predictions
+                """INSERT OR IGNORE INTO predictions
                    (date, code, name, mode, score, rating, buy_price, model_version,
                     factor_scores, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -151,6 +154,11 @@ class PredictionTracker:
                  _created_at)
             )
             conn.commit()
+            if c.rowcount == 0:
+                # 命中唯一索引：该 (date, code, mode) 已存在（并发写入/竞态窗口）
+                logger.warning(
+                    f"推荐记录已存在（UNIQUE 命中，跳过写入）: {date} {code} mode={mode}")
+                return None
             prediction_id = c.lastrowid
             logger.debug(f"记录推荐: {code} {name} 评分{score} ID={prediction_id}")
             return prediction_id
@@ -508,8 +516,13 @@ class PredictionTracker:
             if conn:
                 conn.close()
 
-    def get_recent_predictions(self, limit: int = 20) -> pd.DataFrame:
-        """获取最近N条推荐记录（含结果）"""
+    def get_recent_predictions(self, limit: int = 20,
+                               mode: str = None) -> pd.DataFrame:
+        """获取最近N条推荐记录（含结果）
+
+        mode（2026-09-20 审查 P3-5）：可选按模式过滤（show_status 传 'short'，
+        避免未来 shadow/其他模式行混入展示）。None = 不过滤（历史行为不变）。
+        """
         conn = None
         try:
             conn = sqlite3.connect(self.db_path)
@@ -519,10 +532,14 @@ class PredictionTracker:
                        o.t1_return, o.t5_return, o.t20_return
                 FROM predictions p
                 LEFT JOIN outcomes o ON p.id = o.prediction_id
-                ORDER BY p.id DESC
-                LIMIT ?
             """
-            df = pd.read_sql_query(query, conn, params=(limit,))
+            params = []
+            if mode:
+                query += " WHERE p.mode = ?"
+                params.append(mode)
+            query += " ORDER BY p.id DESC LIMIT ?"
+            params.append(limit)
+            df = pd.read_sql_query(query, conn, params=tuple(params))
         finally:
             if conn:
                 conn.close()

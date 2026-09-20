@@ -111,13 +111,16 @@ def backfill_pending_outcomes():
 
 
 def _shadow_rows_from(recommendations: list) -> list:
-    """提取影子落库行（2026-09-18 影子推荐）。
+    """提取影子落库行（2026-09-18 影子推荐；2026-09-20 审查 P1-1 修键名）。
 
     三种情况：
       - 影子模式（极差市/拥挤度断路器触发但仍完成评分）：run() 返回带 shadow 标记的
         推荐 → 全部取出（有 code 的）；
-      - 零达标（no_qualified）：返回元信息条目，取其中的 top_unqualified（含 code/name/score；
-        该路径无价格，buy_price 记 0 —— update_outcomes 会从 K 线重算买入价，安全）；
+      - 零达标（no_qualified）：返回元信息条目，取其中的最高分候选（含 code/name/score；
+        该路径无价格，buy_price 记 0 —— update_outcomes 会从 K 线重算买入价，安全）。
+        键名契约：策略端（strategies/short_term.py）零达标分支写入的是
+        **'top_candidate'**（2026-09-20 审查 P1-1：原读 'top_unqualified' 恒取空，
+        零达标影子台账从未落过库）。保留 'top_unqualified' 回退兼容旧快照/旧调用方；
       - 正常推荐日 / 非交易日 / 其他：返回空列表（不写 shadow）。
     """
     if not recommendations:
@@ -126,7 +129,9 @@ def _shadow_rows_from(recommendations: list) -> list:
     if first.get('shadow'):
         return [r for r in recommendations if r.get('code')]
     if first.get('no_qualified'):
-        top = first.get('top_unqualified') or {}
+        # 键名契约：生产写 top_candidate（backtest_report 渲染亦读此键）；
+        # top_unqualified 仅作历史兼容回退。
+        top = first.get('top_candidate') or first.get('top_unqualified') or {}
         if top.get('code'):
             return [{'code': top.get('code'), 'name': top.get('name', ''),
                      'score': top.get('score', 0), 'rating': '', 'price': 0,
@@ -271,6 +276,21 @@ def run_long_term(config: dict) -> list:
     from datetime import date
     today = date.today().isoformat()
 
+    # 非交易日守卫（2026-09-20 审查 P3-1）：short 侧 2026-09-17 已修，long 侧漏改 —
+    # 周末手工 --mode long 会把当日快照污染 predictions/factor 库。与 short 侧同口径：
+    # 日历不可用（None）时按交易日继续并在日志"响一声"。
+    try:
+        from core.trading_calendar import is_trading_day
+        _td = is_trading_day(today)
+        if _td is False:
+            logger.warning(f"{today} 为非交易日（long 侧非交易日守卫）→ "
+                           f"不写入 predictions/因子采集")
+            return recommendations
+        elif _td is None:
+            logger.warning("交易日历不可用 → long 侧守卫跳过，按交易日继续")
+    except Exception as e:
+        logger.warning(f"非交易日守卫执行失败（按交易日继续）: {e}")
+
     # 批次级防重：当日已有推荐则跳过整批写入
     if tracker.has_predictions(today, 'long'):
         logger.info(f"防重: {today} mode=long 已有推荐记录，跳过写入")
@@ -384,7 +404,8 @@ def show_status(config: dict):
     print(f"\n⚙️  模型版本: v1")
     print(f"  权重(生效): {effective_weights}")
 
-    recent = tracker.get_recent_predictions(limit=5)
+    # P3-5（2026-09-20 审查）：只展示 short 正式推荐，避免未来 shadow 行混入展示
+    recent = tracker.get_recent_predictions(limit=5, mode='short')
     if not recent.empty:
         print(f"\n📋 最近推荐:")
         for _, row in recent.iterrows():

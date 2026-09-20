@@ -250,6 +250,23 @@ def generate_daily_report(recommendations: List[Dict], mode: str = 'short') -> s
         lines.append("")
         return "\n".join(lines)
 
+    # 影子推荐过滤（2026-09-20 审查 P1-2）：shadow 条目是"照常评分但不下发"的
+    # 观察样本，绝不能以正常推荐样式（评分/仓位）进入日报（daily_report 委托本函数，
+    # 该文件随简报一起供人工/自动化阅读）——否则用户照报告买入的交易不会进绩效
+    # 统计（DB 层不写 mode='short'，口径分裂）。单独渲染"影子观察"区块并提前返回。
+    shadow_recs = [r for r in recommendations if r.get('shadow') and r.get('code')]
+    if shadow_recs:
+        _sr = (shadow_recs[0].get('shadow_reason')
+               or shadow_recs[0].get('skip_reason') or '极端市况')
+        lines.append("  🌑 影子观察（极端市况，本次未下发推荐）")
+        lines.append(f"  原因：{_sr}")
+        for r in shadow_recs:
+            lines.append(f"  • {r.get('code', '')} {r.get('name', '')} "
+                         f"⭐ {r.get('score', 0):.1f}")
+        lines.append("  （已以 mode=shadow 落库观察，不构成操作建议）")
+        lines.append("")
+        return "\n".join(lines)
+
     # 数据源状态诊断
     source_status = recommendations[0].get('data_source_status', {})
     failed_sources = {k: v for k, v in source_status.items()

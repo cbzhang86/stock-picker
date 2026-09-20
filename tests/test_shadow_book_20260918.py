@@ -47,13 +47,24 @@ class TestShadowRowsHelper(unittest.TestCase):
         self.assertEqual(rows[0]['code'], '600001')
 
     def test_no_qualified_meta(self):
+        """P1-1 修键名（2026-09-20 审查）：生产键是 top_candidate；
+        top_unqualified 仅作历史兼容回退（单独用例覆盖）"""
+        from scripts.eod_stock_picker import _shadow_rows_from
+        meta = [{'no_qualified': True,
+                 'top_candidate': {'code': '600003', 'name': '松发股份', 'score': 66.8}}]
+        rows = _shadow_rows_from(meta)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['code'], '600003')
+        self.assertAlmostEqual(rows[0]['score'], 66.8)
+
+    def test_no_qualified_fallback_legacy_key(self):
+        """历史兼容：旧快照/旧调用方仍写 top_unqualified 也能提取（不丢失）"""
         from scripts.eod_stock_picker import _shadow_rows_from
         meta = [{'no_qualified': True,
                  'top_unqualified': {'code': '600003', 'name': '松发股份', 'score': 66.8}}]
         rows = _shadow_rows_from(meta)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['code'], '600003')
-        self.assertAlmostEqual(rows[0]['score'], 66.8)
 
     def test_normal_recs_return_empty(self):
         """正常推荐（无 shadow 标记、无 no_qualified）→ 不写 shadow（只加不改）"""
@@ -138,7 +149,7 @@ class TestShadowIntegration(unittest.TestCase):
     # ── B2 空仓日（no_qualified）──
     def test_zero_qualified_day_writes_shadow_only(self):
         self._run([{'no_qualified': True, 'min_score': 70,
-                    'top_unqualified': {'code': '600003', 'name': 'x', 'score': 66.8}}])
+                    'top_candidate': {'code': '600003', 'name': 'x', 'score': 66.8}}])
         short, shadow = self._counts()
         self.assertEqual(short, 0, '零达标日不得写 short')
         self.assertEqual(shadow, 1, '零达标日应写 shadow')
@@ -155,7 +166,7 @@ class TestShadowIntegration(unittest.TestCase):
     # ── B3 非交易日 ──
     def test_non_trading_day_writes_nothing(self):
         self._run([{'no_qualified': True,
-                    'top_unqualified': {'code': '600005', 'name': 'z', 'score': 60}}],
+                    'top_candidate': {'code': '600005', 'name': 'z', 'score': 60}}],
                   trading_day=False)
         short, shadow = self._counts()
         self.assertEqual((short, shadow), (0, 0), '非交易日不得写入任何记录')
@@ -163,7 +174,7 @@ class TestShadowIntegration(unittest.TestCase):
     # ── C 防重 ──
     def test_shadow_dedup_on_rerun(self):
         recs = [{'no_qualified': True,
-                 'top_unqualified': {'code': '600006', 'name': 'w', 'score': 65}}]
+                 'top_candidate': {'code': '600006', 'name': 'w', 'score': 65}}]
         self._run(recs)
         self._run(recs)                       # 同日重复运行
         short, shadow = self._counts()

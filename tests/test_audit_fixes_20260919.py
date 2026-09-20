@@ -265,7 +265,8 @@ class TestCalibratorObjectiveGate(unittest.TestCase):
         proc = subprocess.run(
             [sys.executable, os.path.join(PROJECT_ROOT, 'scripts', 'calibrate_weights.py'),
              '--apply'],
-            capture_output=True, text=True, timeout=300)
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=300)
         after = hashlib.md5(open(v1, 'rb').read()).hexdigest()
         self.assertEqual(proc.returncode, 2,
                          f'闸门拒绝写入应返回码 2（实际 {proc.returncode}）—— '

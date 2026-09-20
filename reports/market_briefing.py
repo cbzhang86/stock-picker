@@ -228,7 +228,14 @@ def generate_market_briefing(recommendations: List[Dict],
     # ── 3. 短线推荐排名（skip/熔断条目单独展示停推原因，不渲染空条目） ──
     # 真实推荐 = 带 code 的条目；无 code 的是"元信息条目"（市场跳过 /
     # 门槛清零），它们只承载说明信息，不参与推荐渲染（2026-09-14）。
-    rec_recs = [r for r in (recommendations or []) if r.get('code')]
+    # 影子推荐过滤（2026-09-20 审查 P1-2）：shadow 条目是"照常评分但不下发"的
+    # 观察样本，绝不能以正常推荐样式（⭐评分/💼仓位）进入推送内容 —— 否则用户
+    # 照简报买入的交易不会进绩效统计（DB 层不写 mode='short'，口径分裂）。
+    # 单独渲染"🌑 影子观察"区块，只列 code/name/score 并注明原因。
+    shadow_recs = [r for r in (recommendations or [])
+                   if r.get('shadow') and r.get('code')]
+    rec_recs = [r for r in (recommendations or [])
+                if r.get('code') and not r.get('shadow')]
     has_skip = any(r.get('skip_reason') for r in (recommendations or []))
     for r in (recommendations or []):
         if r.get('skip_reason'):
@@ -238,6 +245,18 @@ def generate_market_briefing(recommendations: List[Dict],
             lines.append(f"    🚫 {r['skip_reason']}")
             lines.append("")
             break
+    if shadow_recs:
+        _sr = (shadow_recs[0].get('shadow_reason')
+               or shadow_recs[0].get('skip_reason') or '极端市况')
+        lines.append("-" * 45)
+        lines.append("  🌑 影子观察（极端市况，本次未下发推荐）")
+        lines.append("-" * 45)
+        lines.append(f"    原因：{_sr}")
+        for r in shadow_recs:
+            lines.append(f"    • {r.get('code', '')} {r.get('name', '')} "
+                         f"⭐ {r.get('score', 0):.1f}")
+        lines.append("    （已以 mode=shadow 落库观察，不构成操作建议）")
+        lines.append("")
     if rec_recs:
         lines.append("-" * 45)
         lines.append("  📈 短线评分排名（因子加权）")

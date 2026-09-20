@@ -107,9 +107,17 @@ def load_stock_pool(limit: int = 100, de=None) -> list:
     codes, seen = [], set()
     try:
         conn = sqlite3.connect(db_path)
+        # 2026-09-20 审查 P3-2：date('now') 是 UTC 日期，北京早上 8 点前比北京日期
+        # 早一天（90 天窗口边界差一天）。改用北京日期参数化（与全工程口径一致）。
+        try:
+            from core.trading_calendar import beijing_now
+            _today = beijing_now().strftime('%Y-%m-%d')
+        except Exception:
+            from datetime import datetime as _dt
+            _today = _dt.now().strftime('%Y-%m-%d')
         rows = conn.execute(
-            "SELECT code FROM predictions WHERE date >= date('now', '-90 day') "
-            "ORDER BY date DESC LIMIT 500"
+            "SELECT code FROM predictions WHERE date >= date(?, '-90 day') "
+            "ORDER BY date DESC LIMIT 500", (_today,)
         ).fetchall()
         conn.close()
         for (code,) in rows:
