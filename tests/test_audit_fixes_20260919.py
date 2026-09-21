@@ -16,6 +16,25 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+def _extract_dict_literal(src: str, name: str) -> str:
+    """从源码文本里抽出 `name = {...}` 的字典字面量文本。
+
+    用括号配平而非固定字符窗口：原实现取 `src.index('_peri_map = {')` 后
+    截 600 字符，一旦白名单上方补注释就会错位（假绿/假红）。
+    """
+    anchor = f'{name} = {{'
+    start = src.index(anchor) + len(anchor)
+    depth, i = 1, start
+    while i < len(src) and depth:
+        c = src[i]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+        i += 1
+    return src[start:i - 1]
+
+
 # 由「原始百分位字段」驱动的因子 → 缺失时必须走让渡
 PERCENTILE_DRIVEN = {
     'liq_dev': '_liq_dev_percentile',
@@ -79,7 +98,7 @@ class TestNeutralReassignmentCoversNewFactors(unittest.TestCase):
         """守卫：所有以 _*_percentile 为数据源的因子都必须在让渡白名单内"""
         src = open(os.path.join(PROJECT_ROOT, 'core', 'scoring_model.py'),
                    encoding='utf-8').read()
-        block = src[src.index('_peri_map = {'):src.index('_peri_map = {') + 600]
+        block = _extract_dict_literal(src, '_peri_map')
         for factor, field in PERCENTILE_DRIVEN.items():
             self.assertIn(f"'{factor}': '{field}'", block,
                           f'让渡白名单缺 {factor}（新增百分位驱动因子时必须同步登记）')
@@ -108,6 +127,18 @@ class TestSourceFactorImpactCoverage(unittest.TestCase):
         'north_flow': ('akshare_north_flow',),
         'hot_theme': ('asharehub_concepts', 'ths_hot', 'eastmoney_blocks'),
         'dragon_tiger': ('dragon_tiger',),
+        # 2026-09-21 补登记：size 的数据源是腾讯实时快照的 total_market_cap
+        # 字段（core/data_engine.py:950，字段 45，单位亿元）与估值快照表
+        # valuation_snapshot，**不属 K 线族** —— 不能挂到 mootdx_kline/
+        # baostock_kline 下（那样会把缺市值数据误判成 K 线源故障）。
+        # 腾讯快照在 _SOURCE_FACTOR_IMPACT 里是哨兵键 '全部因子'（行情缺失
+        # → 无法评分），故登记在该键名下。
+        # 已知局限：哨兵键会触发"影响范围: 全部因子"的整表降级文案，
+        # 因此"仅市值字段缺失"的精确权重合计无法从该表算出。size 权重恒 0
+        # （启用条件 = 估值快照积累 >=60 交易日后 OOS 验证审批），届时若要
+        # 精确登记，需把估值快照建为独立源键并同步 _source_status 与
+        # _SOURCE_FACTOR_IMPACT（见 config.yml weights 段 size 的注释）。
+        'size': ('tencent_quote',),
     }
 
     def test_nonzero_weight_factors_have_source_family(self):
@@ -128,6 +159,26 @@ class TestSourceFactorImpactCoverage(unittest.TestCase):
                        for k in keys):
                 problems.append(f'{f} 未被任何对应数据源映射列出（降级警示会漏算）')
         self.assertEqual(problems, [], '数据源影响登记缺口: ' + '; '.join(problems))
+
+    def test_required_table_covers_all_weighted_factors(self):
+        """反向守卫：REQUIRED 表不得漏掉任何有权重的因子（防 09-21 的 size 缺陷复发）
+
+        上例只检查"已声明的因子是否登记正确"，是单向的 —— 新增因子若忘在
+        REQUIRED 里声明，会直接失败但不指明是新增遗漏；更糟的是此前
+        `size` 长期缺席本表，README.md:397-400 与 config.yml weights 段明文
+        写好的下一步（估值快照积累 ≥60 交易日后给 size 加权）一旦执行，
+        该守卫就会立刻失败 —— 即"新增数据源/新因子必须同步登记"这条硬要求
+        会阻断自身文档化的合法流程。本用例把"v1.json 中有权重的因子 ⊆
+        REQUIRED"锁死，使任何加权动作都必须先补登记。
+        """
+        weights = _short_weights()
+        declared = set(self.REQUIRED)
+        weighted = {f for f, w in weights.items()
+                    if isinstance(w, (int, float)) and w > 0}
+        missing = sorted(weighted - declared)
+        self.assertEqual(missing, [],
+                         f'以下有权重的因子未在 REQUIRED 依赖表中声明（新增因子加权前'
+                         f'必须先登记数据源，否则降级警示会漏算）: {missing}')
 
     def test_kline_factors_registered(self):
         """K 线源映射必须包含 2026-09-19 启用的三个 K 线派生因子"""

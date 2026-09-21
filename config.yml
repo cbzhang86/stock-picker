@@ -5,16 +5,17 @@
 # ---- 短线策略权重 ----
 # ⚠️ 权重加载优先级（见 SKILL.md 陷阱 21）：
 #   **data/weights/v1.json  >  本段 short_term.weights  >  ScoringModel.DEFAULT_WEIGHTS**
-#   → 本段是 **兜底（fallback）**：当 v1.json 存在时本段不生效；一旦 v1.json 丢失/
+#   本段是 **兜底（fallback）**：当 v1.json 存在时本段不生效；一旦 v1.json 丢失/
 #     损坏，本段会立即接管，因此**必须与 v1.json 保持完全一致**（Σ=1.00）。
-#   （2026-09-14 曾发生本段停留在旧值、与 v1.json 严重不一致的隐患：一旦回落会与
-#     动态门槛 强市65/中性70/弱市75 的评分尺度错配，选股行为静默剧变。）
-#   当前生效值（v1.json short，2026-09-18 最佳配置）：hot_theme 0.46 /
-#   reversal_20d 0.46 / capital_flow 0.02 / technical 0.02 / volume_price 0.02 /
-#   momentum 0.00 / dragon_tiger 0.02 / north_flow 0.00 / size 0.00。
+#   生效值以 weights: 段（下方）与 data/weights/v1.json 为准 —— 两处必须逐键一致。
+#   （2026-09-21 更正：本行此前写死了具体数字，方案 G 定稿后未同步，
+#   与实际生效的 hot_theme 0.55 / liq_dev 0.14 / reversal_20d 0.10 严重不符；
+#   注释不再是有效值的承载点，改为指向权威来源，避免下次权重变更再次漂移。）
 #   权重调整唯一入口：python scripts/calibrate_weights.py（--apply 需人工审批）。
 #
-# 首次校准依据（2026-06-30~2026-09-03，47 交易日 / 889 只，主口径 hold1d，历史存档）：
+# 首次校准依据（2026-06-30~2026-09-03，47 交易日 / 889 只，主口径 hold1d）：
+#   ⚠️ ARCHIVED —— 以下为历史校准数据，仅说明旧权重从何而来，**不代表当前生效值**
+#   （当前生效权重见 weights: 段与 v1.json，方案 G，2026-09-19 定稿）。
 #   hot_theme      OOS IC +0.0651 (t=+2.17) ← 唯一统计显著的有效因子
 #   capital_flow   OOS IC +0.0056 (t=+0.11) ← 三种口径方向一致，弱正
 #   dragon_tiger   OOS IC -0.0072            ← 噪声
@@ -67,17 +68,19 @@ short_term:
     hot_theme: 0.55             # 题材热度（2026-09-19 方案G：主导腿，热点池内由新因子排序）
     dragon_tiger: 0.01          # 龙虎榜信号（OOS IC -0.0019，噪声腿）
     reversal_20d: 0.10          # 反转因子（与 liq_dev 相关 0.530，压缩以防重复计数）
-    size: 0.00                  # 小市值因子（权重 0 链路先行，对标 Barra Size）
-    liquidity: 0.00             # 原始流动性因子（2026-09-19 证伪：与规模代理相关 0.838，
-                                # 84% 是小市值效应；由 liq_dev 替代，本键保留 0 不启用）
     volatility: 0.06            # 波动率因子（2026-09-19 方案G：低波动溢价成立，IC +0.0467）
     liq_dev: 0.14               # 缩量偏离因子（2026-09-19 方案G 新增，OOS 验证启用）
     vol_dev: 0.07               # 波动收敛偏离因子（2026-09-19 方案G 新增，OOS 验证启用）
-                                # （低波动溢价），权重 0 链路先行，启用条件同上                  # 小市值因子（2026-09-18 R-B，权重 0 链路先行）：横截面市值
+    # ---- 待验证新因子（权重 0，链路已通，验证后再启用）----
+    size: 0.00                  # 小市值因子（2026-09-18 R-B，权重 0 链路先行）：横截面市值
                                 # 百分位取反，市值越小分越高（study-vault F09：A 股最稳健截面
                                 # 因子，现体系无规模维度）。OOS 面板无市值数据，启用条件 =
                                 # 市值历史快照积累 >= 60 交易日后跑 OOS 验证再审批加权。
-    # ---- 待验证新因子（权重 0，链路已通，验证后再启用）----
+                                # 数据源 = 腾讯实时快照 total_market_cap（data_engine.py:950）
+                                # / 估值快照表 valuation_snapshot，不属于 K 线族，故不登记在
+                                # _SOURCE_FACTOR_IMPACT 的 mootdx_kline/baostock_kline 键内。
+    liquidity: 0.00             # 原始流动性因子（2026-09-19 证伪：与规模代理相关 0.838，
+                                # 84% 是小市值效应；由 liq_dev 替代，本键保留 0 不启用）
     valuation_fundamental: 0.00 # 通达信估值/基本面：PE/PB/ROE/股息率（见 core/fundamental_provider.py）
     event_catalyst: 0.00        # 事件催化：公告/业绩预告/新闻（见 core/event_provider.py）
     # 合计 1.00。

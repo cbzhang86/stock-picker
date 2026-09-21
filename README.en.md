@@ -10,7 +10,7 @@
 
 [简体中文](README.md) · [English](README.en.md)
 
-> **Status (2026-09-19)**: Code frozen (stable v-G), entering observation period. 438 unit tests + 9/0 gate all green.
+> **Status (2026-09-21)**: Code frozen (stable v-G), entering observation period. 497 unit tests + 9/0 gate all green.
 
 ---
 
@@ -363,7 +363,7 @@ stock-picker/
 │   ├── prefetch_tdx.py            TDX valuation/event prefetch
 │   └── prefetch_asharehub.py      Non-trading-day quota prefetch
 │
-├── tests/                         438 unit tests (incl. hard-contract locks + guard tests)
+├── tests/                         497 unit tests (incl. hard-contract locks + guard tests)
 ├── config.yml                     Central configuration
 ├── SKILL.md                       AI assistant skill definition
 ├── CHEATSHEET.md                  Quick reference

@@ -34,8 +34,9 @@ _SOURCE_FACTOR_IMPACT = {
     # ——2026-09-19 方案G 启用的 liq_dev / vol_dev / volatility 同源（都依赖
     # kline_df 的 amount/close 序列），合计权重 0.27。此前未登记 → K 线源故障时
     # 简报"受影响因子权重合计"漏算近 1/3，违反契约 #3"新增数据源需登记"。
-    # 守卫测试 tests/test_source_factor_impact_20260919.py 确保未来新增因子不再漂移。
-    # liquidity 权重 0，登记以保持映射完整。
+    # 守卫测试：tests/test_audit_fixes_20260919.py::TestSourceFactorImpactCoverage
+    # （2026-09-21 更正：原注释指向不存在的 tests/test_source_factor_impact_20260919.py）。
+    # size 的数据源是腾讯实时快照（total_market_cap）/估值快照，不在此 K 线族内。
     'mootdx_kline': ['technical', 'volume_price', 'momentum', 'reversal_20d',
                      'liq_dev', 'vol_dev', 'volatility', 'liquidity'],
     'baostock_kline': ['technical', 'volume_price', 'momentum', 'reversal_20d',

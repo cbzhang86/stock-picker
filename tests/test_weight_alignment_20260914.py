@@ -103,6 +103,28 @@ class TestMismatchWarningSemantics(unittest.TestCase):
         for k, v in v1_w.items():
             self.assertAlmostEqual(loaded[k], v, places=9, msg=f'{k} 生效权重不等于 v1.json')
 
+    def test_default_weights_keys_match_v1(self):
+        """DEFAULT_WEIGHTS 必须含 v1.json 的全部因子键（含零权重键）
+
+        `_weights_equivalent` 把"缺键"当作 0 处理，所以 v1.json 新增
+        `size: 0.00` 这类零权重键时，`test_config_matches_default_short`
+        依然会通过 —— 但 fallback 层从此没有该因子的显式登记点。
+        后果：v1.json 一旦丢失，回落到 DEFAULT_WEIGHTS 后 `size` 等键
+        从"权重 0"退化为"未登记"，与"零权重链路先通、积累 ≥60 交易日
+        后再审批加权"的约定在语义上不再对称（该因子会走 factors.get 的
+        默认 50 静默路径）。此守卫要求三层键集合完全一致。
+        """
+        with open(os.path.join(PROJECT_ROOT, 'data', 'weights', 'v1.json'),
+                  encoding='utf-8') as f:
+            v1_keys = set(json.load(f)['short'])
+        default_keys = set(ScoringModel.DEFAULT_WEIGHTS['short'])
+        self.assertEqual(
+            default_keys, v1_keys,
+            f'DEFAULT_WEIGHTS 的键集合与 v1.json 不一致 —— '
+            f'缺: {sorted(v1_keys - default_keys)}，'
+            f'多: {sorted(default_keys - v1_keys)}'
+        )
+
 
 class TestEquivalenceHelper(unittest.TestCase):
     """_weights_equivalent 的边界行为"""

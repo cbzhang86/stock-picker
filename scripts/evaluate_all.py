@@ -9,7 +9,6 @@
 """
 import os
 import sys
-import subprocess
 import logging
 
 if sys.platform == 'win32':

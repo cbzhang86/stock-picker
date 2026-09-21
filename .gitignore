@@ -47,5 +47,9 @@ reports/backtest_weekly.md
 
 # 2026-09-19 补：备份库/分析缓存/临时对账文件不入库
 data/backup/*.db
+data/backup/*.json
 data/cache/*.pkl
 data/_bf_*.json
+
+# 2026-09-21 补：门禁/诊断/推送运行时日志（每日重生成，不入库）
+data/cache/*.log
