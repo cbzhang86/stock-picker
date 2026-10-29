@@ -13,6 +13,7 @@
 """
 
 import logging
+import math
 from datetime import date, datetime
 from typing import Dict, List
 
@@ -92,9 +93,30 @@ def _degradation_note(failed: Dict, mode: str) -> List[str]:
     return out
 
 
+def _load_briefing_config() -> Dict:
+    """读取 config.yml（简报内联长线扫描的阈值来源）。
+
+    2026-09-22 修复（缺陷排查 P1-12）：原实现在简报里硬编码
+    `{'buy': {'max_candidates': 5, 'min_score': 50}}`，而 config.yml
+    `long_term.buy.min_score` 为 65 → 简报"长线关注"区块与生产长线账本口径不一致。
+    读取失败时返回空 dict，由调用方回落默认值并告警（不阻断简报生成）。
+    """
+    try:
+        import os as _os
+        import yaml as _yaml
+        _p = _os.path.join(_os.path.dirname(_os.path.dirname(
+            _os.path.abspath(__file__))), 'config.yml')
+        with open(_p, encoding='utf-8') as f:
+            return _yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning(f"简报读取 config.yml 失败（长线阈值回落默认 65）: {str(e)[:80]}")
+        return {}
+
+
 def generate_market_briefing(recommendations: List[Dict],
                               mode: str = 'short',
-                              source_status: Dict = None) -> str:
+                              source_status: Dict = None,
+                              long_recs: List[Dict] = None) -> str:
     """
     生成每日市场简报
 
@@ -108,6 +130,10 @@ def generate_market_briefing(recommendations: List[Dict],
                      状态无关 → 简报（即微信推送内容）永远不会出现降级提示，
                      导致"四源全降级的中性化推荐"被当作正常结果推送出去。
                      传入时优先使用运行期快照；缺省（如长线/测试）回落内部实例。
+      long_recs: 长线推荐列表（2026-09-22 P1-12 新增）。
+                     调用方（eod_stock_picker::run_long_term）已有结果时传入，
+                     避免简报内联再跑一遍长线全流程；未传入时回退内联扫描
+                     （阈值读 config.yml，不再是硬编码 50）。
 
     返回：格式化的市场简报字符串
     """
@@ -124,15 +150,31 @@ def generate_market_briefing(recommendations: List[Dict],
     # ── 0. 数据源降级警示（2026-09-16 P1-1：必须在首屏，先于任何结论）──
     # 2026-09-19 深查 P2-2：source_status 缺失时回退到新建 DataEngine 的 summary
     # （其 _source_status 恒全绿）→ 降级警示会静默消失。回退必须留痕。
-    if source_status:
-        snapshot = source_status
-    else:
+    # 2026-09-22 修复（缺陷排查 P1-12）：回退不再"假装全绿后什么都不说" ——
+    # 缺运行期快照时直接渲染「状态不可用」警示行（而不是依赖读者去看日志），
+    # 这样"预案漏传"这一事故本身在推送内容里可见。
+    _src_missing = not source_status
+    if _src_missing:
         snapshot = de.get_data_source_summary()
         logger.warning(
             "generate_market_briefing 未收到运行期 source_status（调用方漏传）→ "
             "回退到新建实例的默认全绿状态，本次降级警示可能不完整，请检查调用侧")
+    else:
+        snapshot = source_status
+    if _src_missing:
+        lines.append("!" * 45)
+        lines.append("  ⚠️ 数据源状态不可用（调用方未透传运行期快照）")
+        lines.append("!" * 45)
+        lines.append("    本次降级警示可能不完整，请以运行日志为准")
+        lines.append("")
     failed = {k: v for k, v in (snapshot or {}).items()
               if not v.get('available', True)}
+    # 2026-09-23（交接单 A3 配套）：预算受限但**保活**的源（available=True +
+    # degraded=True，如配额耗尽后的 asharehub_concepts → hot_theme 0.55 仅走
+    # 7 天预取缓存）。不单独渲染的话，简报会把它当"完全正常"而漏报
+    # —— 这正是 A3 分级后新增的可见性缺口。
+    degraded_only = {k: v for k, v in (snapshot or {}).items()
+                     if v.get('available', True) and v.get('degraded')}
     if failed:
         lines.append("!" * 45)
         lines.append("  ⚠️ 数据源降级警示：本次结果可信度下降")
@@ -143,6 +185,18 @@ def generate_market_briefing(recommendations: List[Dict],
             err_str = f" ({err})" if err else ""
             lines.append(f"    🔌 {label}: 不可用{err_str}")
         lines.extend(_degradation_note(failed, mode))
+        lines.append("")
+    if degraded_only:
+        lines.append("-" * 45)
+        lines.append("  ⚠️ 数据源预算受限（仍可服务，但仅用已有缓存）")
+        lines.append("-" * 45)
+        for sname, status in degraded_only.items():
+            label = status.get('label', sname)
+            if sname in failed:
+                continue
+            lines.append(f"    🪫 {label}: 仅预取缓存可用"
+                         f"（{str(status.get('last_error', ''))[:60]}）")
+        lines.append("    （缓存有 7 天 TTL：超过则相关因子回落中性）")
         lines.append("")
 
     # ── 1. 市场概览 ──
@@ -204,7 +258,10 @@ def generate_market_briefing(recommendations: List[Dict],
                     lead = t['top_stocks'][0] if t['top_stocks'] else {}
                     lead_name = lead.get('name', '')
                     lead_pct = lead.get('pct_chg')
-                    if isinstance(lead_pct, (int, float)):
+                    # 2026-09-22 修复（缺陷排查 P2-37 · 契约 A）：`isinstance(v, float)`
+                    # 对 NaN 为真 → 会渲染出 `+nan% ➖`（脏数值进微信推送）。
+                    # 必须用 math.isfinite（NaN 是 float，isinstance 判不出来）。
+                    if isinstance(lead_pct, (int, float)) and math.isfinite(lead_pct):
                         arrow = '📈' if lead_pct > 0 else (
                             '📉' if lead_pct < 0 else '➖')
                         tail = f" {lead_pct:+.1f}% {arrow}"
@@ -254,8 +311,12 @@ def generate_market_briefing(recommendations: List[Dict],
         lines.append("-" * 45)
         lines.append(f"    原因：{_sr}")
         for r in shadow_recs:
-            lines.append(f"    • {r.get('code', '')} {r.get('name', '')} "
-                         f"⭐ {r.get('score', 0):.1f}")
+            # 2026-09-22 修复（第二轮回归 P3-5）：同 rec_recs —— NaN/None 不渲染
+            _s = r.get('score')
+            _s = _s if (isinstance(_s, (int, float)) and not isinstance(_s, bool)
+                        and math.isfinite(_s)) else 0.0
+            lines.append(f"    • {r.get('code') or ''} {r.get('name') or ''} "
+                         f"⭐ {_s:.1f}")
         lines.append("    （已以 mode=shadow 落库观察，不构成操作建议）")
         lines.append("")
     if rec_recs:
@@ -272,18 +333,35 @@ def generate_market_briefing(recommendations: List[Dict],
                          f"模型近期表现不佳，请谨慎参考短线推荐")
             lines.append("")
         for i, rec in enumerate(rec_recs[:5], 1):
-            code = rec.get('code', '')
-            name = rec.get('name', '')
-            score = rec.get('score', 0)
-            rating = rec.get('rating_cn', '')
-            allocation = rec.get('allocation_pct', 0)
-            bd = rec.get('breakdown', {})
+            code = rec.get('code') or ''
+            name = rec.get('name') or ''
+            # 2026-09-22 修复（第二轮回归 P3-5）：NaN/None 的 score/allocation
+            # 会渲染成 "⭐ nan" / "💼 nan%"（实证：shadow 条目 score=float('nan')）。
+            # 非有限一律回落 0 展示（简报仅展示用，不影响决策数据）。
+            _sc = rec.get('score')
+            score = _sc if (isinstance(_sc, (int, float))
+                            and not isinstance(_sc, bool)
+                            and math.isfinite(_sc)) else 0.0
+            _al = rec.get('allocation_pct')
+            allocation = _al if (isinstance(_al, (int, float))
+                                 and not isinstance(_al, bool)
+                                 and math.isfinite(_al)) else 0.0
+            rating = rec.get('rating_cn') or ''
+            bd = rec.get('breakdown') or {}
             # 全部因子：数据缺失的因子打 [缺] 标记，让"分数低因为没数据"和"分数低因为股票差"可区分
-            top_factors = sorted(bd.items(),
-                                 key=lambda x: x[1].get('weighted', 0),
-                                 reverse=True)
+            # 2026-09-22 修复（第二轮回归 P3-5）：weighted/raw_score 为 None 时
+            # `sorted` 的 key 与 f-string 都会 TypeError；非有限按 0 处理。
+            def _w(kv):
+                d = kv[1] if isinstance(kv[1], dict) else {}
+                _v = d.get('weighted', 0)
+                return _v if (isinstance(_v, (int, float))
+                              and not isinstance(_v, bool)
+                              and math.isfinite(_v)) else 0.0
+
+            top_factors = sorted(bd.items(), key=_w, reverse=True)
             factors_str = ' '.join(
-                f"{f}({d.get('raw_score',0):.0f})" + ('' if d.get('data_available', True) else '[缺]')
+                f"{f}({(d.get('raw_score') if isinstance(d, dict) else 0) or 0:.0f})"
+                + ('' if (isinstance(d, dict) and d.get('data_available', True)) else '[缺]')
                 for f, d in top_factors)
             medal = _MEDALS[i - 1] if i <= len(_MEDALS) else f"{i}."
             # 现金口径（2026-09-16 P1-2）：单票上限 40% 生效后，荐股 ≤2 只时
@@ -297,27 +375,37 @@ def generate_market_briefing(recommendations: List[Dict],
             lines.append(f"       🧩 因子: {factors_str}")
 
             # 概念板块
-            blocks = rec.get('blocks', {})
+            blocks = rec.get('blocks') or {}
             if blocks and blocks.get('concept_tags'):
                 tags = blocks['concept_tags'][:4]
                 lines.append(f"       🏷️ 板块: {'、'.join(tags)}")
 
             # 龙虎榜亮点
-            dt = rec.get('dragon_tiger', {})
+            dt = rec.get('dragon_tiger') or {}
             if dt and dt.get('records'):
                 r = dt['records'][0]
                 net = r.get('net_buy_wan', 0)
-                if abs(net) > 0:
+                # 2026-09-22 修复（第二轮回归 P3-5）：`abs(None)`/NaN 会 TypeError
+                if isinstance(net, (int, float)) and not isinstance(net, bool) \
+                        and math.isfinite(net) and abs(net) > 0:
                     lines.append(f"       🐉 龙虎榜: 净买入 {net:,.0f} 万")
             lines.append("")
 
-    elif recommendations is not None and not has_skip:
+    elif recommendations is not None and not has_skip and not shadow_recs:
         # 既无 skip 也无推荐条目：min_score 质量门槛自然过滤（非熔断停推），
         # 显式说明避免简报短线区块静默消失
+        # 2026-09-22 修复（缺陷排查 P1-11）：原条件缺少 `not shadow_recs` ——
+        # 影子日（极差市/拥挤度断路器触发但照常评分）rec_recs 为空、has_skip 为
+        # False → 这里会追加"🚫 今日无评分达标标的（min_score 质量门槛过滤）"，
+        # 与上方"🌑 影子观察（极端市况…）"自相矛盾，用户无法判断到底是
+        # "没好票""门槛偏高"还是"极端市况停推"。
+        # 同理，预过滤/动量硬过滤清零日也不应归因为"min_score 门槛"。
         lines.append("-" * 45)
         lines.append("  📈 短线评分排名（因子加权）")
         lines.append("-" * 45)
-        lines.append("    🚫 今日无评分达标标的（min_score 质量门槛过滤）")
+        # 2026-09-22：文案改为中性，不武断认定是 min_score 门槛
+        # （仅在确有 top_candidate 元信息时给出"距门槛"量化说明）
+        lines.append("    🚫 今日无评分达标标的")
         # 2026-09-14 需求：零推荐时展示当日最高分标的（明确标注分数），
         # 用于区分"市场确实没有好票"与"门槛相对当前评分尺度偏高"。
         # 数据来自策略透出的元信息条目（no_qualified + top_candidate）。
@@ -335,36 +423,52 @@ def generate_market_briefing(recommendations: List[Dict],
         lines.append("")
 
     # ── 4. 长线关注（基于基本面评分） ──
-    try:
-        from strategies.long_term import LongTermStrategy
-        long_cfg = {'buy': {'max_candidates': 5, 'min_score': 50}}
-        long_st = LongTermStrategy(long_cfg)
-        long_recs = long_st.run()
-        if long_recs:
-            lines.append("-" * 45)
-            lines.append("  📌 长线关注（ROE+PE 评分）")
-            lines.append("-" * 45)
-            for i, rec in enumerate(long_recs[:5], 1):
-                code = rec.get('code', '')
-                name = rec.get('name', '')
-                score = rec.get('score', 0)
-                roe = rec.get('roe', 'N/A')
-                eps = rec.get('eps', 'N/A')
-                pe = rec.get('pe', 'N/A')
-                allocation = rec.get('allocation_pct', 0)
-                cash = rec.get('cash_pct', 0) or 0
-                lines.append(f"    {i}. 🎯 {code} {name}  ⭐{score}/100"
-                             f"  💼{allocation:.0f}%"
-                             + (f"（现金 {cash:.0f}%）" if cash > 0 else ""))
-                if roe and str(roe) != 'N/A':
-                    # 修复（2026-09-06 审查）：eps 可能为 None（long_term fin.get('eps')），
-                    # 直接 :.2f 会抛 ValueError 并被外层 except 吞掉导致长线区块整体消失
-                    eps_str = f"{eps:.2f}" if isinstance(eps, (int, float)) else str(eps or 'N/A')
-                    roe_str = f"{roe:.1f}" if isinstance(roe, (int, float)) else str(roe)
-                    lines.append(f"       💹 ROE {roe_str}%  |  EPS {eps_str}  |  PE {pe}")
-            lines.append("")
-    except Exception as e:
-        logger.warning(f"长线策略运行失败: {e}")
+    # 2026-09-22 修复（缺陷排查 P1-12）：
+    #   · 原实现硬编码 `min_score: 50`，而 config.yml `long_term.buy.min_score` 是 65
+    #     → 简报"长线关注"区块与生产长线账本口径不一致（用户可能据此误读为当日长线选股结果）。
+    #   · 现优先使用调用方透传的 long_recs（eod_stock_picker 的 run_long_term 结果），
+    #     未透传时才回退到内联轻量扫描，且阈值改读 config.yml（失败回落 65/5）。
+    #     模块级行情缓存（分钟键）会让内联扫描命中选股同一份快照，成本很低。
+    if long_recs is None:
+        try:
+            from strategies.long_term import LongTermStrategy
+            _lt_cfg = (_load_briefing_config() or {}).get('long_term', {}).get('buy', {})
+            long_cfg = {'buy': {'max_candidates': int(_lt_cfg.get('max_candidates', 5)
+                                                      or 5),
+                                'min_score': float(_lt_cfg.get('min_score', 65) or 65)}}
+            long_recs = LongTermStrategy(long_cfg).run()
+        except Exception as e:
+            logger.warning(f"长线策略运行失败: {e}")
+            long_recs = []
+    if long_recs:
+        lines.append("-" * 45)
+        lines.append("  📌 长线关注（ROE+PE 评分）")
+        lines.append("-" * 45)
+        for i, rec in enumerate(long_recs[:5], 1):
+            code = rec.get('code', '')
+            name = rec.get('name', '')
+            score = rec.get('score', 0)
+            roe = rec.get('roe', 'N/A')
+            eps = rec.get('eps', 'N/A')
+            pe = rec.get('pe', 'N/A')
+            allocation = rec.get('allocation_pct', 0)
+            cash = rec.get('cash_pct', 0) or 0
+            lines.append(f"    {i}. 🎯 {code} {name}  ⭐{score}/100"
+                         f"  💼{allocation:.0f}%"
+                         + (f"（现金 {cash:.0f}%）" if cash > 0 else ""))
+            if roe and str(roe) != 'N/A':
+                # 修复（2026-09-06 审查）：eps 可能为 None（long_term fin.get('eps')），
+                # 直接 :.2f 会抛 ValueError 并被外层 except 吞掉导致长线区块整体消失
+                # 2026-09-22：同样补 math.isfinite —— NaN 满足 isinstance 会被
+                # 渲染成 "nan"（长度线 370 已按 None 处理，但 NaN 会漏过）。
+                eps_str = (f"{eps:.2f}"
+                           if isinstance(eps, (int, float)) and math.isfinite(eps)
+                           else str(eps or 'N/A'))
+                roe_str = (f"{roe:.1f}"
+                           if isinstance(roe, (int, float)) and math.isfinite(roe)
+                           else str(roe))
+                lines.append(f"       💹 ROE {roe_str}%  |  EPS {eps_str}  |  PE {pe}")
+        lines.append("")
 
     # ── 5. 数据源状态 ──
     # 2026-09-16 P1-1：该区块已上移至首屏「⚠️ 数据源降级警示」。

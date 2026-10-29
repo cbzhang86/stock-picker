@@ -139,10 +139,32 @@ def block_bootstrap(r, iters=5000, block=10, seed=7, start=1000.0, unit='percent
     0 笔（空序列）时显式抛 ValueError——调用方据此非 0 退出，不输出 0。
     """
     r = np.asarray(r, dtype=float)
+    # 2026-09-22 修复（缺陷排查 P1-19 配套）：非有限收益必须剔除 ——
+    # JSON 允许 NaN 字面量，一旦混入则 finals 全为 NaN →
+    # prob_profit = 0.0（nan > start 恒 False）并写出非法 JSON（NaN），
+    # 报告"看起来合理"。
+    _n_before = len(r)
+    r = r[np.isfinite(r)]
+    if len(r) != _n_before:
+        import logging as _lg
+        _lg.getLogger(__name__).warning(
+            f"逐笔收益含 {_n_before - len(r)} 个非有限值，已剔除")
     n = len(r)
     if n == 0:
         raise ValueError("逐笔收益序列为空（0 笔交易），无法做 Bootstrap；"
                          "请检查输入或回测是否真的有成交。")
+
+    # 2026-09-22 修复（缺陷排查 P1-19）：`max_start = max(1, n - block + 1)` 在
+    # n <= block 时恒为 1 → 每轮抽到的都是**同一整段原序列**（起点恒 0），
+    # iters 条路径完全相同 → prob_profit ∈ {0,1}、P5=P50=P95=observed，
+    # 却照常输出，制造虚假置信度（交易数少时极易触发，默认 block=10）。
+    # 现自动降级块长到 n//2 并显式披露。
+    _block_note = None
+    if n <= block:
+        _new_block = max(2, n // 2)
+        _block_note = (f"交易数 {n} ≤ block {block} → 块长自动降级为 {_new_block}"
+                       f"（否则重采样退化为恒等抽样，置信区间无意义）")
+        block = _new_block
 
     if unit == 'percent':
         mult = 1.0 + r / 100.0
@@ -183,6 +205,7 @@ def block_bootstrap(r, iters=5000, block=10, seed=7, start=1000.0, unit='percent
         'final_P95': round(p95, 4),
         'mean_trade_ret': round(float(np.mean(r)), 4),
         'unit': unit,
+        'block_note': _block_note,
     }
 
 

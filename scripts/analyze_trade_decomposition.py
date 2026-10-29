@@ -33,10 +33,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DB_TRADES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          'data', 'cache', 'backtest_cache.db')
 # 成本口径与 backtest_engine/config.yml 一致（单笔委托金额 33 万 → 最低档滑点 0.001）
-SLIP = 0.001
-COMMISSION = 0.0003
-STAMP = 0.0005
-TRANSFER = 0.00001
+# 2026-09-23（审查报告 R3）：与 config.yml/回测引擎单一来源对齐
+from core.costs import load_costs as _load_costs
+_costs = _load_costs()
+SLIP = _costs['slippage']
+COMMISSION = _costs['commission_rate']
+STAMP = _costs['stamp_duty']
+TRANSFER = _costs['transfer_fee']
 COST_ROUNDTRIP = SLIP * 2 + COMMISSION * 2 + STAMP + TRANSFER  # ≈ 0.312%
 
 
@@ -55,7 +58,7 @@ def main():
         "WHERE run_id=? ORDER BY date", (args.run_id,)).fetchall()
     if not trades:
         print(f"run {args.run_id} 无交易明细")
-        return
+        return 1   # 2026-09-22（第二轮回归 P2-2）：失败退出码可感知（原 exit 0）
     print(f"run {args.run_id}: {len(trades)} 笔 | 双边成本口径 ≈ {COST_ROUNDTRIP*100:.3f}%/笔\n")
 
     rows = []
@@ -116,9 +119,18 @@ def main():
           f"日内段净拖累 = {sum(intras)/len(intras):+.3f}%/笔")
 
     # 库中净值交叉校验
-    diffs = [abs(r['net'] - r['db_net']) for r in rows]
-    print(f"交叉校验（自算净 vs 库中 return_t1）: 平均偏差 {sum(diffs)/len(diffs):.3f}pp（应 <0.1，"
-          f"差异来自 buy_price 口径与精确费率）")
+    # 2026-09-22 修复（缺陷排查 P2-34）：`db_net` 可能为 NULL ——
+    # `backtest_trades.return_t1` 无 NOT NULL 约束，未平仓/无后续 K 线时
+    # `backtest_engine` 会写 None（同库 `mc_bootstrap._extract_returns` 专门
+    # 跳过 None）。原实现直接相减 → TypeError，`--run-id` 分析不可用。
+    _diffs = [abs(r['net'] - r['db_net']) for r in rows if r['db_net'] is not None]
+    if _diffs:
+        print(f"交叉校验（自算净 vs 库中 return_t1）: 平均偏差 {sum(_diffs)/len(_diffs):.3f}pp"
+              f"（应 <0.1，差异来自 buy_price 口径与精确费率）"
+              + (f" | 跳过 {len(rows) - len(_diffs)} 条 NULL"
+                 if len(_diffs) != len(rows) else ""))
+    else:
+        print("交叉校验: 库中 return_t1 全为 NULL（未平仓/无后续K线），跳过")
 
     # 分月
     print("\n=== 分月分解 ===")
@@ -157,4 +169,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

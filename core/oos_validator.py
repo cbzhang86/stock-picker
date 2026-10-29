@@ -57,43 +57,29 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # 全部可验证因子（K 线类 + 快照类）
-K_FACTORS = ['momentum', 'technical', 'volume_price',
-             # P3-2（2026-09-17）：跳日动量研究因子 —— 仅验证，权重恒 0。
-             # 动机：momentum 是 OOS 最强信号（hold1d test t=-2.20）但方向反向；
-             # 外部实测（EP007，5/14 模型）动量符号对"是否跳过最近 1~3 日"极敏感。
-             # A 股 T+1 + 次日反转强，skip=1/3 可能让符号翻正 → 成为第二条正 alpha 腿。
-             # 若验证为正，才能安全降低 hot_theme 的集中度（当前 0.50 是因子池
-             # 只有唯一正 alpha 腿的"症状"）。
-             'skip_momentum_1', 'skip_momentum_3',
-             # P3-3（2026-09-17）：反转因子 —— momentum 取负。
-             # 依据：2.2 年全市场面板 momentum IC -0.0298 (t=-2.11)，三折符号稳定，
-             # 与华泰 A 股短线反转研究一致（沪深300 1 个月反转 IC 27.69%）。
-             # 不是"赌它翻正"，而是**把已证实的反向信号显式翻转为正向因子**。
-             # 华泰研报口径："反转因子"= 负动量，是 A 股长期 IC 最强的经典因子之一。
-             'reversal_20d',
-             # 2026-09-19：对标 Barra 补充缺失的两类因子（波动率、流动性），
-             # 用 kline_cache 已有历史数据（2024-01~2026-09，5232只）即可验证，不必等
-             # P5 数据积累。方向（低波动/低流动性溢价是否成立）由 IC 决定。
-             'volatility', 'liquidity',
-             # 2026-09-19（方案G）：偏离成分因子 —— 把"水平"与"偏离"分离后的产物。
-             # 证伪证据：原始 liquidity(−log amount) 与 60 日滚动中位数（规模代理）
-             # 相关 0.838 → 84% 是小市值效应；剥离后的偏离成分 ICIR 反超
-             # （liq_dev 0.535 > 0.418，vol_dev 0.225 > vol_level 0.126）且与规模正交。
-             # 方向：偏离越低（缩量/波动收敛）→ 分越高，已由 IC 确认。
-             'liq_dev', 'vol_dev']
+# 2026-09-23（审查报告 R2）：因子清单改由 core/factor_registry **单一来源**派生。
+# 此前与 factor_diag/recalibrate/scoring_model 各自手写 → 已发生过"清单漏改 →
+# 诊断器假绿灯"的真实事故（factor_diag 漏 4 个启用因子后仍打印"未检测到恒值"）。
+# 新增因子请先在 factor_registry 登记，再在 factor_library 产出。
+from core.factor_registry import (OOS_KLINE_FACTORS, OOS_SNAPSHOT_FACTORS,
+                                  OOS_ONLY_FACTORS)
+
+K_FACTORS = list(OOS_KLINE_FACTORS)
 # P1-I（2026-09-05 审查报告）：新因子 valuation_fundamental / event_catalyst
 # 此前不在验证清单 → "链路已通但永远拿不到 OOS 证据 → 永远不能给权重"死锁。
-SNAPSHOT_FACTORS = ['capital_flow', 'hot_theme', 'dragon_tiger',
-                    'valuation_fundamental', 'event_catalyst']
+SNAPSHOT_FACTORS = list(OOS_SNAPSHOT_FACTORS)
 ALL_FACTORS = K_FACTORS + SNAPSHOT_FACTORS
 
-# 实盘成交成本（与 config.yml backtest 段一致）
-# P0-C 关联修复：补齐印花税（仅卖出）+ 过户费（双向），此前 OOS 收益口径
-# 只扣佣金+滑点，与回测引擎不一致（2026-09-05 起两处统一）。
-COMMISSION = 0.0003
-SLIPPAGE = 0.001
-STAMP_DUTY = 0.0005     # 印花税，仅卖出收取
-TRANSFER_FEE = 0.00001  # 过户费，买卖双向
+# 实盘成交成本 —— 2026-09-23（审查报告 R3）：改由 core.costs **单一来源**读取
+# config.yml backtest 段。此前 4 个常量在本文件硬编码，与 config/回测引擎共 6 处
+# 重复，契约 O（OOS 口径=实盘）全靠人肉对齐 —— 已发生过漏扣印花税的真实事故。
+# 保持常量名不变以兼容既有调用点与测试。
+import core.costs as _costs
+_cost = _costs.load_costs()
+COMMISSION = _cost['commission_rate']
+SLIPPAGE = _cost['slippage']
+STAMP_DUTY = _cost['stamp_duty']     # 印花税，仅卖出收取
+TRANSFER_FEE = _cost['transfer_fee']  # 过户费，买卖双向
 
 # 收益口径列
 RET_HOLD1D = 'ret_hold1d'       # close_t0 → close_t1（尾盘买入、持有 1 天，默认口径）
@@ -343,7 +329,12 @@ class OOSValidator:
             ret_daily = df.groupby('code', sort=False)['close'].pct_change()
             vol20 = (ret_daily.groupby(df['code'], sort=False)
                      .rolling(20).std().reset_index(level=0, drop=True))
-            vol_level60 = (vol20.fillna(0).groupby(df['code'], sort=False)
+            # 2026-09-22 修复（缺陷排查 P2-14 · 契约 B）：原为 `vol20.fillna(0)`
+            # —— 把"前 20 日不足/缺失"的波动率填成 0 再取 60 日滚动中位数，
+            # 于是 `min_periods=30` 形同虚设（填 0 后全部算有效值），
+            # 前 20 日 `vdev = vol20 - 0` 严重失真。改为保留 NaN（rolling.median
+            # 会跳过 NaN，min_periods 恢复语义），与上方 liq_dev 的口径一致。
+            vol_level60 = (vol20.groupby(df['code'], sort=False)
                            .rolling(60, min_periods=30).median()
                            .reset_index(level=0, drop=True))
             vdev = vol20 - vol_level60
@@ -658,7 +649,14 @@ class OOSValidator:
         实现：先在每个交易日内对因子和收益做秩变换，再算 Pearson ——
         数学上等价于 Spearman，但向量化后比逐日调 spearmanr 快一个量级。
         """
-        sub = df[[factor, ret_col, 'date']].dropna()
+        # 2026-09-22 修复（缺陷排查 P2-15 · 契约 A）：`dropna()` 不剔 ±Inf，
+        # 而 Inf 在秩变换中会被排成"最高名次"→ 伪造出极高的 IC（实测构造含 inf
+        # 的面板可得 IC≈0.94）。改为显式按有限性过滤。
+        sub = df[[factor, ret_col, 'date']].copy()
+        for _c in (factor, ret_col):
+            sub[_c] = pd.to_numeric(sub[_c], errors='coerce')
+            sub.loc[~np.isfinite(sub[_c].astype(float)), _c] = np.nan
+        sub = sub.dropna()
         # 单日样本 < 5 只无法给出有意义的秩相关
         cnt = sub.groupby('date')[factor].transform('size')
         sub = sub[cnt >= 5]
@@ -1045,13 +1043,25 @@ class OOSValidator:
 
     def walk_forward(self, panel: pd.DataFrame, factors: Sequence[str] = None,
                      n_splits: int = 3, train_ratio: float = 0.7,
-                     ret_col: str = RET_HOLD1D) -> Dict:
+                     ret_col: str = RET_HOLD1D, purge_days: int = None) -> Dict:
         """
         滚动前进验证（walk-forward）
 
         把日期序列切成 n_splits 个连续块，第 k 折用前 k 块训练、第 k+1 块测试。
         每折的"测试"都在训练之后，严格无前视。
         返回每折的 OOS IC 及其均值 —— 均值比单次切分稳健得多。
+
+        2026-09-22 修复（缺陷排查 P1-3）：
+          · 原实现**完全没有 purge/embargo** —— `train_d = dates[:test_start]` 与
+            `test_d` 紧邻，训练段末尾样本的 60 日因子窗口与 T+1~T+5 标签直接跨入
+            测试段（同文件 `split_by_time` 为此专门实现了 purge 并在报告披露，
+            两条 OOS 口径一条有保护、一条没有）→ 本函数给出的 `mean_oos_ic`
+            系统性高估，且与 test IC 不可比。
+          · 原实现还计算了 `tr`（训练段 DataFrame）后**从未使用**，本函数实际
+            没有"拟合"步骤，是"分段 OOS IC"。此处删除该无用计算并在返回值中
+            显式声明口径，避免被误读为"训练→预测"式 walk-forward。
+          · `train_ratio` 参数同样从未被使用（分块固定按 n_splits+1 等分），
+            保留签名以兼容既有调用方，但不再声称它生效。
         """
         if factors is None:
             factors = [f for f in ALL_FACTORS if f in panel.columns]
@@ -1060,6 +1070,12 @@ class OOSValidator:
         if len(dates) < n_splits + 1:
             return {'folds': [], 'factors': {}, 'note': '交易日数量不足以做 walk-forward'}
 
+        # purge 默认开启（取最长因子窗口），与 split_by_time 同口径
+        if purge_days is None:
+            purge_days = OOSValidator.DEFAULT_PURGE_DAYS
+        purge_days = int(purge_days)
+        purge_notes = []
+
         # 扩展式切分：fold k 的测试窗口是第 k 个块
         fold_size = len(dates) // (n_splits + 1)
         folds = []
@@ -1067,10 +1083,15 @@ class OOSValidator:
             test_start = fold_size * k
             test_end = fold_size * (k + 1) if k < n_splits else len(dates)
             test_d = dates[test_start:test_end]
-            train_d = dates[:test_start]
+            # 训练段末尾剔除 purge_days 个交易日（其标签会跨入测试段）
+            _p, _pnote = OOSValidator._resolve_purge(len(dates), test_start, purge_days)
+            if _pnote:
+                purge_notes.append(f'fold {k}: {_pnote}')
+            train_end = max(0, test_start - _p)
+            train_d = dates[:train_end]
             if not test_d or not train_d:
                 continue
-            folds.append({'fold': k, 'train': train_d, 'test': test_d})
+            folds.append({'fold': k, 'train': train_d, 'test': test_d, 'purge': _p})
 
         per_factor = {}
         for f in factors:
@@ -1078,7 +1099,8 @@ class OOSValidator:
                 continue
             fold_ics = []
             for fd in folds:
-                tr = panel[panel['date'].isin(set(fd['train']))]
+                # 注意：本函数无"拟合"步骤（因子权重不由训练段学得），
+                # train_d 仅用于界定"测试段之前的历史"，故不再物化训练 DataFrame。
                 te = panel[panel['date'].isin(set(fd['test']))]
                 ic = self.daily_ic(te, f, ret_col)
                 if len(ic) == 0:
@@ -1097,11 +1119,18 @@ class OOSValidator:
                 per_factor[f] = {'fold_ics': [], 'mean_oos_ic': None,
                                  'std_oos_ic': None, 'stable': None}
 
+        note = (f'分段 OOS IC（无拟合步骤，train 段仅界定测试段之前的历史）；'
+                f'每折在训练段末尾 purge {purge_days} 日以消除标签重叠')
+        if purge_notes:
+            note += ' | ' + ' | '.join(purge_notes)
         return {
             'folds': [{'fold': f['fold'],
-                       'train': [f['train'][0], f['train'][-1]],
-                       'test': [f['test'][0], f['test'][-1]]} for f in folds],
+                       'train': [f['train'][0], f['train'][-1]] if f['train'] else None,
+                       'test': [f['test'][0], f['test'][-1]],
+                       'purge_days': f['purge']} for f in folds],
             'factors': per_factor,
+            'purge_days_requested': purge_days,
+            'note': note,
         }
 
     @staticmethod

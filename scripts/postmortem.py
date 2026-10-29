@@ -159,10 +159,17 @@ def cmd_backfill(args) -> int:
 # ── stats（周检熔断闸门）──────────────────────────────
 
 def _hit(pred: str, outcome: float) -> bool:
+    """命中判定（2026-09-22 修复，缺陷排查 P1-25）。
+
+    原实现 up/down **无死区**（+0.01% 即算命中），而 flat 用 ±FLAT_BAND
+    → 判定口径不对称，命中率系统性偏高 → `HIT_RATE_FLOOR` 熔断（退出码 1）
+    更难触发，把"复盘无信息增量"这一信号掩盖掉。
+    现 up/down 同样要求超出 FLAT_BAND（与 flat 的死区一致、方向相反）。
+    """
     if pred == 'up':
-        return outcome > 0
+        return outcome > FLAT_BAND
     if pred == 'down':
-        return outcome < 0
+        return outcome < -FLAT_BAND
     return abs(outcome) <= FLAT_BAND
 
 

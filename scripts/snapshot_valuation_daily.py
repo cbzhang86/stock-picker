@@ -21,6 +21,7 @@
 """
 import argparse
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime
@@ -113,8 +114,11 @@ def main():
     miss = {'pe_lost': 0, 'pb_lost': 0, 'mv_lost': 0}
     nonpos = {'pe': 0, 'pb': 0}
     for _, r in quotes.iterrows():
-        code = str(r.get('code', '')).zfill(6)
-        if not code or code.startswith('39'):
+        # 2026-09-22 修复（缺陷排查 P3）：`not code` 是死判断 —— `str('').zfill(6)`
+        # 恒为 '000000'（真值）。改为显式校验 6 位数字代码。
+        _raw_code = r.get('code')
+        code = str(_raw_code).strip().zfill(6) if _raw_code is not None else ''
+        if not re.fullmatch(r'\d{6}', code) or code.startswith('39'):
             continue
         pe_raw, pb_raw = _f_raw(r.get('pe')), _f_raw(r.get('pb'))
         tmv, cmv = _f(r.get('total_market_cap')), _f(r.get('circulating_market_cap'))

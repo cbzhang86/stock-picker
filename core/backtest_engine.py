@@ -18,6 +18,7 @@
 """
 
 import logging
+import math
 import os
 import sqlite3
 from datetime import datetime, timedelta
@@ -197,6 +198,33 @@ class BacktestEngine:
             strategy = ShortTermStrategy(self.config)
         else:
             strategy = LongTermStrategy(self.config)
+        # 2026-09-23 修复（回测重跑事故复盘）：**回测不得消耗生产 ASHareHub 配额**。
+        # 策略的 enrichment 会按 rank 调 AShareHub 四源（moneyflow/tech/concepts/
+        # financial）与北向 —— 这些调用不区分实盘/回测，回测逐日运行时大量 cache
+        # miss → 实盘 API 调用 → 当日 90/100 配额闸门被打满（实测 2026-09-23 两次
+        # 回测重跑后当日 eod 四源全部降级）。
+        # 实现（2026-09-23 交接单 R1 修订）：置 `DataEngine._quota_frozen = True`
+        # → `_asharehub_budget_ok()` 入口直接返回 False。相比早前"逐 key 置
+        # `_source_available=False`"的做法，本方案：
+        #   · **一次性覆盖全部 ASHareHub 系 key**（含 akshare_north_flow 与未来新增）
+        #     —— 旧做法的跳过集合只含 4 个 asharehub_*，akshare_north_flow 会被
+        #     `_recover_sources()` 的 10 分钟自动恢复翻回 True（交接单定为"假保护"）；
+        #   · **完全不写生产配额账本**（不调 `_consume_asharehub_quota`）→ 生产侧
+        #     的 owner/用量归因不再被回测污染；
+        #   · 不把生产源标记为故障（只是"回测选择不调用"）。
+        # 各 get_* 仍**先读预取缓存**（tech/concepts 有 7 天 TTL 缓存，命中即返回），
+        # 仅 moneyflow 无预取缓存（data_engine 注释：当日资金流预取无用）→ 回测的
+        # 资金流走 factor_daily.db 快照 + `short_term._enrich_data` 的 is_backtest 守卫。
+        # 附带修复一个前视泄漏：预取缓存存的是"最新"数据（7 天 TTL），回测把它
+        # 套到历史日期上 = 用未来数据。
+        try:
+            _de = strategy.data_engine
+            _de._quota_frozen = True
+            _de.set_quota_owner(f'backtest:{mode}')
+            logger.info("回测模式：ASHareHub 配额已冻结（不调实盘 API、不写生产账本）")
+        except Exception as _e:
+            logger.warning(f"回测配额保护设置失败（继续，但不保证不耗配额）: {_e}")
+
         # P2-5 修复（2026-09-17）：--ablate 消融权重需在 ScoringModel 实例化后
         # 显式覆盖 —— ScoringModel 加载优先级 v1.json > config，config 传入的
         # 消融权重被 v1.json 静默覆盖 → 消融实际不生效（所有消融结果 = 基线）。
@@ -348,6 +376,16 @@ class BacktestEngine:
 
         # 批量读取：一次性拉取所有股票在目标区间的 K 线
         # 通过 SQLite 的 WHERE IN 拼接加速
+        # 2026-09-22 修复（缺陷排查 P2-10）：SQL 下界**前移 30 个自然日**作为
+        # 回看窗口 —— 原实现从 start_date 起取数，导致区间首日 `idx == 0`、
+        # 无前收盘 → `pct_chg` 恒 0.0（当日涨停过滤 / 涨幅区间过滤 / 追高惩罚
+        # 在首日全部失效），且前 3 日 `volume_ratio` 恒 1.0（无均量基准）。
+        # 回看行只用于算 prev_close / 均量，快照日期仍在下方按 [start,end] 过滤。
+        try:
+            _lookback_start = (datetime.strptime(str(start_date), '%Y-%m-%d')
+                               - timedelta(days=30)).strftime('%Y-%m-%d')
+        except (ValueError, TypeError):
+            _lookback_start = start_date
         codes_batches = [codes[i:i+500] for i in range(0, len(codes), 500)]
         for cb in codes_batches:
             try:
@@ -359,7 +397,7 @@ class BacktestEngine:
                         f"FROM kline_cache "
                         f"WHERE code IN ({placeholders}) AND date>=? AND date<=? "
                         f"ORDER BY code, date",
-                        conn, params=[str(c).zfill(6) for c in cb] + [start_date, end_date]
+                        conn, params=[str(c).zfill(6) for c in cb] + [_lookback_start, end_date]
                     )
                 finally:
                     conn.close()
@@ -400,8 +438,11 @@ class BacktestEngine:
         self._hot_lookup = hot_lookup
 
         # 构建 {date: DataFrame}
+        # 2026-09-22：K 线已在 SQL 层前移回看窗口（见上），此处必须把快照日期
+        # 限回 [start_date, end_date]，否则回看行会被当成回测交易日参与选股。
         trade_dates = sorted(set(
             ds for kline in kline_dict.values() for ds in kline['date_str'].unique()
+            if str(start_date) <= ds <= str(end_date)
         ))
         snapshots = {}
 
@@ -740,14 +781,14 @@ class BacktestEngine:
         try:
             from core.trading_calendar import trading_days
         except Exception:
-            return self._locate_tn_rows_fallback(kline)
+            return self._locate_tn_rows_fallback(kline, buy_date)
 
         try:
             end_look = (datetime.strptime(buy_date, '%Y-%m-%d')
                         + timedelta(days=40)).strftime('%Y-%m-%d')
             cal = trading_days(buy_date, end_look)
             if not cal:
-                return self._locate_tn_rows_fallback(kline)
+                return self._locate_tn_rows_fallback(kline, buy_date)
             # 2026-09-07 回访修复：日历缓存有年份覆盖下限（_MIN_YEAR=2024），
             # buy_date 早于覆盖范围时 cal 非空但 future[0] 会指向错误年份，
             # 必须校验首个目标日确实紧跟 buy_date（间隔 ≤7 自然日），
@@ -758,7 +799,7 @@ class BacktestEngine:
             from datetime import datetime as _dt, timedelta as _td
             if (_dt.strptime(future[0], '%Y-%m-%d')
                     - _dt.strptime(buy_date, '%Y-%m-%d')) > _td(days=7):
-                return self._locate_tn_rows_fallback(kline)
+                return self._locate_tn_rows_fallback(kline, buy_date)
             t1_target = future[0]
             t5_target = future[4] if (t5_needed and len(future) >= 5) else None
 
@@ -786,13 +827,42 @@ class BacktestEngine:
             return t1_idx, t5_idx
         except Exception as e:
             logger.warning(f"T+N 交易日定位失败（回退位置索引）: {str(e)[:60]}")
-            return self._locate_tn_rows_fallback(kline)
+            return self._locate_tn_rows_fallback(kline, buy_date)
 
     @staticmethod
-    def _locate_tn_rows_fallback(kline: pd.DataFrame):
-        """日历不可用时的回退：与旧位置索引口径完全一致。"""
-        t1_idx = 1 if len(kline) > 1 else None
-        t5_idx = 5 if len(kline) > 5 else None
+    @staticmethod
+    def _entry_row_index(kline: pd.DataFrame, buy_date: str):
+        """买入行 = kline 中日期 >= buy_date 的第一行。
+
+        2026-09-22 新增（剩余项 #1）：K 线拉取窗口已向**前**扩展 30 个自然日
+        （为 ATR14 提供入场前历史），kline 不再保证首行 = buy_date。
+        找不到（该股 buy_date 后停牌且无更早数据）返回 None。
+        """
+        try:
+            dates = pd.to_datetime(kline['date']).dt.strftime('%Y-%m-%d')
+            mask = dates >= str(buy_date)
+            if not mask.any():
+                return None
+            return int(mask.values.argmax())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _locate_tn_rows_fallback(kline: pd.DataFrame, buy_date: str = None):
+        """日历不可用时的回退：与旧位置索引口径完全一致。
+
+        2026-09-22 修正（剩余项 #1）：K 线窗口已向前扩展（首行 ≠ buy_date），
+        固定用 iloc[1]/iloc[5] 会把 T+1 定位到**回看期**里（早于买入日）。
+        现先定位买入行，再取其后第 1/5 行；定位失败返回 (None, None) 弃算。
+        """
+        if buy_date is not None:
+            base = BacktestEngine._entry_row_index(kline, buy_date)
+        else:
+            base = 0
+        if base is None:
+            return None, None
+        t1_idx = base + 1 if len(kline) > base + 1 else None
+        t5_idx = base + 5 if len(kline) > base + 5 else None
         return t1_idx, t5_idx
 
     def _calculate_results(self, records: List[Dict],
@@ -817,9 +887,15 @@ class BacktestEngine:
             if buy_price <= 0:
                 continue
 
-            # 拉取买入日后 30 天 K 线（复用 DataEngine 缓存）
+            # 拉取买入日前后 K 线（复用 DataEngine 缓存）
+            # 2026-09-22 扩展（剩余项 #1）：起点**前移 30 个自然日**（≈20 个交易日），
+            # 为 `_simulate_exit_path` 的 ATR14 提供入场前历史（此前从 buy_date 起拉，
+            # `upto_idx < 14` 恒成立 → ATR 恒 None → 配置的 atr 止损全程静默回落固定）。
+            # T+N 定位按交易日历日期匹配（不依赖首行=买入日），回看行不影响其结果。
             end_look = (datetime.strptime(buy_date, '%Y-%m-%d') + timedelta(days=40)).strftime('%Y-%m-%d')
-            kline = self.data_engine.get_kline(code, start_date=buy_date, end_date=end_look)
+            _look_start = (datetime.strptime(buy_date, '%Y-%m-%d')
+                           - timedelta(days=30)).strftime('%Y-%m-%d')
+            kline = self.data_engine.get_kline(code, start_date=_look_start, end_date=end_look)
 
             if kline is None or kline.empty or len(kline) < 2:
                 continue
@@ -865,8 +941,11 @@ class BacktestEngine:
                     ret_t5 = (effective_sell_t5 / effective_buy - 1) * 100
                 else:
                     ret_t5 = None
-                if ret_t5 is not None:
-                    trade_returns_t5.append(ret_t5)
+                # 2026-09-22 修复（缺陷排查 P2）：原实现只在 ret_t5 非 None 时
+                # 才 append，而下面 else 分支恒 append(None) → 两条路径产生的
+                # trade_returns_t5 长度不一致（t5_valid 过滤后统计虽不受影响，
+                # 但与 trade_details 的下标对齐关系被破坏）。统一恒 append。
+                trade_returns_t5.append(ret_t5)
             else:
                 trade_returns_t5.append(None)
 
@@ -876,7 +955,11 @@ class BacktestEngine:
             # 注意：严格 T+1 制度下退出检查从买入次日开始（见 _simulate_exit_path）。
             # close_t0 已移除（2026-09-17）：统一 T+1 入场，与 fill_price=open_t1、
             # 与 _simulate_portfolio 的 open_t1 口径完全一致；不再响应 fill_convention。
-            entry_idx = 1
+            # 2026-09-22 修复（缺陷排查 P1-10）：原为硬编码 `entry_idx = 1`，
+            # 而买入价取的是 `kline.iloc[t1_idx]['open']`。当 `_locate_tn_rows`
+            # 因停牌缺口"顺延"（t1_idx > 1）时，退出窗口仍从第 1 行起算 →
+            # 与真实入场行错位（潜在同日买卖/窗口整体偏移）。改为与买入价同源。
+            entry_idx = t1_idx
             # P2-N：ATR 自适应止损（stop_mode='atr'），止损宽度 = max(atr_mult×ATR, 固定距离)
             stop_abs = None
             if self.sell_config.get('stop_mode', 'fixed') == 'atr':
@@ -1063,16 +1146,32 @@ class BacktestEngine:
         # P2-N：ATR 自适应止损开关（默认 fixed 保持历史行为）
         atr_mode = (self.sell_config.get('stop_mode', 'fixed') == 'atr')
         atr_mult = float(self.sell_config.get('atr_mult', 1.0))
+        if atr_mode:
+            # 2026-09-22 更新（剩余项 #1）：K 线拉取窗口已前移 30 个自然日
+            # （≈20 个交易日），`_atr_from_kline` 的 `upto_idx >= 14` 现在可以满足
+            # → atr 模式真正生效。此处仅记录口径：止损宽度 =
+            # max(atr_mult × ATR14, 固定止损距离)，无前视（只用入场行及之前）。
+            logger.info(
+                f"ATR 自适应止损已启用：宽度 = max(atr_mult={atr_mult} × ATR14, "
+                f"固定距离 {self.sell_config.get('stop_loss')})；"
+                f"K 线窗口已前移 30 日以提供入场前历史（无前视）")
 
         # ── 预拉每笔推荐的 K 线（缓存命中，毫秒级）──
         klines = {}        # (决策日, code) -> kline df
         row_of_date = {}   # (决策日, code) -> {'yyyy-mm-dd': 行号}
+        # 2026-09-22 扩展（剩余项 #1）：起点前移 30 个自然日，为组合模拟退出段的
+        # ATR14 提供入场前历史（此前从决策日起拉 → `upto_idx < 14` 恒成立 →
+        # atr 模式全程静默回落固定止损）。回看行只作为 ATR 的历史，
+        # 不会成为买入/退出日（日历已过滤到首个决策日之后，见下）。
         for date in sorted(by_date.keys()):
             for rec in by_date[date]:
                 key = (date, rec['code'])
                 end_look = (datetime.strptime(date, '%Y-%m-%d')
                             + timedelta(days=40)).strftime('%Y-%m-%d')
-                k = self.data_engine.get_kline(rec['code'], start_date=date, end_date=end_look)
+                _look_start = (datetime.strptime(date, '%Y-%m-%d')
+                               - timedelta(days=30)).strftime('%Y-%m-%d')
+                k = self.data_engine.get_kline(rec['code'], start_date=_look_start,
+                                               end_date=end_look)
                 if k is None or k.empty or len(k) < 2:
                     continue
                 k = k.reset_index(drop=True)
@@ -1088,6 +1187,12 @@ class BacktestEngine:
         cal_set = set(by_date.keys())
         for m in row_of_date.values():
             cal_set.update(m.keys())
+        # 2026-09-22（剩余项 #1 配套）：K 线已向前扩展回看窗口，必须把回看期
+        # 从组合日历中**剔除**（只保留 >= 首个决策日），否则 ATR 的历史行会被
+        # 当成回测交易日参与每日权益标记，total_trading_days（Sharpe 分母）失真。
+        _first_decision = min(by_date.keys()) if by_date else None
+        if _first_decision:
+            cal_set = {d for d in cal_set if str(d) >= str(_first_decision)}
         try:
             from core.trading_calendar import trading_days
             _start = min(by_date.keys()) if by_date else None
@@ -1133,6 +1238,8 @@ class BacktestEngine:
                 _batch_want = base_equity * (total_alloc / 100.0) if self.sizing_mode == 'absolute' \
                     else base_equity * 1.0
                 _cash_scale = min(1.0, cash / _batch_want) if _batch_want > 0 else 1.0
+                _skipped_cash = 0
+                _missing_alloc = 0   # 2026-09-23：本批缺 allocation_pct 的笔数
                 still_pending = []
                 for dec_date, rec in pending_buys:
                     key = (dec_date, rec['code'])
@@ -1165,15 +1272,41 @@ class BacktestEngine:
                     # absolute 的超配处理（2026-09-18 修正）：Σalloc > 100% 时按比例
                     # 收缩到 100%，**不做顺序截断**——顺序截断会让先买的吃满、后买的
                     # 只剩零头，使结果依赖 pending_buys 的排序（非确定性伪影）。
-                    _alloc_pct = rec.get('allocation_pct', 0) or 0
+                    # 2026-09-23 修复（审查报告 §2.1 A-5）：`allocation_pct` 缺失/非有限时
+                    # 原实现静默按 0 处理 → 该笔在 normalized 口径下拿到 0 权重
+                    # （等价于"从组合里消失"），而回测照常出数。现计数并在批末披露。
+                    _alloc_raw = rec.get('allocation_pct')
+                    _alloc_pct = 0.0
+                    if isinstance(_alloc_raw, (int, float)) and not isinstance(_alloc_raw, bool):
+                        try:
+                            _alloc_pct = float(_alloc_raw)
+                        except (TypeError, ValueError):
+                            _alloc_pct = 0.0
+                        if _alloc_pct != _alloc_pct or _alloc_pct in (float('inf'), float('-inf')):
+                            _alloc_pct = 0.0
+                    if _alloc_pct <= 0:
+                        _missing_alloc += 1
                     if self.sizing_mode == 'absolute':
                         _cap_scale = min(1.0, 100.0 / total_alloc) if total_alloc > 0 else 1.0
                         allocated = base_equity * (_alloc_pct * _cap_scale / 100.0)
                     else:
                         allocated = base_equity * (_alloc_pct / total_alloc)
-                    # 防御（现金不回补硬契约）：不得透支、不得让 cash 为负
+                    # 2026-09-22 修复（缺陷排查 P0-1 · 契约 I）：
+                    # 现金不足以覆盖本批需求时，按 **_cash_scale 比例**收缩每一笔
+                    # （与上方注释承诺的"不做顺序截断"一致）。原实现计算了
+                    # _cash_scale 却从未使用，真正生效的是
+                    # `if allocated > cash: allocated = cash` —— 先到先得式截断，
+                    # 结果依赖 pending_buys 的排序（非确定性），且排在后面的票
+                    # 直接拿 0 仓位、既不定投也不回队列，被**静默丢弃**。
+                    allocated *= _cash_scale
+                    # 防御（现金不回补硬契约）：浮点残留不得透支
                     if allocated > cash:
                         allocated = cash
+                    if allocated <= 0:
+                        # 现金已耗尽：实盘同样买不进，不延后买入（避免把过期信号
+                        # 在数日后按当时价格成交）。此处计数而非静默丢弃。
+                        _skipped_cash += 1
+                        continue
                     slip = self._slippage_for(allocated)
                     buy_cost_ps = fill * (1 + slip) * (1 + self.commission + self.transfer_fee)
                     if allocated > 0 and buy_cost_ps > 0:
@@ -1203,6 +1336,20 @@ class BacktestEngine:
                             'rec': rec,
                         }
                 pending_buys = still_pending
+                if _missing_alloc:
+                    _missing_alloc_total = getattr(self, '_missing_alloc_total', 0) + _missing_alloc
+                    self._missing_alloc_total = _missing_alloc_total
+                    logger.warning(
+                        f"{d} {_missing_alloc} 笔推荐缺 allocation_pct（或非正/非有限）"
+                        f"→ 已按 0 权重处理（该笔在 normalized 口径下等于不参与组合）。"
+                        f"累计 {_missing_alloc_total} 笔。若数量异常，请检查"
+                        f"PortfolioOptimizer.allocate 是否在落库前执行。")
+                if _skipped_cash:
+                    logger.warning(
+                        f"{d} 现金不足：{_skipped_cash} 笔推荐未建仓"
+                        f"（现金 {cash:,.0f} / 本批需求 {_batch_want:,.0f}，"
+                        f"实际按 {_cash_scale:.2%} 比例收缩）。"
+                        f"实盘同样买不进，此处仅作可观测性记录。")
 
             # ── 2. 盘口阶段：持仓退出检查（严格 T+1：买入日不检查）──
             # 保守序：跳空穿越按开盘价 → 盘中止损优先于止盈（双触发不可知先后）
@@ -1474,7 +1621,16 @@ class BacktestEngine:
                     raw = detail.get('raw_score', 50)
                 else:
                     raw = 50
-                factor_scores[fname] = raw
+                # 2026-09-22 修复（契约 A）：非有限 raw_score 若进入 all_scores，
+                # 会让 spearmanr 整体返回 NaN（该因子 IC 静默变 None）。
+                # 缺失/非有限一律按"该因子无值"跳过，不伪装成 50 参与统计。
+                try:
+                    raw_f = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(raw_f):
+                    continue
+                factor_scores[fname] = raw_f
 
             # ← 这里补上缺失的 append
             rows.append({

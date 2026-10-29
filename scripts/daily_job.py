@@ -62,8 +62,20 @@ LOG_KEEP_DAYS = 30
 # AShareHub 日配额与本地安全闸门（与 data_engine._asharehub_budget 保持一致：
 # 闸门 = budget - 10，预留 10 次给手动验证）
 ASHAREHUB_BUDGET = 100
+# 2026-09-23（交接单 A6）：预留量与 DataEngine.ASHAREHUB_RESERVE 必须一致。
+# 此处保留独立常量（daily_job 不 import data_engine，避免拉起其依赖），
+# 但由 tests/test_quota_reserve_consistency_20260923.py 守卫二者相等。
 QUOTA_RESERVE = 10
 QUOTA_FILE = os.path.join(PROJECT_ROOT, 'data', 'cache', 'asharehub_quota.json')
+
+# 2026-09-22 新增（缺陷排查 P2-21）：子进程看门狗上限（秒）。
+# 参考耗时：eod_stock_picker ~250s、周日全市场 K 线预取可达数十分钟
+# → 默认 3600s 只用于兜底"网络挂死导致永久阻塞"，正常任务不会触碰。
+# 置 0 或负数可禁用（不推荐）。可用环境变量 DAILY_JOB_CHILD_TIMEOUT 覆盖。
+try:
+    _CHILD_TIMEOUT_S = int(os.environ.get('DAILY_JOB_CHILD_TIMEOUT', '3600'))
+except ValueError:
+    _CHILD_TIMEOUT_S = 3600
 
 
 def _beijing_now() -> datetime:
@@ -95,7 +107,11 @@ def _prune_logs() -> None:
 
 
 def _read_quota():
-    """只读 AShareHub 配额账本（不消耗配额）。返回 (used, budget) 或 None"""
+    """只读 AShareHub 配额账本（不消耗配额）。返回 (used, budget) 或 None
+
+    2026-09-23（交接单 A2）：账本新增 `owner` / `last_ts` 元数据字段后，
+    本函数额外通过 `_read_quota_owner()` 暴露归属（旧账本无该字段 → unknown）。
+    """
     try:
         with open(QUOTA_FILE, encoding='utf-8') as f:
             d = json.load(f)
@@ -110,28 +126,53 @@ def _read_quota():
         return None
 
 
+def _read_quota_owner() -> str:
+    """读取配额账本归属（2026-09-23 交接单 A2）；旧账本/读失败 → 'unknown'。"""
+    try:
+        with open(QUOTA_FILE, encoding='utf-8') as f:
+            d = json.load(f)
+        return str(d.get('owner') or 'unknown')
+    except Exception:
+        return 'unknown'
+
+
 def _precheck_quota() -> None:
-    """eod 启动前的配额预检（2026-09-16 P1-1 / P2-2）
+    """eod 启动前的配额预检（2026-09-16 P1-1 / P2-2；2026-09-23 交接单 A5 升级）
 
     刻意只告警不阻断：若在此中止 eod，当日不会生成任何新简报，自动化提示词
     "找不到当日简报就取最近一份"会退化为推送**昨日**简报——比"有明确降级
     标注的低可信结果"更危险。降级可见性由简报首屏的「⚠️ 数据源降级警示」
     保证（market_briefing），本预检负责把它提前写进运行日志、便于事后取证。
+
+    2026-09-23（交接单 A5 + A2）升级内容：
+      · 闸门命中时**显式标注本次结果不可用于决策**（不只是"可信度下降"），
+        并量化受影响权重（hot_theme 0.55 + technical 0.02 + capital_flow 0.01
+        ≈ 0.58），使日志本身就带严重度；
+      · 输出**配额归属**（账本 owner 字段）：直接回答"额度被谁吃光"，
+        不再需要靠文件 mtime 反推（A2 的落地价值）；
+      · 单次 eod 设计预算 55（moneyflow10+tech10+concepts20+financial15）与
+        预取预算 90 之和 145 > 日配额 100 —— 二者**不可同日共存**，闸门命中时
+        明确提示检查"是否有回测/验证/预取与生产抢额度"。
     """
     q = _read_quota()
     if q is None:
         return
     used, budget = q
     gate = budget - QUOTA_RESERVE
+    owner = _read_quota_owner()
     if used >= gate:
         logger.error(
             f"⚠️ AShareHub 配额已用 {used}/{budget}（本地闸门 {gate}，预留 "
-            f"{QUOTA_RESERVE} 次）→ 本次 eod 的四个 AShareHub 源将全部降级为中性，"
-            f"推荐结果可信度下降（简报首屏会标注降级）。请检查是否存在异常重跑。")
+            f"{QUOTA_RESERVE} 次；账本归属 owner={owner}）→ 本次 eod 的 AShareHub "
+            f"源将降级为中性（受影响因子权重合计约 58%，其中 hot_theme 0.55）"
+            f"→ **本次推荐结果不可用于决策**，简报首屏会标注降级。"
+            f"请检查是否有回测/验证/预取与生产抢额度"
+            f"（eod 需 55、预取已改为**按当日剩余额度动态收缩**并给 eod 预留 "
+            f"{QUOTA_RESERVE + 55} 次，日配额 {budget}）。")
     elif used >= gate * 0.6:
         logger.warning(
-            f"AShareHub 配额已用 {used}/{budget}（闸门 {gate}），余量偏低，"
-            f"本次 eod 后续可能降级")
+            f"AShareHub 配额已用 {used}/{budget}（闸门 {gate}，owner={owner}），"
+            f"余量偏低，本次 eod 后续可能降级")
 
 
 def _run(script: str, extra_args: list = None) -> int:
@@ -169,6 +210,27 @@ def _run(script: str, extra_args: list = None) -> int:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding='utf-8', errors='replace', bufsize=1)
         started = True
+        # 2026-09-22 修复（缺陷排查 P2-21）：**子进程看门狗超时**。
+        # 原实现无任何超时：子进程若在网络挂死（非交易时段实时行情接口无响应
+        # 等）会让 `for line in proc.stdout` 永久阻塞 → 调度器层面"看起来在跑"，
+        # 实际当天无推送；且异常分支只记日志、不 kill 子进程，孤儿进程会与
+        # 下一次 cron 并发写库/烧配额。
+        # 用 watchdog 定时线程实现 kill（流式读取无法用 subprocess 的 timeout）。
+        _watchdog = None
+        if _CHILD_TIMEOUT_S and _CHILD_TIMEOUT_S > 0:
+            import threading as _th
+
+            def _kill_on_timeout():
+                logger.error(f"{script} 超过看门狗上限 {_CHILD_TIMEOUT_S}s → 强制终止"
+                             f"（按设计不重跑）")
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+            _watchdog = _th.Timer(_CHILD_TIMEOUT_S, _kill_on_timeout)
+            _watchdog.daemon = True
+            _watchdog.start()
         try:
             for line in proc.stdout:
                 sys.stdout.write(line)
@@ -176,6 +238,8 @@ def _run(script: str, extra_args: list = None) -> int:
                     fh.write(line)
             proc.wait()
         finally:
+            if _watchdog is not None:
+                _watchdog.cancel()
             if proc.stdout:
                 proc.stdout.close()
         rc = proc.returncode
@@ -263,7 +327,19 @@ def main() -> int:
             for p in (os.path.expanduser('~/.bashrc'), '/c/Users/Administrator/.bashrc'):
                 try:
                     with open(p, encoding='utf-8') as f:
-                        m = re.search(r'ASHAREHUB_API_KEY\s*[=:]\s*["\']?([^"\'\s]+)', f.read())
+                        _src = f.read()
+                    # 2026-09-22 修复（缺陷排查 P2-23）：原正则会在**注释行**里命中
+                    # （如 `# export ASHAREHUB_API_KEY=旧值`）→ 加载已失效的 key，
+                    # 随后 ASHAREHub 四源静默降级。改为锚定行首的可执行 export/赋值。
+                    m = None
+                    for _line in _src.splitlines():
+                        if _line.lstrip().startswith('#'):
+                            continue
+                        m = re.match(
+                            r'\s*(?:export\s+)?ASHAREHUB_API_KEY\s*[=:]\s*["\']?([^"\'\s#]+)',
+                            _line)
+                        if m:
+                            break
                     if m:
                         os.environ['ASHAREHUB_API_KEY'] = m.group(1)
                         break

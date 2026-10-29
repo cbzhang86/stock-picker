@@ -40,16 +40,35 @@ def backup_db(src: str, backup_dir: str = None, keep: int = 14,
     dst = os.path.join(backup_dir, f"predictions_{date_str}.db")
 
     # sqlite3 backup API：WAL 模式下安全（文件拷贝可能丢 WAL 未 checkpoint 的数据）
+    # 2026-09-22 修复（缺陷排查 P2-29）：改为**先写临时文件 → integrity_check →
+    # 原子替换**。原实现直接对目标文件做 backup：中途失败/中断会把当日**已存在的
+    # 好备份**部分页覆盖，且外观上仍是"有文件"→ 唯一真源的备份可能比没有备份更危险。
+    tmp = dst + '.tmp'
+    if os.path.exists(tmp):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     src_conn = sqlite3.connect(src)
     try:
-        dst_conn = sqlite3.connect(dst)
+        dst_conn = sqlite3.connect(tmp)
         try:
             src_conn.backup(dst_conn)
             dst_conn.commit()
+            row = dst_conn.execute("PRAGMA integrity_check").fetchone()
+            if not row or str(row[0]).lower() != 'ok':
+                raise RuntimeError(f"备份完整性校验失败: {row!r}")
         finally:
             dst_conn.close()
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     finally:
         src_conn.close()
+    os.replace(tmp, dst)
     return dst
 
 

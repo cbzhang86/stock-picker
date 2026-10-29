@@ -50,6 +50,24 @@ data/backup/*.db
 data/backup/*.json
 data/cache/*.pkl
 data/_bf_*.json
+# 2026-09-22 补：T+1 回填对账产物实际写在 data/cache/ 下（原规则漏了该目录前缀，
+# 导致 _bf_before/after/diff.json 长期显形为未跟踪文件）
+data/cache/_bf_*.json
 
 # 2026-09-21 补：门禁/诊断/推送运行时日志（每日重生成，不入库）
 data/cache/*.log
+
+# 运行产物 / 调试探针 — 绝对不要提交
+_*.out
+_*.log
+_*.py.bak
+_check_*.py
+_verify*.py
+_verify*
+*_probe.py
+seed_drift_samples.py
+data/cache/_bf_*
+data/cache/_smoke.out
+data/cache/oos_push_*.txt
+data/backup/healthcheck_msg_*.txt
+reports/*.md

@@ -18,6 +18,7 @@
 import argparse
 import json
 import logging
+import math
 import sys
 import os
 
@@ -82,13 +83,17 @@ def backfill_pending_outcomes():
 
     if not pending:
         logger.info("没有待处理的推荐结果")
-        return
+        return (0, 0)   # 2026-09-22：返回 (ok, fail) 供调用方判定（P2-27）
 
     logger.info(f"自动回填 {len(pending)} 条推荐结果...")
     # 终态标记（2026-09-07 论证后实施）：attempts 计数随回填递增（内存态，
     # 按调用轮次计），同一票连续 30 轮回填仍无 K 线 → 标记 no_data 退出
     # pending 池。停牌票复牌后自然恢复回填；退市票不再消耗每夜网络扫描。
     # （2026-09-12 清理：attempts={} 内存字典是落库计数改造后的死变量，删）
+    # 2026-09-22 修复（缺陷排查 P2-27）：统计成功/失败并返回 —— 原实现把每条
+    # 失败都吞成 warning、函数恒返回 None → 凌晨脚本无法判定回填是否真的发生。
+    _ok = 0
+    _fail = 0
     for pred in pending:
         code = pred['code']
         pred_date = pred['date']
@@ -99,6 +104,7 @@ def backfill_pending_outcomes():
             if kline is not None and not kline.empty:
                 tracker.update_outcomes(pred['id'], kline,
                                          pred_date=pred['date'])
+                _ok += 1
             else:
                 # 计数持久化（2026-09-07 审计修复）：原内存态计数在独立
                 # 进程每次从 0 开始，终态永不触发；改为落库累计
@@ -106,8 +112,12 @@ def backfill_pending_outcomes():
                 if n >= 30:
                     tracker.mark_no_data(pred['id'])
                     logger.info(f"{code}@{pred_date} 连续 {n} 次回填无 K 线 → no_data 终态")
+                else:
+                    _fail += 1
         except Exception as e:
+            _fail += 1
             logger.warning(f"回填失败 {code}: {e}")
+    return (_ok, _fail)
 
 
 def _shadow_rows_from(recommendations: list) -> list:
@@ -143,6 +153,11 @@ def run_short_term(config: dict, allow_non_trading_day: bool = False) -> list:
     """运行短线尾盘策略"""
     short_cfg = config.get('short_term', {})
     strategy = ShortTermStrategy(short_cfg)
+    # 2026-09-23（交接单 A2）：声明配额归属，使额度消耗可在账本/简报中归因
+    try:
+        strategy.data_engine.set_quota_owner('eod:short')
+    except Exception:
+        pass
     recommendations = strategy.run()
     from datetime import date
     today = date.today().isoformat()
@@ -191,6 +206,28 @@ def run_short_term(config: dict, allow_non_trading_day: bool = False) -> list:
             strategy._last_enriched = None
         except Exception:
             pass
+
+        # 漂移监控日度样本（2026-09-23 交接单 D1 结构性解法）：落当日**候选池 top-N**
+        # （含零达标日），并在下次运行/本步顺带补算历史缺样本日的 T+1。
+        # 零 ASHareHub 配额、幂等、失败不影响主流程。解读口径见
+        # feedback/drift_sample.py 模块 docstring。
+        try:
+            from feedback.drift_sample import (record_candidate_pool,
+                                              backfill_daily_samples)
+            _pool = (getattr(strategy, '_last_diagnostics', None) or {}).get('top_pool')
+            if _pool:
+                _n = record_candidate_pool(today, _pool)
+                logger.info(f"漂移样本：候选池已落库 {_n} 只（{today}）")
+            _nd = backfill_daily_samples()
+            if _nd:
+                logger.info(f"漂移样本：补算 {_nd} 个交易日的 T+1 样本")
+        except Exception as e:
+            logger.warning(f"漂移样本数据线失败(忽略): {str(e)[:80]}")
+        finally:
+            try:
+                strategy._last_diagnostics = None
+            except Exception:
+                pass
 
     # 影子推荐落库（2026-09-18）：极端市况（极差市停推 / 动态门槛零达标）当日照常评分
     # 并以 mode='shadow' 落库，但**不下发、不进正式统计**（全工程 7 处统计读取硬滤
@@ -250,10 +287,20 @@ def run_short_term(config: dict, allow_non_trading_day: bool = False) -> list:
     if guard_skip:
         return recommendations
 
+    # 2026-09-22 修复（缺陷排查 P2-24/契约 A）：
+    #   · `rec.get('code', '')` 的默认值只在键缺失时生效 —— 值为 None 时返回 None，
+    #     落库成 NULL；而唯一索引 `(date,code,mode)` 对 NULL 不去重 → 可重复插入空行。
+    #   · 逐条写入的条数若与入参不一致（中途异常/去重），原实现无任何校验，
+    #     批次级防重又只看"当日是否有任意一行"→ 当日推荐集残缺且不可自愈。
+    _written = 0
     for rec in recommendations:
-        tracker.log_prediction(
+        _code = str(rec.get('code') or '').strip()
+        if not _code:
+            logger.warning("推荐条目缺少 code，跳过落库（避免 NULL 行污染统计）")
+            continue
+        _ok = tracker.log_prediction(
             date=today,
-            code=rec.get('code', ''),
+            code=_code.zfill(6),
             name=rec.get('name', ''),
             mode='short',
             score=rec.get('score', 0),
@@ -262,6 +309,12 @@ def run_short_term(config: dict, allow_non_trading_day: bool = False) -> list:
             model_version='v1',
             factor_scores=rec.get('breakdown', {})
         )
+        if _ok is not None:
+            _written += 1
+    if _written != len(recommendations):
+        logger.warning(
+            f"落库条数 {_written} != 推荐条数 {len(recommendations)}"
+            f"（差额为去重命中/缺 code 条目）→ 当日推荐集可能残缺，请人工核对")
 
     return recommendations
 
@@ -270,6 +323,11 @@ def run_long_term(config: dict) -> list:
     """运行长线策略"""
     long_cfg = config.get('long_term', {})
     strategy = LongTermStrategy(long_cfg)
+    # 2026-09-23（交接单 A2）：同上
+    try:
+        strategy.data_engine.set_quota_owner('eod:long')
+    except Exception:
+        pass
     recommendations = strategy.run()
 
     tracker = PredictionTracker()
@@ -299,9 +357,15 @@ def run_long_term(config: dict) -> list:
     for rec in recommendations:
         if rec.get('skip_reason') or rec.get('market_assessment'):
             continue
+        # 2026-09-22 修复（契约 A）：同 short 侧 —— `get('code','')` 对值为 None
+        # 无效，且唯一索引对 NULL 不去重。
+        _lcode = str(rec.get('code') or '').strip()
+        if not _lcode:
+            logger.warning("长线推荐条目缺少 code，跳过落库")
+            continue
         tracker.log_prediction(
             date=today,
-            code=rec.get('code', ''),
+            code=_lcode.zfill(6),
             name=rec.get('name', ''),
             mode='long',
             score=rec.get('score', 0),
@@ -410,7 +474,10 @@ def show_status(config: dict):
         print(f"\n📋 最近推荐:")
         for _, row in recent.iterrows():
             t1 = row.get('t1_return', None)
-            if t1 is None:
+            # 2026-09-22 修复（缺陷排查 P2-24）：`recent` 是 DataFrame，SQL NULL
+            # 读回来是 NaN —— `t1 is None` 为 False，`NaN > 0` 也为 False
+            # → 未回填的记录被显示成 "❌ nan%"，人工复盘结论被反向误导。
+            if t1 is None or not math.isfinite(float(t1)):
                 mark, t1_disp = '⏳', '待回填'
             else:
                 mark, t1_disp = ('✅' if t1 > 0 else '❌'), f"{t1}%"
@@ -451,6 +518,10 @@ def main():
 
     # 1.5 绩效漂移监控（2026-09-05 审查报告 P3-Q）：事后视角，不阻塞选股。
     #     PSI 分布漂移检测：结果写 data/reports/drift_latest.json + 日志告警
+    #     2026-09-23（交接单 D7/D8）：结论**追加进简报尾部**（原为只写文件+日志，
+    #     简报里看不到）；与 run_context.regime.killswitch 并列展示 ——
+    #     kill-switch 管尾部风险（累计收益→降仓动作），drift 管分布漂移（PSI→告警）。
+    drift_result = None
     try:
         from core.drift_monitor import DriftMonitor
         drift_result = DriftMonitor().check()
@@ -460,6 +531,13 @@ def main():
                            f"(详情: {drift_path})")
         elif drift_result.get('verdict') == 'WATCH':
             logger.info(f"绩效漂移 WATCH: {drift_result.get('note')}")
+        elif drift_result.get('verdict') == 'PENDING_BACKFILL':
+            logger.info(f"绩效漂移: 待回填 — {drift_result.get('note', '')[:80]}")
+        elif drift_result.get('verdict') in ('NO_SAMPLE', 'INSUFFICIENT'):
+            # D6：把"监控已冻结/结构性无样本"提到 warning —— 这两个状态说明
+            # 监控在最需要它的行情里失效，不能再按普通 info 淹没
+            logger.warning(f"绩效漂移监控未就绪（{drift_result.get('verdict')}）: "
+                           f"{drift_result.get('note', '')[:120]}")
         else:
             logger.info(f"绩效漂移: {drift_result.get('verdict')} - "
                         f"{drift_result.get('note', '')[:60]}")
@@ -473,8 +551,15 @@ def main():
     # 简报据此在首屏渲染降级警示，替代原先恒为全绿的内部实例快照。
     _runtime_src = (recommendations[0].get('data_source_status')
                     if recommendations else None)
+    # 2026-09-22 修复（第二轮回归 P2-2 · P1-12 接线补全）：长线模式下
+    # `recommendations` 就是 run_long_term 的结果，直接透传给简报，
+    # 避免简报内联再跑一遍长线全流程（重复网络/配额消耗 + 口径可能不一致）。
+    # 短线模式下简报仍按 config 阈值内联扫描（阈值已从硬编码 50 改为读 config）。
     briefing_text = generate_market_briefing(recommendations, mode=args.mode,
-                                            source_status=_runtime_src)
+                                            source_status=_runtime_src,
+                                            long_recs=(recommendations
+                                                       if args.mode == 'long'
+                                                       else None))
 
     # 2.5 数据质量巡检（T5，2026-09-06 第一梯队）：结果追加到简报尾部，
     # 异常同时打 WARNING 日志。只读巡检，不改变简报既有内容。
@@ -486,6 +571,17 @@ def main():
         briefing_text = briefing_text.rstrip('\n') + '\n' + format_quality_line(dq) + '\n'
     except Exception as e:
         logger.warning(f"数据质量巡检失败(忽略): {e}")
+
+    # 2.6 绩效漂移状态（2026-09-23 交接单 D7）：原结论只进日志/JSON，简报里没有。
+    #     仅在非 OK 时追加（OK 时避免噪声；ALERT/WATCH/未就绪都需要可见）。
+    try:
+        if drift_result and drift_result.get('verdict') not in (None, 'OK'):
+            _dv = drift_result.get('verdict')
+            _icon = {'ALERT': '🔴', 'WATCH': '🟡'}.get(_dv, '⚪')
+            briefing_text = briefing_text.rstrip('\n') + '\n' + (
+                f"{_icon} 绩效漂移: {_dv} — {drift_result.get('note', '')[:160]}\n")
+    except Exception as e:
+        logger.warning(f"简报追加漂移状态失败(忽略): {e}")
 
     print(briefing_text)
 
@@ -549,18 +645,32 @@ def _print_optimizer_report(report: dict):
     print("=" * 55)
 
     d = report.get('data_diagnostics', {})
-    print(f"  训练数据: {d.get('total_records', '?')} 条 | "
-          f"胜率 {d.get('win_rate', '?'):.1f}% | "
-          f"平均收益 {d.get('avg_return_t1', 0):+.2f}%")
-    print(f"  时间范围: {d.get('date_range', '?')}")
-    print(f"  数据新鲜度: {d.get('fresh_ratio', 0)*100:.0f}%")
+
+    # 2026-09-22 修复（缺陷排查 P2-24 · 契约 A）：`d.get(k, '?')` 的默认值只在
+    # 键缺失时生效 —— 键存在而值为 null 时 `'?'.format` / `None * 100` 会
+    # TypeError。本函数在"选股已成功落库"之后的收尾阶段执行，一旦抛出
+    # 整个 eod 以非 0 退出，daily_job 会判为失败（简报已生成，语义误导）。
+    def _fmt_num(v, fmt='{:.1f}', default='—'):
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return default
+        return fmt.format(fv) if math.isfinite(fv) else default
+
+    print(f"  训练数据: {d.get('total_records') or '—'} 条 | "
+          f"胜率 {_fmt_num(d.get('win_rate'), '{:.1f}', '—')}% | "
+          f"平均收益 {_fmt_num(d.get('avg_return_t1'), '{:+.2f}', '—')}%")
+    print(f"  时间范围: {d.get('date_range') or '—'}")
+    print(f"  数据新鲜度: {_fmt_num((d.get('fresh_ratio') or 0) * 100, '{:.0f}', '—')}%")
 
     print(f"\n  因子信号诊断:")
-    for fname, stats in d.get('factor_stats', {}).items():
-        sig = "✅" if stats.get('unique_values', 0) >= 3 else "❌"
-        print(f"    {sig} {fname}: {stats.get('n_samples', 0)}条, "
-              f"{stats.get('unique_values', 0)}个唯一值, "
-              f"范围 {stats.get('min', '?')}~{stats.get('max', '?')}")
+    for fname, stats in (d.get('factor_stats') or {}).items():
+        _uv = stats.get('unique_values') or 0
+        sig = "✅" if _uv >= 3 else "❌"
+        print(f"    {sig} {fname}: {stats.get('n_samples') or 0}条, "
+              f"{_uv}个唯一值, "
+              f"范围 {stats.get('min') if stats.get('min') is not None else '—'}"
+              f"~{stats.get('max') if stats.get('max') is not None else '—'}")
 
     old = report.get('old_weights', {})
     new = report.get('proposed_weights', {})

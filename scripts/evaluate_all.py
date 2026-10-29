@@ -206,7 +206,11 @@ def _find_trial_matrix():
     if os.path.isdir(cand_dir):
         cs = sorted(f for f in os.listdir(cand_dir) if f.endswith('.csv'))
         if cs:
-            return os.path.join(cand_dir, cs[0])
+            # 2026-09-22 修复（缺陷排查 P1-15）：原为 `cs[0]`（字母序第一），
+            # 而本仓库其余模块一律按 mtime 取最新 → 矩阵目录累积后 DSR/PBO
+            # 永远审计最旧一份，WARN 数值长期陈旧（误导性诊断）。
+            newest = max(cs, key=lambda f: os.path.getmtime(os.path.join(cand_dir, f)))
+            return os.path.join(cand_dir, newest)
     fallback = os.path.join(ROOT, 'data', 'reports', 'trials.csv')
     if os.path.exists(fallback):
         return fallback
@@ -258,6 +262,41 @@ def _dsr_pbo_gate():
 
 
 _dsr_pbo_gate()
+
+
+def _drift_gate():
+    """绩效漂移门禁（2026-09-23 交接单 D7）。
+
+    原实现只写 `data/reports/drift_latest.json` + 打日志，**未接入任何 gate**——
+    与 multiple_testing 未接 gate 是同一类问题：算出来了但没人看。
+    现按"ALERT → WARN（不阻断）"接线，让漂移在回归门禁的输出里可见。
+    不阻断的理由与 DSR/PBO 一致：告警来自统计口径，需人工判断是否重跑 OOS，
+    不应阻断当日交付。
+    """
+    try:
+        sys.path.insert(0, os.path.join(ROOT, 'core'))
+        from core.drift_monitor import DriftMonitor
+        r = DriftMonitor().check()
+    except Exception as e:
+        _record_diag("绩效漂移监控", 'SKIP',
+                     f'无法执行（{type(e).__name__}: {str(e)[:60]}）')
+        return
+    v = r.get('verdict')
+    if v == 'ALERT':
+        _record_diag("绩效漂移监控", 'WARN',
+                     f"ALERT — {r.get('note', '')[:180]}")
+    elif v == 'WATCH':
+        _record_diag("绩效漂移监控", 'WARN',
+                     f"WATCH（仅提示）— {r.get('note', '')[:160]}")
+    elif v == 'OK':
+        _record_diag("绩效漂移监控", 'PASS', '')
+    else:
+        # NO_SAMPLE / PENDING_BACKFILL / INSUFFICIENT：不是失败，但要可见
+        _record_diag("绩效漂移监控", 'SKIP',
+                     f"{v} — {r.get('note', '')[:170]}")
+
+
+_drift_gate()
 
 
 print()

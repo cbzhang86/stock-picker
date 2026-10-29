@@ -20,6 +20,9 @@
 重复实现。如果未来要给某策略用中间变量，可在那里调用 TechnicalScorer。
 """
 
+import math
+from core import numeric
+
 import numpy as np
 import pandas as pd
 from typing import Dict, List
@@ -29,6 +32,11 @@ from core.fundamental_provider import FundamentalProvider
 from core.event_provider import EventProvider
 
 logger = logging.getLogger(__name__)
+
+
+# 2026-09-23（审查报告 R1）：委托 core.numeric —— 契约 A 的唯一实现。
+# 保留 `_is_finite_number` 名称以兼容既有调用点（含 scoring_model 的 import）。
+_is_finite_number = numeric.is_finite
 
 
 class FactorLibrary:
@@ -76,8 +84,17 @@ class FactorLibrary:
     # ========== 动量因子 ==========
 
     def calc_rps_score(self, rps_value: float) -> float:
-        """RPS 值 → 评分（0-100）"""
-        return float(np.clip(rps_value, 0, 100))
+        """RPS 值 → 评分（0-100）
+
+        2026-09-22 修复（契约 A）：原实现 `float(np.clip(rps_value, 0, 100))`
+        无缺失守卫 —— None 直接 TypeError 中断整条评分链；NaN 原样穿透到总分
+        （被 `score >= min_score` 恒 False 静默剔除，日志却显示"门槛过滤"）；
+        +Inf 会被 clip 成 100（把异常当"最强动量"满分）。
+        缺失/非有限一律回落中性 50，与其余因子口径一致。
+        """
+        if not _is_finite_number(rps_value):
+            return 50.0
+        return float(np.clip(float(rps_value), 0, 100))
 
     # ========== 技术形态因子 ==========
     # MACD 状态判断作为简易回退（首选 TechnicalScorer，已在 scoring_model 里处理）
@@ -152,10 +169,10 @@ class FactorLibrary:
         锚点: (0.3, 25) → (0.8, 65) → (1.0, 75) → (1.4, 85)
               → (3.0, 65) → (5.0, 40) → (15.0, 15)
         """
-        if volume_ratio is None or volume_ratio <= 0:
+        if not _is_finite_number(volume_ratio) or volume_ratio <= 0:
             return 50.0
 
-        r = volume_ratio
+        r = float(volume_ratio)
 
         # 缩量区间：0 → 1.4（平滑上升）
         if r <= 1.4:
@@ -184,9 +201,10 @@ class FactorLibrary:
         < 0.5% 冷清 → 低分
         > 20% 异常 → 低分
         """
-        if turnover is None:
+        if not _is_finite_number(turnover):
             return 50
 
+        turnover = float(turnover)
         if 2 <= turnover <= 5:
             return 85
         elif 1 <= turnover < 2:
@@ -257,6 +275,12 @@ class FactorLibrary:
                         c = float(b.get('change_pct', 0) or 0)
                     except (ValueError, TypeError):
                         continue
+                    # 2026-09-22 修复（第二轮回归 P2-7）：`NaN` 是 float 且
+                    # `NaN or 0` 返回 NaN（or 只对假值生效）→ NaN 进入
+                    # sector_chgs → top3 均值 NaN → bonus NaN → score NaN →
+                    # hot_theme NaN 进 rank/sorted 顺序未定义。NaN/Inf 一律跳过。
+                    if not math.isfinite(c):
+                        continue
                     sector_chgs.append(c)
                 if sector_chgs:
                     top3 = sorted(sector_chgs, reverse=True)[:3]
@@ -290,6 +314,11 @@ class FactorLibrary:
                 score += 5
                 if breakdown is not None:
                     breakdown['concept_count'] = 5
+        # 2026-09-22 修复（第二轮回归 P2-7）：出口兜底 —— hot_theme 权重 0.55，
+        # NaN 进入排序/加权和会让整条评分链失效。非有限一律回落中性 50。
+        if not math.isfinite(score):
+            logger.warning("calc_hot_theme_score 产出非有限值 → 回落中性 50")
+            return 50.0
         return min(score, 100)
 
     def calc_limit_up_streak(self, kline_df, code: str = '') -> int:
@@ -300,6 +329,11 @@ class FactorLibrary:
         short_term 涨停统计同口径，容忍四舍五入）。
 
         无 K 线或不足 2 行返回 0；非涨停返回 0。
+
+        2026-09-22 修复（缺陷排查 P2-3）：原实现用 `close.pct_change()` 再
+        `dropna()` 后倒序计数 —— 末根 close 缺失（停牌/当日未更新）时该日
+        的 pct 被 dropna 丢掉，于是**前一日的涨停被当成"今日仍连板"**，
+        连板数虚高 1；中间缺口同样被跨过。现改为显式逐日回看，遇缺失即停。
         """
         if kline_df is None or len(kline_df) < 2:
             return 0
@@ -312,10 +346,18 @@ class FactorLibrary:
             else:
                 thresh = 9.5
             close = pd.to_numeric(kline_df['close'], errors='coerce')
-            pct = close.pct_change() * 100
+            vals = close.tolist()
+            # 末根/次末根非有限 → 无法判定"今日是否涨停"，按 0 处理
+            if not (_is_finite_number(vals[-1]) and _is_finite_number(vals[-2])):
+                return 0
             streak = 0
-            for v in reversed(pct.dropna().tolist()):
-                if v >= thresh:
+            for i in range(len(vals) - 1, 0, -1):
+                prev_v, cur_v = vals[i - 1], vals[i]
+                # 缺口（停牌）或非法价格 → 停止回看，不跨缺口计数
+                if not (_is_finite_number(prev_v) and _is_finite_number(cur_v)) \
+                        or prev_v <= 0:
+                    break
+                if (cur_v / prev_v - 1) * 100 >= thresh:
                     streak += 1
                 else:
                     break
@@ -365,8 +407,14 @@ class FactorLibrary:
             return 50.0
 
         # 机构净买入（只保留有机构资金实锤的加分方向）
-        inst = dragon_tiger.get('institution', {})
+        inst = dragon_tiger.get('institution', {}) or {}
         inst_net = inst.get('net_amt', 0)
+        # 2026-09-22 修复（第二轮回归 P2-3）：`net_amt` 为 null 时原实现
+        # `None > 0` 直接 TypeError（实证：data_collector 对缺机构数据的推荐
+        # 会写 institution 为空 dict / net_amt 为 null）。缺失按中性处理。
+        if not isinstance(inst_net, (int, float)) or isinstance(inst_net, bool) \
+                or not math.isfinite(float(inst_net)):
+            inst_net = 0
 
         score = 50.0
         if inst_net > 0:
@@ -620,7 +668,7 @@ class FactorLibrary:
         # 由 rank_stocks 写入 _size_percentile；缺失（回测快照/数据缺失）→ 中性 50。
         # 当前权重 0（v1.json/config 已登记），启用契约见 rank_stocks 注释。
         _size_pct = stock_data.get('_size_percentile')
-        factors['size'] = min(_size_pct * 100.0, 100.0) if _size_pct is not None else 50.0
+        factors['size'] = min(_size_pct * 100.0, 100.0) if _is_finite_number(_size_pct) else 50.0
 
         # 技术形态 — 双源评分（K线自算 + AShareHub API 校验）
         # 修复（2026-09-06 审查）：get_kline 全源失败时返回空 DataFrame（非 None），
@@ -685,25 +733,25 @@ class FactorLibrary:
         # 由 rank_stocks 写入 _liquidity_percentile；缺失（回测快照/无行情）→ 中性 50。
         # 当前权重 0（v1.json/config 已登记），启用契约：OOS IC 确认 + calibrate 审批。
         _liq_pct = stock_data.get('_liquidity_percentile')
-        factors['liquidity'] = min(_liq_pct * 100.0, 100.0) if _liq_pct is not None else 50.0
+        factors['liquidity'] = min(_liq_pct * 100.0, 100.0) if _is_finite_number(_liq_pct) else 50.0
 
         # 波动率因子（2026-09-18 对标 Barra Volatility）：20 日日收益率标准差 →
         # 横截面百分位取反（低波动高分，Barra 低波动溢价）。由 rank_stocks 写入
         # _volatility_percentile；缺失 → 中性 50。
         _vol_pct = stock_data.get('_volatility_percentile')
-        factors['volatility'] = (1.0 - _vol_pct) * 100.0 if _vol_pct is not None else 50.0
+        factors['volatility'] = (1.0 - _vol_pct) * 100.0 if _is_finite_number(_vol_pct) else 50.0
 
         # 缩量偏离因子（2026-09-19 方案G·OOS 实证 IC+0.0654/ICIR 0.535/t+12.81）：
         # 当日成交额相对自身 60 日常态的偏离，偏离越低（缩量/地量）→ 分越高。
         # 由 rank_stocks 写入 _liq_dev_percentile；缺失 → 中性 50。
         _liq_dev_pct = stock_data.get('_liq_dev_percentile')
-        factors['liq_dev'] = (1.0 - _liq_dev_pct) * 100.0 if _liq_dev_pct is not None else 50.0
+        factors['liq_dev'] = (1.0 - _liq_dev_pct) * 100.0 if _is_finite_number(_liq_dev_pct) else 50.0
 
         # 波动收敛偏离因子（2026-09-19 方案G·OOS 实证 IC+0.0263/ICIR 0.225/t+5.37）：
         # 20 日波动率相对自身 60 日常态的偏离，偏离越低（波动收敛）→ 分越高。
         # 由 rank_stocks 写入 _vol_dev_percentile；缺失 → 中性 50。
         _vol_dev_pct = stock_data.get('_vol_dev_percentile')
-        factors['vol_dev'] = (1.0 - _vol_dev_pct) * 100.0 if _vol_dev_pct is not None else 50.0
+        factors['vol_dev'] = (1.0 - _vol_dev_pct) * 100.0 if _is_finite_number(_vol_dev_pct) else 50.0
 
         # 新信号因子 — 同花顺热点/板块归属/AShareHub概念/龙虎榜
         factors['hot_theme'] = self.calc_hot_theme_score(

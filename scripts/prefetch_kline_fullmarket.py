@@ -52,10 +52,18 @@ def _sina_fetch(symbol: str) -> list:
     import requests
     url = ("http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
            "CN_MarketData.getKLineData")
-    r = requests.get(url, params={"symbol": symbol, "scale": "240",
-                                  "ma": "no", "datalen": str(DATELEN)},
-                     headers={"User-Agent": "Mozilla/5.0 Chrome/131.0.0.0"},
-                     timeout=15)
+    # 2026-09-22 修复（缺陷排查 P2-24）：本机代理会干扰直连（与
+    # core/data_engine._session.trust_env=False 同因），原实现用裸 requests.get
+    # → 代理环境下全量失败（叠加 P1-6 的静默吞异常 → 退出码 0 假成功）。
+    _sess = requests.Session()
+    _sess.trust_env = False
+    try:
+        r = _sess.get(url, params={"symbol": symbol, "scale": "240",
+                                   "ma": "no", "datalen": str(DATELEN)},
+                      headers={"User-Agent": "Mozilla/5.0 Chrome/131.0.0.0"},
+                      timeout=15)
+    finally:
+        _sess.close()
     if r.status_code != 200 or len(r.text) <= 50:
         return []
     import json
@@ -189,13 +197,33 @@ def main():
     lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
         futs = [pool.submit(_worker, c, results, lock) for c in todo]
-        for _ in as_completed(futs):
-            pass
+        # 2026-09-22 修复（缺陷排查 P1-6）：原为
+        #   `for _ in as_completed(futs): pass`
+        # —— 从不调用 fut.result()，_worker 内未捕获的异常（如 `_write_rows`
+        # 位于其 try 之外的 `sqlite3.OperationalError: database is locked`，
+        # 多线程各开连接且无重试）会静默留在 future 里：不冒泡、不打印、
+        # results 计数也不递增，最终 `fail == 0` → `return 0` ——
+        # 周日全市场 K 线预取"覆盖塌缩修复"实际未完成，而调度器认为成功。
+        for f in as_completed(futs):
+            try:
+                f.result()
+            except Exception as e:
+                with lock:
+                    results['fail'] += 1
+                logger.warning(f"worker 异常（计入失败）: {type(e).__name__}: {str(e)[:100]}")
 
     el = time.time() - results['t0']
     logger.info(f"完成: {results['done']} 只 | 成功 {results['ok']} | "
                 f"失败 {results['fail']} | 写入 {results['rows']:,} 行 | 耗时 {el:.0f}s")
-    return 0 if results['fail'] == 0 else 1
+    # 2026-09-22 修复（缺陷排查 P2）：原为"单只失败即整体 rc=1"—— 5000+ 只票的
+    # 个别失败属常态，会让周日 daily_job 因偶发失败判为整体失败。
+    # 改为按失败率判定（>5% 才视为失败）。
+    total = max(1, results['total'])
+    fail_ratio = results['fail'] / total
+    if fail_ratio > 0.05:
+        logger.error(f"失败率 {fail_ratio:.1%} > 5%，判定本次预取失败")
+        return 1
+    return 0
 
 
 if __name__ == '__main__':

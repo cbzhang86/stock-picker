@@ -39,6 +39,8 @@ ensemble_score = model_score
 """
 
 import logging
+import math
+from core import numeric
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -50,6 +52,13 @@ from core.event_provider import EventProvider
 
 
 logger = logging.getLogger(__name__)
+
+
+# 2026-09-23（审查报告 R1）：委托 core.numeric（契约 A 唯一实现）
+_finite = numeric.is_finite
+
+
+_as_float = numeric.float_or
 
 
 # 5 维权重（专家卡）— 内部固定，不与 7 因子权重联动
@@ -121,6 +130,11 @@ class ExpertScorer:
         roe = fund.get('roe')
         rev_g = fund.get('revenue_growth')
         prof_g = fund.get('profit_growth')
+        # 2026-09-22 修复（契约 A）：`is not None` 会把 NaN/±Inf 算作"已覆盖"，
+        # 人为抬高 coverage（把失明维度当有效第二意见）。统一用 _finite。
+        roe = float(roe) if _finite(roe) else None
+        rev_g = float(rev_g) if _finite(rev_g) else None
+        prof_g = float(prof_g) if _finite(prof_g) else None
         covered = roe is not None or rev_g is not None or prof_g is not None
         if not covered:
             return 50.0, '基本面字段全空 → 中性', False
@@ -150,7 +164,11 @@ class ExpertScorer:
         """
         full = stock.get('tech_score_0_100')
         if full is not None:
-            return float(full), f'6维技术分={full}', True
+            # 2026-09-22 修复（契约 A）：`float(NaN)` 不报错 → raw_score NaN →
+            # expert/ensemble 全链路 NaN；且 `is not None` 会把 NaN 当"已覆盖"。
+            if _finite(full):
+                return float(full), f'6维技术分={full}', True
+            return 50.0, '技术分非有限 → 中性', False
 
         score = 50.0
         notes = []
@@ -158,9 +176,14 @@ class ExpertScorer:
         pct_chg = stock.get('pct_chg')       # 当日涨幅 %
         turnover = stock.get('turnover')     # 换手率 %
         amount_ratio = stock.get('amount_ratio')  # 量比
-        covered = any(v is not None for v in (rps, pct_chg, turnover, amount_ratio))
+        covered = any(_finite(v) for v in (rps, pct_chg, turnover, amount_ratio))
         if not covered:
             return 50.0, '无技术面字段 → 中性', False
+
+        rps = float(rps) if _finite(rps) else None
+        pct_chg = float(pct_chg) if _finite(pct_chg) else None
+        turnover = float(turnover) if _finite(turnover) else None
+        amount_ratio = float(amount_ratio) if _finite(amount_ratio) else None
 
         if rps is not None:
             if rps >= 80:    score += 12; notes.append(f'RPS={rps:.0f}强')
@@ -189,6 +212,10 @@ class ExpertScorer:
         north = stock.get('north_flow_accumulated')
 
         # 缺失数据用中性
+        # 2026-09-22 修复（契约 A）：`is None` 会把 NaN 算作"已覆盖"并给中性 50 →
+        # 用失明维度抬高 coverage、放行 MIN_EXPERT_COVERAGE 门控。统一用 _finite。
+        main_fund = float(main_fund) if _finite(main_fund) else None
+        north = float(north) if _finite(north) else None
         if main_fund is None and north is None:
             return 50.0, '无资金流数据', False
 
@@ -211,11 +238,29 @@ class ExpertScorer:
                 score -= 10; notes.append('主力净流出>1000万')
 
         if north is not None:
-            # 类似处理
-            if north > 2000:
-                score += 12; notes.append('北向>2000w')
-            elif north < -2000:
-                score -= 12; notes.append('北向<-2000w')
+            # 2026-09-22 修复（缺陷排查 P1-7 · 单位错配）：北向金额字段口径更正。
+            # data_engine.get_north_flow_accumulated 的返回是
+            # 「近 N 日净增持**股数**」（最新持股量 − N 日前持股量），**不是万元**。
+            # 原阈值 `north > 2000` 注释写"北向>2000w"→ 2000 股是极小量，
+            # 任何净增持都能拿满 ±12，capital 维丧失区分度（与 2026-09-06 已修的
+            # main_fund 单位问题同构，当时漏修此分支）。
+            #
+            # 2026-09-23 实证标定（剩余项 #4，用户要求"找数据"）：
+            #   数据 = 本地 factor_daily.db north_flow 表（AShareHub
+            #   northbound_holdings 同源同口径，单位=股），n=178 样本、
+            #   覆盖 2026-06-30~07-10 共 5 个交易日（候选池股票）。
+            #   分布：p15=−1318万股 / p50=+36万股 / p85=+2298万股。
+            #   东财个股北向接口已确认停发（RPT_MUTUAL_HOLD_DETRENDD
+            #   "报表配置不存在"，与 2024-08 北向披露新政一致）→ 只能用
+            #   AShareHub 口径积累样本。
+            #   阈值定 ±1500万股：命中率 31%（±500万→56% 太松，±2000万→25% 偏严），
+            #   与"显著加仓/减仓"语义匹配。
+            #   ⚠️ 局限：小样本（n=178/5 日）且仅覆盖候选池（偏大票），月度复检时
+            #   用新积累的 north_flow 数据复核（脚本：按本注释口径重算分位）。
+            if north > 15_000_000:           # 净增持 > 1500 万股
+                score += 12; notes.append('北向净增持>1500万股')
+            elif north < -15_000_000:        # 净减持 > 1500 万股
+                score -= 12; notes.append('北向净减持>1500万股')
 
         return max(0, min(100, score)), ', '.join(notes) or '资金面中性', True
 
@@ -225,6 +270,9 @@ class ExpertScorer:
         pe_rank = stock.get('pe_percentile')      # 0-100，越高越贵
         pb_rank = stock.get('pb_percentile')
 
+        # 2026-09-22 修复（契约 A）：非有限值按缺失处理（同 _capital_dim）
+        pe_rank = float(pe_rank) if _finite(pe_rank) else None
+        pb_rank = float(pb_rank) if _finite(pb_rank) else None
         if pe_rank is None and pb_rank is None:
             return 50.0, '无估值百分位', False
 
@@ -279,6 +327,14 @@ class ExpertScorer:
         covered_weight = 0.0
         for name, weight in EXPERT_WEIGHTS.items():
             raw, note, covered = dims[name]
+            # 2026-09-22 修复（契约 A）：任一分维返回非有限值（如上游字段为 NaN
+            # 且该维未做守卫）都会让 expert_score 变 NaN → 进而污染 ensemble。
+            # 非有限一律降级为"未覆盖 + 中性 50"。
+            if covered and not _finite(raw):
+                raw, covered = 50.0, False
+                note = (note or '') + ' [非有限值 → 按缺失处理]'
+            else:
+                raw = float(raw)
             if covered:
                 weighted_sum += raw * weight
                 covered_weight += weight
@@ -319,6 +375,26 @@ class ExpertEnsemble:
         """
         if model_score is None:
             model_score = stock.get('score', 50.0)
+
+        # 2026-09-22 修复（缺陷排查 P0）：`stock.get('score', 50.0)` 的默认值
+        # 只在**键缺失**时生效 —— 键存在而值为 None/NaN 时默认值无效。原实现的
+        # `delta = expert_score - model_score` 会直接 TypeError（None），
+        # 或让 model_score=NaN 一路穿透；而下面 `max(0, min(100, NaN))` 会返回
+        # **100**（`min(100, NaN)` 取 100）→ NaN 被当成"最强共识满分"参与仓位加权。
+        if not _finite(model_score):
+            # 2026-09-22 修复（缺陷排查 P0）：`stock.get('score', 50.0)` 的默认值
+            # 只在**键缺失**时生效 —— 键存在而值为 None/NaN 时默认值无效。
+            # 原实现的 `delta = expert_score - model_score` 会 TypeError（None），
+            # 或让 model_score=NaN 一路穿透；而 `max(0, min(100, NaN))` 返回
+            # **100**（`min(100, NaN)` 取 100）→ NaN 被当成"最强共识满分"，
+            # 再经 PortfolioOptimizer 的 0.6/0.4 加权**放大仓位**。
+            # 处理：显式抛错，复用调用方既有的降级路径
+            # （strategies/short_term.py 捕获后"降级到仅主模型分数"，不下发
+            #  ensemble_score/weight_factor），比静默给一个错值安全。
+            raise ValueError(
+                f'model_score 非有限值（{model_score!r}），无法融合；'
+                f'调用方应降级为仅使用主模型分数')
+        model_score = float(model_score)
 
         expert_score, breakdown, notes, coverage = self.scorer.score(stock)
         delta = expert_score - model_score
@@ -366,7 +442,13 @@ class ExpertEnsemble:
             + confidence_bonus
             - conflict_penalty
         )
-        ensemble_score = round(max(0, min(100, ensemble_raw)), 2)
+        # 2026-09-22 修复（缺陷排查 P0）：`max(0, min(100, x))` 对 NaN 返回 100
+        # （`min(100, nan)` 取 100）→ 坏值变"满分共识"。入口已保证 model_score
+        # 有限，此处再兜一层，确保任何新增分维都不会重新引入该路径。
+        if not _finite(ensemble_raw):
+            logger.warning(f"ensemble_raw 非有限（{ensemble_raw!r}）→ 回落 model_score")
+            ensemble_raw = model_score
+        ensemble_score = round(max(0.0, min(100.0, float(ensemble_raw))), 2)
 
         return ExpertVerdict(
             code=stock.get('code', ''),

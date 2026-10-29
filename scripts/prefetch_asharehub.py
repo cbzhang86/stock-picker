@@ -175,6 +175,7 @@ def main():
     # ── 交易日守卫（2026-09-06 迭代）────────────────────────────
     # 原实现只按 weekday 分流（周六/周日），法定节假日（连休/调休）完全没覆盖。
     # 改用 core.trading_calendar（本地缓存 + 联网刷新，未知时返回 None）。
+    is_td = None      # 2026-09-23：显式初始化，供下方 A5 配额推导使用
     try:
         from core.trading_calendar import is_trading_day, next_trading_day
         is_td = is_trading_day()
@@ -196,28 +197,72 @@ def main():
     os.environ['ASHAREHUB_API_KEY'] = key
 
     de = DataEngine(config={})
+    # 2026-09-23（交接单 A2）：声明配额归属（预取单次预算 90，与 eod 的 55
+    # 之和超过日配额 100 → 二者不可同日共存，归属标记便于事后归因）
+    de.set_quota_owner('prefetch')
     # 预取模式：强制 live 拉取（绕过缓存读，否则命中上周缓存→写回旧数据→永不刷新）
     de._prefetch_mode = True
     # offset 自动推断（2026-09-06 迭代）：改为按"缓存已覆盖股票数"推进批次，
     # 不再依赖 weekday —— 支持任意长度假期（春节/国庆连休每天都推进一批），
     # 且覆盖完后自动回到池首刷新（保证老数据不会永久不更新）
     from core.trading_calendar import beijing_now
+    # 2026-09-22 修复（缺陷排查 P1-22）：原实现 `args.offset = len(covered)` 并把
+    # 它当作 `load_stock_pool()` 返回列表的下标 —— 而该池 = `predictions ORDER BY
+    # date DESC LIMIT 500` + 全市场成交额 TOP 补齐，**每天都变**。用"已覆盖数量"
+    # 索引一个漂移列表 → 批次之间无稳定对应：部分股票被反复预取、另一些永远
+    # 进不了批（近期推荐池小、靠成交额补齐时尤其明显），"任意长度假期每天推进
+    # 一批"的设计意图静默失效。
+    # 改为按**代码差集**推进：从稳定排序的池中取"尚未覆盖"的前 limit 只 —— 天然幂等，
+    # 且不依赖任何会漂移的下标。`--offset` 仍保留为手工跳过的兼容参数。
+    covered = covered_codes(de)
+    pool = load_stock_pool(max(args.limit * 4, 200), de=de) or []
+    pool = sorted(set(pool))
     if args.offset is None:
-        covered = covered_codes(de)
-        args.offset = len(covered)
-        logger.info(f"自动分批: 缓存已覆盖 {len(covered)} 只 → offset={args.offset}")
-    codes = load_stock_pool(args.limit + args.offset, de=de)
-    # 池已全部覆盖 → 回到池首重新刷新（避免旧数据永久不更新）
-    if args.offset >= len(codes) and codes:
-        logger.info(f"池已全部覆盖（offset={args.offset} >= 池{len(codes)}）→ 回到池首刷新")
+        todo_codes = [c for c in pool if c not in covered]
+        if not todo_codes and pool:
+            logger.info(f"池已全部覆盖（{len(covered)} 只）→ 回到池首刷新")
+            todo_codes = pool
         args.offset = 0
-    codes = codes[args.offset:]
+        logger.info(f"自动分批（按未覆盖差集）: 池 {len(pool)} 只 / 已覆盖 {len(covered)} 只 "
+                    f"→ 待预取 {len(todo_codes)} 只")
+        codes = todo_codes[:max(args.limit, 0)] if args.limit else todo_codes
+    else:
+        codes = pool[args.offset:]
+        if args.offset >= len(pool) and pool:
+            logger.info(f"池已全部覆盖（offset={args.offset} >= 池{len(pool)}）→ 回到池首刷新")
+            args.offset = 0
+            codes = pool
     if not codes:
-        logger.info(f"股票池为空（offset={args.offset} 超出池大小 {len(codes) + args.offset}），退出")
+        logger.info(f"股票池为空（池大小 {len(pool)}），退出")
         return 0
-    logger.info(f"本批股票 {len(codes)} 只（offset={args.offset}，limit={args.limit}）")
-    # 每只股票 3 因子 = 3 次配额；预算：30 只 × 3 = 90（留 10 余量）
-    logger.info(f"预计配额消耗: {len(codes) * 3} 次（上限 {de._asharehub_budget - 10}）")
+
+    # ── 2026-09-23（交接单 A5 决策）：批大小**按当日剩余额度动态推导** ──
+    # 原实现用固定 `--limit 30`（30×3 = 90 次）去撞闸门，与 eod 的 55 次之和
+    # （145）超过日配额 100 → 同日共存必然有一方降级。现改为：
+    #   floor = ASHAREHUB_PROD_FLOOR(55) 若今天是交易日（eod 可能稍后运行）否则 0
+    #   usable = budget − RESERVE − used − floor
+    #   limit_eff = min(请求值, usable // 3)
+    # 效果：非交易日（预取主场景）吞吐不变（90//3 = 30 只）；
+    #       交易日（--force）或当日已跑过 eod 时自动收缩；
+    #       usable < 3 时跳过 ASh 只预取东财（东财不限配额）。
+    # 硬约束：任何情况下都不会击穿"日配额 100"。
+    _floor = de.ASHAREHUB_PROD_FLOOR if is_td is True else 0
+    _used_now = de._read_quota_file()
+    _usable = de.quota_remaining(extra_floor=_floor)
+    _limit_eff = min(int(args.limit or 0) or len(codes), _usable // 3)
+    logger.info(
+        f"配额推导: 日配额 {de._asharehub_budget} − 预留 {de.ASHAREHUB_RESERVE} "
+        f"− 生产地板 {_floor}（{'交易日' if is_td is True else '非交易日'}） "
+        f"− 今日已用 {_used_now} = 可用 {_usable} 次"
+        f" → 本批上限 {_limit_eff} 只（请求 {args.limit}）")
+    _skip_ash_only = _limit_eff <= 0
+    if _skip_ash_only:
+        logger.warning("配额余量不足以支持任何 AShareHub 预取"
+                       "→ 本轮仅预取东财（不限配额），ASHareHub 段跳过")
+    else:
+        codes = codes[:_limit_eff]
+    logger.info(f"本批股票 {len(codes)} 只（请求 limit={args.limit} → 实际 "
+                f"{len(codes)}，ASHareHub {'跳过' if _skip_ash_only else '启用'}）")
 
     if args.dry_run:
         logger.info("[dry-run] 不实际调用")
@@ -234,10 +279,12 @@ def main():
                 quota_used = int(qd.get('used', 0))
     except Exception as e:
         logger.warning(f"配额账本读取失败（按 0 处理）: {e}")
-    if quota_used >= de._asharehub_budget - 10:
-        logger.warning(
-            f"ASHareHub 已达本地安全闸门（{quota_used}/{de._asharehub_budget}，"
-            f"闸门 {de._asharehub_budget - 10}）→ 跳过 ASHareHub 预取，仅预取东财")
+    if quota_used >= de._asharehub_budget - de.ASHAREHUB_RESERVE or _skip_ash_only:
+        if not _skip_ash_only:
+            logger.warning(
+                f"ASHareHub 已达本地安全闸门（{quota_used}/{de._asharehub_budget}，"
+                f"闸门 {de._asharehub_budget - de.ASHAREHUB_RESERVE}）"
+                f"→ 跳过 ASHareHub 预取，仅预取东财")
         skip_asharehub = True
     else:
         skip_asharehub = False
@@ -245,7 +292,7 @@ def main():
     # 预取阶段 1：ASHareHub 三因子（烧配额，每只 3 次）
     # 配额不够时跳过（东财不限配额，仍继续）
     stats = {'tech': 0, 'concepts': 0, 'financial': 0, 'miss': 0, 'reject': 0,
-             'fail': 0, 'blocks': 0, 'dragon_tiger': 0}
+             'fail': 0, 'blocks': 0, 'dragon_tiger': 0, 'quota_skip': 0}
     for i, code in enumerate(codes):
         if not skip_asharehub:
             data = de.get_technical_factors_asharehub(code)
@@ -273,7 +320,9 @@ def main():
             else:
                 stats['miss'] += 1
         else:
-            stats['miss'] += 3  # asharehub 跳过，标记 3 次 miss
+            # 2026-09-22 修复（缺陷排查 P2-12）：配额跳过单独计数 ——
+            # 原实现并入 'miss'，日志无法区分"上游返回空"与"配额满跳过"。
+            stats['quota_skip'] += 3
 
         # 预取阶段 2：东财板块归属 + 龙虎榜（不限配额，em_get 内置 0.5s 限流）
         # 板块归属短期稳定、龙虎榜是 T+1 数据，周末拉到的就是周五最新
@@ -287,8 +336,13 @@ def main():
 
         try:
             dt = de.get_dragon_tiger(code)
-            de._write_eastmoney_prefetch('dragon_tiger', code, dt)
-            stats['dragon_tiger'] += 1
+            # 2026-09-22 修复（缺陷排查 P2-13）：`dt is None` 时原实现仍写入
+            # JSON `null` 记录并把计数加 1 → 缓存里出现"假已覆盖"条目。
+            if dt:
+                de._write_eastmoney_prefetch('dragon_tiger', code, dt)
+                stats['dragon_tiger'] += 1
+            else:
+                stats['miss'] += 1
         except Exception as e:
             logger.warning(f"东财龙虎榜预取失败 {code}: {e}")
 
@@ -296,9 +350,19 @@ def main():
             logger.info(f"进度 {i+1}/{len(codes)}: {stats}")
 
     logger.info(f"预取完成: {stats}")
+    # 2026-09-22 修复（缺陷排查 P2-11）：壳记录（MACD/RSI/CCI 全空）占比告警。
+    # 契约 E 要求 ">20% 需关注上游质量"，原实现只累加 reject 却从不计算占比。
+    _tried = stats['tech'] + stats['reject']
+    if _tried > 0:
+        _rej_ratio = stats['reject'] / _tried
+        if _rej_ratio > 0.20:
+            logger.error(f"壳记录占比 {_rej_ratio:.1%} > 20%（{stats['reject']}/{_tried}）"
+                         f"→ 上游技术因子字段完整率异常，请检查 ASHareHub schema")
+        else:
+            logger.info(f"壳记录占比 {_rej_ratio:.1%}（{stats['reject']}/{_tried}）")
     # 报告配额使用（仅 asharehub）
     used = de._asharehub_budget_used
-    gate = de._asharehub_budget - 10
+    gate = de._asharehub_budget - de.ASHAREHUB_RESERVE
     logger.info(f"当日 ASHareHub 配额已用: {used}/{de._asharehub_budget}"
                 f"（本地闸门 {gate}，东财不限配额）")
     return 0

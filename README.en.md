@@ -10,7 +10,7 @@
 
 [简体中文](README.md) · [English](README.en.md)
 
-> **Status (2026-09-21)**: Code frozen (stable v-G), entering observation period. 497 unit tests + 9/0 gate all green.
+> **Status (2026-09-21)**: Code frozen (stable v-G), entering observation period. 565 unit tests + 9/0 gate all green.
 
 ---
 
@@ -132,7 +132,7 @@ python scripts/eod_stock_picker.py --mode long
 
 # Unified CLI entry: one command for all common ops
 python scripts/pick.py pick          # EOD stock picking
-python scripts/pick.py health        # fast gate (9 checks)
+python scripts/pick.py health        # fast gate (10 checks)
 python scripts/pick.py backfill      # T+1/T+5/T+20 return backfill
 python scripts/pick.py oos           # full OOS factor diagnostics
 python scripts/pick.py calibrate     # weight calibration proposal (no auto-apply)
@@ -363,7 +363,7 @@ stock-picker/
 │   ├── prefetch_tdx.py            TDX valuation/event prefetch
 │   └── prefetch_asharehub.py      Non-trading-day quota prefetch
 │
-├── tests/                         497 unit tests (incl. hard-contract locks + guard tests)
+├── tests/                         565 unit tests (incl. hard-contract locks + guard tests)
 ├── config.yml                     Central configuration
 ├── SKILL.md                       AI assistant skill definition
 ├── CHEATSHEET.md                  Quick reference
@@ -441,7 +441,7 @@ Example prompts:
 > "Show me fundamentals for 600519" → ROE/EPS/valuation snapshot
 > "Run a backtest" → executes backtest engine
 > "Compare two backtest runs" → version comparison
-> "Check system health" → runs verify.py 9 checks
+> "Check system health" → runs verify.py 10 checks
 > "What's the postmortem hit rate?" → runs postmortem.py stats
 
 ---

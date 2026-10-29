@@ -20,6 +20,8 @@
 import os
 import atexit
 import math
+from core import numeric
+import numbers
 import time
 import random
 import logging
@@ -57,9 +59,19 @@ def sanitize_nan(obj):
     float('nan')/float('inf')/float('-inf') 统一转为 None（JSON null）。
     配合 json.dumps(..., allow_nan=False) 形成双保险：若清洗遗漏会直接抛错
     （写入失败进日志），而不是把毒数据写进缓存。
+
+    2026-09-22 修复（第二轮回归 P2-6 · 实证）：原实现 `isinstance(obj, float)`
+    **漏判 numpy 标量** —— `np.float64('nan')` 不是 python float，
+    `np.float64('inf')` 同理；它们进入 json.dumps 时会被转成 python float 并以
+    `NaN` 字面量落盘（实测 allow_nan=False 也不报错，因为 dumps 在序列化时
+    已把它转成 float 且 allow_nan 只拦截 python float 的 nan…实测确实未拦截），
+    读回后污染因子分。改用 `numbers.Real`（覆盖 numpy 数值类型）统一判定。
     """
-    if isinstance(obj, float):
-        return None if (obj != obj or obj in (float('inf'), float('-inf'))) else obj
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, numbers.Real):
+        f = float(obj)
+        return f if math.isfinite(f) else None
     if isinstance(obj, dict):
         return {k: sanitize_nan(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -124,6 +136,21 @@ def em_get(url: str, params: dict = None, headers: dict = None,
 class DataEngine:
     """核心数据引擎 — 汇聚多源A股数据"""
 
+    # 2026-09-23（交接单 A6）：ASHareHub 日配额的**预留量**单一常量。
+    # 必须放在类属性（而非 __init__）——既有测试用 `DataEngine.__new__(DataEngine)`
+    # 构造轻量对象再调 `_mark_asharehub_quota_exhausted`，实例属性不存在会 AttributeError。
+    # 真实闸门 = _asharehub_budget - ASHAREHUB_RESERVE（默认 90/100）。
+    # `scripts/daily_job.QUOTA_RESERVE` 必须与之相等（守卫测试断言）。
+    ASHAREHUB_RESERVE = 10
+    # 2026-09-23（交接单 A5 决策）：**生产 eod 的额度地板**。
+    # 单次 eod 的设计预算 = 55 次（moneyflow 10 + tech 10 + concepts 20 + financial 15，
+    # 见 strategies/short_term.py 的注释），与预取单次预算 90 之和 145 > 日配额 100
+    # → 二者不可同日共存。策略：
+    #   · 预取在**交易日**（通常有 eod）运行时，必须给生产留下这 55 次；
+    #   · 非交易日（预取的主场景）无 eod，地板为 0 → 可用满剩余额度（吞吐不变）。
+    # 配额上限的任何路径都不得击穿"日配额 100"这一硬约束。
+    ASHAREHUB_PROD_FLOOR = 55
+
     def __init__(self, config: dict = None):
         self.config = config or {}
         self.cache = TTLCache(maxsize=100, ttl=60)
@@ -175,6 +202,27 @@ class DataEngine:
         self._last_asharehub_call = 0.0
         self._asharehub_lock = threading.Lock()  # 节流 + 配额计数共用一把锁
         self._asharehub_budget = 100  # 日配额
+        # 2026-09-23（交接单 A6）：预留量已收敛为**类属性** ASHAREHUB_RESERVE（见类头）。
+        # 此前 `- 10` 硬编码在本文件 3 处 + daily_job.QUOTA_RESERVE + prefetch 2 处。
+        # 2026-09-23（交接单 R1）：回测/离线路径的**配额冻结**开关。
+        # 置 True 后 `_asharehub_budget_ok()` 直接返回 False —— 一次性覆盖全部
+        # ASHareHub 系 key（含 akshare_north_flow 与未来新增），且不受
+        # `_recover_sources()` 的 10 分钟自动恢复影响（该函数只翻 _source_available，
+        # 而这里冻结的是"能否扣额"本身，二者解耦）。
+        # 与旧的"把 _source_available 置 False"相比更彻底：不会写生产配额账本、
+        # 不会把生产源标记为故障、不依赖 key 清单。
+        self._quota_frozen = False
+        # 2026-09-23（交接单 A2）：配额账本归属标识（谁在消耗）。
+        # 默认 unknown；调用方用 set_quota_owner() 注入（如 'eod:short' /
+        # 'backtest:short' / 'prefetch'），闸门命中时写进降级文案，使"额度被谁吃光"
+        # 可在简报首屏直接归因（此前只能靠文件 mtime 反推）。
+        self._quota_owner = os.environ.get('ASHAREHUB_QUOTA_OWNER', 'unknown')
+        # 2026-09-23（交接单 A3/A4 配套）：当日闸门命中标记 + 告警去重。
+        # 命中后 `_asharehub_budget_ok()` 走快路径直接返回 False（不节流、不读盘、
+        # 不重复标记），避免"4 个 wrapper × 200 股"造成的 warning 刷屏与
+        # 0.3s×N 的串行空转（A7-②）；标记按日重置，跨天由既有重置逻辑恢复。
+        self._asharehub_gate_hit_date = ''
+        self._quota_gate_warned = False
         # fin_cache 财务快照 TTL（天）：超过则视为过期，回源重查。
         # 理由（2026-09-17 T1）：此前 fin_cache 无 TTL，"最新季报"缓存一旦写入
         # 永不刷新 → 新季报发布后基本面/估值因子永久陈旧。季报披露期最长约 4 个月，
@@ -246,6 +294,23 @@ class DataEngine:
                 conn.execute("ALTER TABLE fin_cache ADD COLUMN fetched_at TEXT")
             except Exception:
                 pass
+            # 迁移（2026-10-29 P-20261021-01）：存量行（迁移前写入）fetched_at 全
+            # NULL 且 report_date 全 '0'——TTL 判定读 fetched_at，NULL 时按
+            # "不过期处理"，导致这些脏行永久驻留、永不回源（实测 56 行全部如此，
+            # 覆盖全 A 仅 1.1%）。修复：给存量脏行填一个过期时间戳（1970-01-01），
+            # 让 _get_fin_from_cache 的 TTL 判定（>90 天）自然触发回源重查；
+            # 下一次写入会带正确的 fetched_at + report_date。
+            try:
+                cur = conn.execute(
+                    "UPDATE fin_cache SET fetched_at='1970-01-01 00:00:00' "
+                    "WHERE fetched_at IS NULL OR fetched_at='' OR report_date='0' OR report_date=''"
+                )
+                if cur.rowcount > 0:
+                    logger.info(
+                        f"fin_cache 存量脏行已标记过期（fetched_at 补旧时间戳）: "
+                        f"{cur.rowcount} 行，将触发 TTL 回源")
+            except Exception as e:
+                logger.warning(f"fin_cache 存量迁移失败（不影响功能）: {str(e)[:60]}")
             # 2026-09-18 审查修复（性能 P2）：kline_cache 主键为 (code,date)，
             # `WHERE date>=? AND date<=?` 无可用索引 → 对 300 万行**全表 SCAN**
             # （面板构建/回测预热/预取均受影响，EXPLAIN 已实测确认）。补 date 索引。
@@ -352,7 +417,13 @@ class DataEngine:
             conn = sqlite3.connect(self._eastmoney_prefetch_path)
             conn.execute(
                 "INSERT OR REPLACE INTO {} (code, data, fetched_at) VALUES (?, ?, ?)".format(table),
-                (str(code).zfill(6), json.dumps(data, ensure_ascii=False),
+                # 2026-09-22 修复（缺陷排查 P2-8）：与 asharehub 预取同口径加
+                # `sanitize_nan` + `allow_nan=False` 双保险 —— 原实现裸 dumps，
+                # 一旦出现非有限值就以 `NaN` 字面量落盘（非严格 JSON），
+                # 读回后沿 calc_hot_theme_score 的板块涨幅均值进入排序，
+                # `sorted` 遇 NaN 顺序未定义。
+                (str(code).zfill(6),
+                 json.dumps(sanitize_nan(data), ensure_ascii=False, allow_nan=False),
                  _dt.now().strftime('%Y-%m-%d %H:%M:%S'))
             )
             conn.commit()
@@ -756,13 +827,26 @@ class DataEngine:
         时间 —— 否则 23:59 发起、00:01 写盘的请求会把账本日期写成次日，与读取时
         的日期口径不一致导致跨午夜配额错乱/重复计数。today 缺省时回退到当前日期
         （兼容其他调用点）。
+
+        2026-09-23（交接单 A2）：**向后兼容地**追加两个元数据字段
+          · `owner`    —— 谁在消耗（`set_quota_owner()` 注入，默认 unknown）
+          · `last_ts`  —— 最后一次成功自增的本地时间（分钟级）
+        读取方（`_read_quota_file` 返回 int、`prefetch_asharehub` / `daily_job`
+        直接 json.load 后取 'used'）全部按 `dict.get(k, default)` 容错，
+        追加字段不改变任何既有签名与语义。
         """
         if today is None:
             today = datetime.now().strftime('%Y-%m-%d')
         tmp_path = self._asharehub_quota_path + '.tmp'
+        payload = {
+            'date': today,
+            'used': used,
+            'owner': getattr(self, '_quota_owner', 'unknown'),
+            'last_ts': datetime.now().strftime('%Y-%m-%d %H:%M'),
+        }
         try:
             with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump({'date': today, 'used': used}, f)
+                json.dump(payload, f)
             os.replace(tmp_path, self._asharehub_quota_path)
         except Exception as e:
             logger.warning(f"asharehub配额文件写入失败: {str(e)[:60]}")
@@ -800,7 +884,7 @@ class DataEngine:
                     fcntl.flock(fd, fcntl.LOCK_EX)
                 try:
                     used = self._read_quota_file(today)
-                    if used >= self._asharehub_budget - 10:
+                    if used >= self._asharehub_budget - self.ASHAREHUB_RESERVE:
                         # 配额已满：同步内存缓存 + 标记源状态（报告显示原因）
                         self._asharehub_budget_used = used
                         self._mark_asharehub_quota_exhausted()
@@ -831,7 +915,7 @@ class DataEngine:
             if self._asharehub_budget_date != today:
                 self._asharehub_budget_date = today
                 self._asharehub_budget_used = 0
-            if self._asharehub_budget_used >= self._asharehub_budget - 10:
+            if self._asharehub_budget_used >= self._asharehub_budget - self.ASHAREHUB_RESERVE:
                 # 降级模式配额耗尽也标记源状态，避免 4 个 wrapper 对 200 股各
                 # 调一次 budget_ok 都走完整重试 → 800 条 warning + 240s 空转
                 self._mark_asharehub_quota_exhausted()
@@ -839,47 +923,126 @@ class DataEngine:
             self._asharehub_budget_used += 1
             return True
 
+    def quota_remaining(self, extra_floor: int = 0) -> int:
+        """当日**可用于消耗**的剩余次数（只读，不消耗、不写盘）。
+
+        2026-09-23（交接单 A5 决策）：供预取脚本按剩余额度动态推导批大小 ——
+        而不是用固定的 `--limit 30` 去撞闸门。计算：
+            remaining = budget − ASHAREHUB_RESERVE − used − extra_floor
+        · `extra_floor` 用于给生产 eod 预留（交易日传 `ASHAREHUB_PROD_FLOOR`）；
+        · 返回负数时按 0 处理。
+        """
+        try:
+            used = self._read_quota_file()
+        except Exception:
+            used = 0
+        return max(0, int(self._asharehub_budget) - self.ASHAREHUB_RESERVE
+                   - int(used) - max(0, int(extra_floor)))
+
+    def set_quota_owner(self, owner: str):
+        """注入配额账本归属标识（2026-09-23 交接单 A2）。
+
+        调用方在启动时声明自己是谁（如 'eod:short' / 'backtest:run#104' /
+        'prefetch'），写入账本 `owner` 字段并在闸门命中文案中回显 —— 使
+        "当日额度被谁吃光" 可在简报首屏直接归因（此前只能靠文件 mtime 反推）。
+        仅影响文案与账本元数据，不改变配额计数语义。
+        """
+        if owner:
+            self._quota_owner = str(owner)[:60]
+
     def _mark_asharehub_quota_exhausted(self):
-        """配额耗尽：同步 _source_available 熔断 + _source_status 报告标注
+        """配额耗尽：**按源价值分级**熔断 + _source_status 报告标注
 
         文案口径（2026-09-16 P2-3）：必须说明是**本地安全闸门**而非服务端配额。
-        真实闸门 = budget - 10（预留 10 次给手动验证），默认 90/100；原文案写
+        真实闸门 = budget - ASHAREHUB_RESERVE，默认 90/100；原文案写
         "日配额已用完(100次/天)"会让人误判为服务端 429 限流，从而去查上游状态。
+
+        2026-09-23（交接单 A3）：原实现把 4 个源**一起**置 False —— 把"预算耗尽"
+        这一个事件复用成"源故障"。但四源价值差异极大（concepts→hot_theme **0.55**；
+        tech 0.02；moneyflow 0.01；financial 0）。现改为：
+          - **保留 `asharehub_concepts` 可用**：它依赖 7 天 TTL 的预取缓存，
+            缓存命中即可继续供 hot_theme（0.55），实时调用仍被预算闸门挡住
+            （`_asharehub_budget_ok` 返回 False）→ 既保住主导因子，又不超配额；
+          - 低价值源（moneyflow/tech/financial，合计权重 0.03）照旧熔断，
+            维持原有"避免 4 wrapper × 200 股 warning 刷屏 + 空转"的防抖意图
+            （闸门快路径已进一步消除空转，见 `_asharehub_gate_hit_date`）。
         """
         keys = ('asharehub_moneyflow', 'asharehub_tech_factors',
-                'asharehub_concepts', 'asharehub_financial')
-        gate = self._asharehub_budget - 10
+                'asharehub_financial')
+        gate = self._asharehub_budget - self.ASHAREHUB_RESERVE
+        # 防御：本方法可能被 `DataEngine.__new__` 构造的轻量对象调用
+        # （既有测试 test_quota_message_timezone_20260916 即如此）→ 全部用
+        # getattr 兜底，不得假设 __init__ 已执行。
+        # 2026-09-23（独立验证者发现的不一致边角加固）：**两个日期必须同时落定为
+        # 今天** —— 若只写 gate_hit_date 而 budget_date 仍是 ''，下一次
+        # `_asharehub_budget_ok()` 会先命中"跨天重置"分支把 gate_hit_date 清掉并
+        # 复活 4 个源 → 快路径失效（0.3s×N 空转回归）。当前该状态在生产不可达
+        # （`_consume_asharehub_quota` 成功路径已置 budget_date），此处按无条件赋值
+        # 加固，杜绝该状态下的"复活"。
+        _today = datetime.now().strftime('%Y-%m-%d')
+        self._asharehub_budget_date = _today
+        self._asharehub_gate_hit_date = _today
+        owner = getattr(self, '_quota_owner', 'unknown')
         msg = (f'AShareHub 已达本地安全闸门({gate}/{self._asharehub_budget}，'
-               f'预留 10 次)，因子降为中性')
+               f'预留 {self.ASHAREHUB_RESERVE} 次)；本日额度由 {owner} 消耗'
+               f'（账本 owner 字段可归因），低价值源降为中性；'
+               f'概念板块(→hot_theme 0.55)仍走预取缓存')
+        if not getattr(self, '_quota_gate_warned', False):
+            self._quota_gate_warned = True
+            logger.warning(msg)
         for k in keys:
             self._source_available[k] = False
             if hasattr(self, '_source_status'):
                 self._update_source_status(k, False, msg)
+        # concepts 保持可用（仅缓存可服务）：显式标注原因，便于健康报告区分
+        # "预算受限" 与 "源故障"；文案保留闸门数字（便于按预算变化核对）
+        if hasattr(self, '_source_status'):
+            self._update_source_status(
+                'asharehub_concepts', True,
+                f'AShareHub 已达本地安全闸门({gate}/{self._asharehub_budget})，'
+                f'预算受限：概念板块仅预取缓存可用（本日额度由 {owner} 耗尽）')
 
     def _asharehub_budget_ok(self) -> bool:
         """检查 ASHareHub 日配额是否还有余额，消耗一次。
 
         线程锁（进程内串行）+ 跨进程文件锁（原子账本）。
         配额耗尽时同步标记 _source_available + _source_status，报告可显示原因。
+
+        2026-09-23 三处加固（交接单 R1 / A3 / A4 / A7-②）：
+          · **R1 配额冻结**：`_quota_frozen=True`（回测/离线路径）→ 立即返回 False，
+            不读盘、不写盘、不节流、不标记源状态。这覆盖全部 ASHareHub 系 key
+            （含 akshare_north_flow 及未来新增），且不受 `_recover_sources` 影响 ——
+            修掉了旧做法"只置 4 个 asharehub_* + akshare_north_flow 会被 10 分钟
+            自动恢复翻回 True"的假保护。
+          · **闸门快路径**：当日已命中闸门 → 直接 False，**跳过 0.3s 节流与读盘**。
+            原实现每次调用都要先 sleep 0.3s（节流在锁内）→ 闸门命中后
+            4 wrapper × 200 股 ≈ 240s 纯空转；现在只有真正会发起请求的调用才节流。
+          · 跨天重置语义不变（由既有分支恢复源状态与计数）。
         """
         with self._asharehub_lock:
+            if self._quota_frozen:
+                return False
+            today = datetime.now().strftime('%Y-%m-%d')
+            if self._asharehub_budget_date != today:
+                # 跨天重置：恢复 asharehub 源状态（配额恢复）
+                self._asharehub_budget_date = today
+                self._asharehub_budget_used = 0
+                self._asharehub_gate_hit_date = ''
+                self._quota_gate_warned = False
+                for k in ('asharehub_moneyflow', 'asharehub_tech_factors',
+                          'asharehub_concepts', 'asharehub_financial'):
+                    self._source_available[k] = True
+                    if hasattr(self, '_source_status'):
+                        self._update_source_status(k, True)
+            # 闸门快路径：本日已确认耗尽 → 立即失败（不节流/不读盘/不重复告警）
+            if self._asharehub_gate_hit_date == today:
+                return False
             # 节流：两次调用间隔不少于 0.3s（此前 _rate_limit_asharehub 是
             # 死代码从未被调用，节流从未生效；并入此处真正生效）
             elapsed = time.time() - self._last_asharehub_call
             if elapsed < 0.3:
                 time.sleep(0.3 - elapsed)
             self._last_asharehub_call = time.time()
-
-            today = datetime.now().strftime('%Y-%m-%d')
-            if self._asharehub_budget_date != today:
-                # 跨天重置：恢复 asharehub 源状态（配额恢复）
-                self._asharehub_budget_date = today
-                self._asharehub_budget_used = 0
-                for k in ('asharehub_moneyflow', 'asharehub_tech_factors',
-                          'asharehub_concepts', 'asharehub_financial'):
-                    self._source_available[k] = True
-                    if hasattr(self, '_source_status'):
-                        self._update_source_status(k, True)
             return self._consume_asharehub_quota()
 
     def get_all_quotes(self) -> pd.DataFrame:
@@ -927,7 +1090,14 @@ class DataEngine:
                         pre_close = self._safe_float(fields[4])
                         results.append({
                             'code': code6, 'name': fields[1], 'price': price,
-                            'pct_chg': round((price - pre_close) / pre_close * 100, 2) if pre_close else 0.0,
+                            # 2026-09-22 修复（缺陷排查 P2-3 · 契约 B）：
+                            # `pre_close` 缺失/为 0 时原实现回落到 0.0，把"涨幅未知"
+                            # 伪装成"零涨幅"→ 涨停硬过滤（risk_filter 的
+                            # `pct_chg >= 板宽×0.98`）与追高惩罚同时失效，该股可能在
+                            # 涨停价被"买入"（回测收益虚高）。缺失一律 None，
+                            # 下游已按"非有限 → 按缺失"加固。
+                            'pct_chg': round((price - pre_close) / pre_close * 100, 2)
+                            if pre_close > 0 else None,
                             'pre_close': pre_close,
                             'open': self._safe_float(fields[5]),
                             'high': self._safe_float(fields[33]),
@@ -937,13 +1107,20 @@ class DataEngine:
                             # （risk_filter min_amount 按元比较，此前单位错位导致
                             #   全市场股票都触发"成交额不足" penalty=0.5 → 分数被 ×0.75）
                             'amount': self._safe_float(fields[37]) * 10000,
-                            'turnover': self._safe_float(fields[38]),
+                            # 2026-09-22 修复（P1-14 · 契约 B）：换手率缺失 → None，
+                            # 不再伪装成 0.0（消费端已按"非有限→缺失"加固）。
+                            'turnover': self._safe_float_opt(fields[38]),
                             # 腾讯 fields[49] 量比（无量纲）。此前漏解析导致
                             # volume_ratio 恒 1.0 → volume_price 恒 52.5 零区分度。
                             # 无效值回退 1.0（保持旧行为），避免数据未就绪时误压低分。
                             'volume_ratio': self._safe_float(fields[49]) if len(fields) > 49 and self._safe_float(fields[49]) > 0 else 1.0,
-                            'pe': self._safe_float(fields[39]),
-                            'pb': self._safe_float(fields[46]) if len(fields) > 46 else None,
+                            # 2026-09-22 修复（P1-14 · 契约 B）：PE/PB 缺失 → None
+                            # （与 total_market_cap 同口径）。负值属业务语义
+                            # （PE<0 亏损股 / PB<0），不是缺失，原样保留。
+                            # 副作用修复：snapshot_valuation_daily 的 `pe_raw is None`
+                            # 缺失率告警此前永不触发（_safe_float 把缺失折成 0.0）。
+                            'pe': self._safe_float_opt(fields[39]),
+                            'pb': self._safe_float_opt(fields[46]) if len(fields) > 46 else None,
                             # 腾讯市值字段单位是亿元，统一转为元（与 factor_library 的
                             # calc_fundamental_score "mcap: 总市值（元）" 文档一致；此前
                             # 亿级数值永远过不了 >1000亿 阈值，大市值加分死代码）
@@ -1462,20 +1639,45 @@ class DataEngine:
             symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
             df = client.technical_factors(symbol=symbol, limit=1)
             if df is not None and not df.empty:
-                row = df.iloc[-1]
+                # 2026-10-29 同款 bug 修复（与 get_financial_indicators 一致）：
+                # SDK `limit` 参数实测不生效（technical_factors 返回 1642 行全量），
+                # 且返回**倒序**（trade_date 最新在前：20261029→…）。原 `row = df.iloc[-1]`
+                # 取到的是**最旧一期**（600176 实测 macd_dif=0.322 vs 最新 -3.035）
+                # ——get_technical_factors_asharehub 同样长期返回旧技术因子。
+                # 修复：有 trade_date 列则按日期排序取最新一期；无该列
+                # （测试 fixture 兼容）回退 iloc[-1] 原语义。
+                if 'trade_date' in df.columns:
+                    df = df.sort_values('trade_date')
+                    row = df.iloc[-1]
+                else:
+                    row = df.iloc[-1]
+
+                # 2026-09-22 修复（缺陷排查 P1-36 · 契约 B/E）：原实现对每个字段用
+                # `float(row.get(k, 0))` / `float(row.get(k, 50))` 兜底 ——
+                # 当上游**整列缺失**（schema 漂移）时，`Series.get` 返回默认值，
+                # 于是 0/50 都变成"有限值"→ `_is_shell_tech_record` 判定为"非壳" →
+                # 记录被写入缓存并借 7 天 TTL 长期驻留；消费端读到的 0/50 恰是
+                # "空头 -10 / RSI 中性"，得 ~40 分而非中性 50（2026-09-16 P0-1
+                # 事故的同构复现）。现改为：列缺失 → None，值非有限 → None，
+                # 使壳记录防线对"列漂移"同样有效（并在预取侧触发占比告警）。
+                def _tv(_k):
+                    if _k not in row.index:
+                        return None
+                    return row.get(_k)     # sanitize_nan 会把 NaN/±Inf 归一为 None
+
                 # 2026-09-16 P1-3：出口统一走 sanitize_nan，把 NaN/±Inf 归一为 None，
                 # 使 live 路径与「写缓存(sanitize_nan) → 读缓存(json.loads)」的形态
                 # 完全等价。此前 live 返回 NaN、缓存返回 None，同一份数据两条路径
                 # 消费行为不一致（NaN 在比较中恒 False，静默落入 else 分支）。
                 return sanitize_nan({
-                    'macd_dif': float(row.get('macd_dif', 0)),
-                    'macd_dea': float(row.get('macd_dea', 0)),
-                    'macd': float(row.get('macd', 0)),
-                    'rsi_6': float(row.get('rsi_6', 50)),
-                    'rsi_12': float(row.get('rsi_12', 50)),
-                    'rsi_24': float(row.get('rsi_24', 50)),
-                    'close_hfq': float(row.get('close_hfq', 0)),
-                    'cci': float(row.get('cci', 0)),
+                    'macd_dif': _tv('macd_dif'),
+                    'macd_dea': _tv('macd_dea'),
+                    'macd': _tv('macd'),
+                    'rsi_6': _tv('rsi_6'),
+                    'rsi_12': _tv('rsi_12'),
+                    'rsi_24': _tv('rsi_24'),
+                    'close_hfq': _tv('close_hfq'),
+                    'cci': _tv('cci'),
                 })
             return None
         except Exception as e:
@@ -1496,7 +1698,12 @@ class DataEngine:
             cached = self._read_asharehub_prefetch('concepts', str(code).zfill(6), max_age_days=7)
             if cached is not None:
                 names = cached.get('names') if isinstance(cached, dict) else cached
-                return names if names else None
+                # 2026-09-22 修复（缺陷排查 P2-9）：命中缓存但内容为空列表时，
+                # 原实现 `return names if names else None` **在缓存分支内直接返回**
+                # → 7 天 TTL 内恒 None，不会 fall through 到实时 API（静默失效模式）。
+                # 现改为仅在非空时返回，否则继续走实时分支。
+                if names:
+                    return names
         if not self._source_available.get('asharehub_concepts', True):
             return None
         if not self._asharehub_budget_ok():
@@ -1554,23 +1761,212 @@ class DataEngine:
             symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
             df = client.financial_indicators(symbol=symbol, limit=1)
             if df is not None and not df.empty:
-                row = df.iloc[-1]
-                return {
-                    'eps': float(row.get('eps', 0)),
-                    'roe': float(row.get('roe', 0)),
-                    'roe_waa': float(row.get('roe_waa', 0)),
-                    'roa': float(row.get('roa', 0)),
-                    'gross_margin': float(row.get('gross_margin', 0)),
-                    'netprofit_margin': float(row.get('netprofit_margin', 0)),
-                    'debt_to_assets': float(row.get('debt_to_assets', 0)),
-                    'bps': float(row.get('bps', 0)),
-                    'ocfps': float(row.get('ocfps', 0)),
-                    'basic_eps_yoy': float(row.get('basic_eps_yoy', 0)),
-                    'netprofit_yoy': float(row.get('netprofit_yoy', 0)),
+                # 2026-10-29 实测修复：SDK `limit` 参数实测不生效（limit=1/6 均返回
+                # 全量历史，600176 实测 58 行，最新在前）。原 `row = df.iloc[-1]`
+                # 取到的是**最旧一期**（600176 实测=2012-06-30，eps=0.1164/roe=2.94）
+                # ——即 get_financial_indicators 长期返回 10+ 年前的财务数据。
+                # 修复：有 end_date 列则按报告期排序取最新一期；无该列
+                # （测试 fixture 兼容）回退 iloc[-1] 原语义。
+                if 'end_date' in df.columns:
+                    df = df.sort_values('end_date')
+                    row = df.iloc[-1]
+                else:
+                    row = df.iloc[-1]
+
+                # 2026-09-22 修复（第二轮回归 P2-5 · 契约 B/E）：原实现
+                # `float(row.get(k, 0))` 把"字段缺失/非有限"折叠成 0 ——
+                # 实证：EPS/ROE 全空的响应会产出 11 个 0.0（eps=0、roe=0），
+                # 0 是**合法业务值**（亏损/微利），无法与"无数据"区分。
+                # 消费端 `long_term` 用 `roe is None` 判缺失 → 永不触发；
+                # `factor_library` 的 roe>=5 加分、pe<0 罚分全部落空。
+                # 处理：列缺失或非有限 → None（ sanitize_nan 同口径），
+                # 与同文件 technical_factors 的 _tv 修复一致。
+                def _fv(_k):
+                    if _k not in row.index:
+                        return None
+                    v = row.get(_k)
+                    try:
+                        f = float(v)
+                    except (TypeError, ValueError):
+                        return None
+                    return f if math.isfinite(f) else None
+
+                out = {
+                    'eps': _fv('eps'),
+                    'roe': _fv('roe'),
+                    'roe_waa': _fv('roe_waa'),
+                    'roa': _fv('roa'),
+                    # 2026-10-29 单位脏修复：gross_margin 实测返回绝对额
+                    # （600176=787068249 元级），grossprofit_margin 才是比率
+                    # （29.55）。提案 P-20261021-01 确认消费端零引用 gross_margin
+                    # （全库 grep 仅生产端+测试 fixture），故双键并存：
+                    # gross_margin 保留兼容旧消费者（值已修复为比率），
+                    # grossprofit_margin 为标准键供新代码使用。
+                    'gross_margin': _fv('grossprofit_margin'),
+                    'grossprofit_margin': _fv('grossprofit_margin'),
+                    'netprofit_margin': _fv('netprofit_margin'),
+                    'debt_to_assets': _fv('debt_to_assets'),
+                    'bps': _fv('bps'),
+                    'ocfps': _fv('ocfps'),
+                    'basic_eps_yoy': _fv('basic_eps_yoy'),
+                    'netprofit_yoy': _fv('netprofit_yoy'),
                 }
+                # 全为 None = 上游返回空壳（无有效财务字段）→ 按失败处理，
+                # 不产出"看似有数据实为全缺"的 dict（同 tech_factors 壳记录防线）。
+                if all(v is None for v in out.values()):
+                    logger.warning(f"asharehub财务指标 {code}: 全字段为空（壳响应）→ 按失败处理")
+                    return None
+                return out
             return None
         except Exception as e:
             logger.warning(f"asharehub财务指标失败 {code}: {str(e)[:60]}")
+            self._register_asharehub_failure('asharehub_financial', str(e))
+        return None
+
+    def get_financial_indicators_history(self, code: str, periods: int = 6) -> Optional[list]:
+        """ASHareHub 财务指标多期历史序列（2026-10-29 新增，P-20261021-01）。
+
+        提案实测发现 SDK `limit` 参数不生效（返回全量历史，最新在前），
+        本方法直接取全量并按 end_date 升序返回最近 periods 期列表，
+        供 F-Score 改善项 / 成长稳定性 std / SUE / Accruals 趋势等
+        需跨期对比的因子使用。
+
+        返回：[{...单期dict（与 get_financial_indicators 同字段）+ 'end_date'}, ...]
+        按报告期升序（最旧在前），periods 截取最近 N 期。失败返回 None。
+        """
+        # 非交易日预取缓存优先（财务季度级低频）
+        if not self._prefetch_mode:
+            cached = self._read_asharehub_prefetch('financial', str(code).zfill(6), max_age_days=14)
+            if cached is not None:
+                # 缓存只有单期（get_financial_indicators 写入），回退单期列表
+                if isinstance(cached, dict):
+                    # 2026-10-29 maker-checker 审查（REJECT 轮1）：缓存分支返回的
+                    # 单期 dict 缺 'end_date' 键，而 API 分支（下方）对每行补了
+                    # d['end_date'] —— 消费端读 d['end_date'] 时缓存路径 KeyError、
+                    # API 路径正常，两条路径形状不一致。修复：缓存分支同样补
+                    # 'end_date'（缓存里没有该字段时填 ''），与 API 分支对齐。
+                    if 'end_date' not in cached:
+                        cached = dict(cached)
+                        cached['end_date'] = ''
+                    return [cached]
+                return cached
+        if not self._source_available.get('asharehub_financial', True):
+            return None
+        if not self._asharehub_budget_ok():
+            return None
+        try:
+            client = self._get_asharehub_client()
+            code6 = str(code).zfill(6)
+            symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
+            df = client.financial_indicators(symbol=symbol, limit=1)
+            if df is not None and not df.empty:
+                if 'end_date' not in df.columns:
+                    logger.warning(f"asharehub财务历史 {code}: 响应无 end_date 列 → 无法分期，按单期处理")
+                    row = df.iloc[-1]
+                    # 2026-10-29 maker-checker 审查（REJECT 轮2）：本兜底分支返回的
+                    # 单期 dict 同样缺 'end_date' 键——方法内三条路径形状不一致
+                    # （cache 分支已补 / API 正常路径补 / 本兜底路径缺）。消费端读
+                    # d['end_date'] 时本路径 KeyError。修复：与其余分支对齐补 ''。
+                    d = self._fin_row_to_dict(row)
+                    d['end_date'] = ''
+                    return [d]
+                df = df.sort_values('end_date')
+                recent = df.tail(periods)
+                rows = []
+                for _, r in recent.iterrows():
+                    d = self._fin_row_to_dict(r)
+                    d['end_date'] = str(r.get('end_date', ''))
+                    rows.append(d)
+                return rows
+            return None
+        except Exception as e:
+            logger.warning(f"asharehub财务历史失败 {code}: {str(e)[:60]}")
+            self._register_asharehub_failure('asharehub_financial', str(e))
+        return None
+
+    @staticmethod
+    def _fin_row_to_dict(row) -> dict:
+        """把 financial_indicators 的一行转成统一 dict（2026-10-29 抽取，供单期/多期共用）。
+
+        与 get_financial_indicators 的 _fv 同口径：列缺失/非有限 → None。
+        """
+        def _fv(_k):
+            if _k not in row.index:
+                return None
+            v = row.get(_k)
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None
+            return f if math.isfinite(f) else None
+        return {
+            'eps': _fv('eps'),
+            'roe': _fv('roe'),
+            'roe_waa': _fv('roe_waa'),
+            'roa': _fv('roa'),
+            'gross_margin': _fv('grossprofit_margin'),
+            'grossprofit_margin': _fv('grossprofit_margin'),
+            'netprofit_margin': _fv('netprofit_margin'),
+            'debt_to_assets': _fv('debt_to_assets'),
+            'bps': _fv('bps'),
+            'ocfps': _fv('ocfps'),
+            'basic_eps_yoy': _fv('basic_eps_yoy'),
+            'netprofit_yoy': _fv('netprofit_yoy'),
+        }
+
+    def get_disclosure_date(self, code: str, start_date: str = None,
+                            end_date: str = None) -> Optional[list]:
+        """ASHareHub 财报披露日期（2026-10-29 新增，P-20261021-01）。
+
+        返回计划/实际披露日期列表（Q3 财报窗口事件驱动用）。
+        Args:
+            code: 6 位代码
+            start_date/end_date: YYYYMMDD 过滤窗口（可选）
+        返回：list[dict]（symbol/ann_date/end_date/pre_date/actual_date/modify_date）
+              或 None（失败）。SDK 返回 DataFrame，转成记录列表。
+        """
+        if not self._source_available.get('asharehub_financial', True):
+            return None
+        if not self._asharehub_budget_ok():
+            return None
+        try:
+            client = self._get_asharehub_client()
+            code6 = str(code).zfill(6)
+            symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
+            df = client.disclosure_date(symbol=symbol,
+                                        start_date=start_date, end_date=end_date)
+            if df is not None and not df.empty:
+                return df.to_dict('records')
+            return None
+        except Exception as e:
+            logger.warning(f"asharehub披露日期失败 {code}: {str(e)[:60]}")
+            self._register_asharehub_failure('asharehub_financial', str(e))
+        return None
+
+    def get_forecast(self, code: str, period: str = None) -> Optional[list]:
+        """ASHareHub 业绩预告（2026-10-29 新增，P-20261021-01）。
+
+        返回 profit warning / guidance 列表（SUE 升级路径 2 事件驱动用）。
+        Args:
+            code: 6 位代码
+            period: 报告期 YYYYMMDD（可选）
+        返回：list[dict]（symbol/ann_date/end_date/type/p_change_min/p_change_max/
+               net_profit_min/net_profit_max/summary）或 None（失败）。
+        """
+        if not self._source_available.get('asharehub_financial', True):
+            return None
+        if not self._asharehub_budget_ok():
+            return None
+        try:
+            client = self._get_asharehub_client()
+            code6 = str(code).zfill(6)
+            symbol = f"{code6}.SH" if code6.startswith(('6', '9')) else f"{code6}.SZ"
+            df = client.forecast(symbol=symbol, period=period)
+            if df is not None and not df.empty:
+                return df.to_dict('records')
+            return None
+        except Exception as e:
+            logger.warning(f"asharehub业绩预告失败 {code}: {str(e)[:60]}")
             self._register_asharehub_failure('asharehub_financial', str(e))
         return None
 
@@ -1598,16 +1994,37 @@ class DataEngine:
                             else:
                                 val = float(raw)
                         except (ValueError, TypeError):
-                            val = 0
-                        self._ths_fund_flow_cache[code_str] = val
+                            # 2026-09-22 修复（第二轮回归 P2-2）：原 `val = 0` 把
+                            # "解析失败"与"真零净流入"折叠 —— 下游 `abs(val) > 0`
+                            # 又把 0 当缺失丢弃。现解析失败存 None（缺失），
+                            # 真实 0.0 正常入缓存并返回（数据就是 0）。
+                            val = None
+                        if val is not None and math.isfinite(val):
+                            self._ths_fund_flow_cache[code_str] = val
                     self._update_source_status('akshare_fund_flow', True)
                     logger.info(f"同花顺全市场资金流已加载: {len(self._ths_fund_flow_cache)} 只")
+                else:
+                    # 2026-09-22 修复（缺陷排查 P2-7）：空表时原实现把缓存留在 {}
+                    # —— `is not None` 的下次调用会跳过重试，但缓存里永远没有数据
+                    # → 之后所有 capital_flow 静默回落 None（权重让渡），
+                    # 而健康报告仍显示 ths_fund_flow 可用（异常分支才会熔断）。
+                    # 现与异常分支同口径：置 None + 标记不可用，由熔断机制接管。
+                    # （注意：本进程内不会自动恢复，恢复靠每日新实例 /
+                    #  _reset_source_status —— 与异常分支口径一致，非本分支特有。）
+                    logger.warning("同花顺资金流返回空表 → 本次置空并标记源不可用"
+                                   "（下一次调用会重试）")
+                    self._ths_fund_flow_cache = None
+                    self._update_source_status(
+                        'ths_fund_flow', False, 'empty dataframe from akshare')
+                    return None
 
             code_str = str(code).zfill(6)
-            if code_str in self._ths_fund_flow_cache:
-                val = self._ths_fund_flow_cache.get(code_str, 0)
-                if abs(val) > 0:
-                    return val
+            # 2026-09-22 修复（第二轮回归 P2-2）：原 `if abs(val) > 0: return val`
+            # 会把**真实的零净流入**当缺失丢弃。现缓存里只存有限值
+            # （解析失败根本不入缓存），取到即返回（含 0.0）。
+            val = self._ths_fund_flow_cache.get(code_str)
+            if val is not None:
+                return val
             return None
         except Exception as e:
             logger.warning(f"同花顺资金流失败 {code}: {str(e)[:60]}")
@@ -2342,22 +2759,49 @@ class DataEngine:
         return {"records": records, "seats": seats, "institution": institution}
 
     def _update_source_status(self, source_key: str, success: bool, error: str = None):
-        """更新数据源状态"""
+        """更新数据源状态。
+
+        2026-09-23（交接单 A3 配套）：额外维护 `degraded` 标记 —— 用于区分
+        「源故障（available=False）」与「预算受限但仍可走缓存（available=True +
+        degraded=True）」。简报据此单独渲染一行，避免"concepts 保活"被误读为
+        "该源完全正常"而漏报 hot_theme(0.55) 的数据新鲜度风险。
+        """
         if source_key in self._source_status:
             self._source_status[source_key]['available'] = success
             if error:
                 self._source_status[source_key]['last_error'] = str(error)[:100]
+                self._source_status[source_key]['degraded'] = \
+                    ('闸门' in str(error)) or ('预算受限' in str(error))
             else:
                 self._source_status[source_key]['last_error'] = None
+                self._source_status[source_key]['degraded'] = False
 
     @staticmethod
     def _safe_float(val) -> float:
-        # 修复（2026-09-06 迭代）：NaN 原样穿透——float('nan') 不进 except 且
-        # bool(nan) 为 True，nan<=0 为 False，会绕过所有行情防护继续污染计算
+        # 2026-09-23（审查报告 R1）：委托 core.numeric（契约 A/B 唯一实现）。
+        # 语义保持：falsy（''/0/None）→ 0.0、NaN → 0.0（修复于 2026-09-06）、
+        # 其余经 opt_float 有限性判定。**新代码请用 _safe_float_opt（缺失→None）**，
+        # 遵守契约 B（字段缺失写 None 不写 0）。
+        return numeric.float_or(val, 0.0)
+
+    @staticmethod
+    def _safe_float_opt(val):
+        """与 `_safe_float` 同源，但**缺失/非有限返回 None 而非 0.0**。
+
+        2026-09-22 修复（缺陷排查 P1-14 · 硬契约 B）：`_safe_float` 把"字段缺失"
+        与"字段为 0"折叠成同一个 0.0，导致
+          ① 缺失 PE/PB 被下游当作业务值 0（`pb<=0 → -10` 破净惩罚、
+             `pe=0` 落空不罚），把"无数据"伪装成"破净/零估值"；
+          ② `scripts/snapshot_valuation_daily.py` 以 `pe_raw is None` 判字段缺失，
+             该分支永不触发 → PE 缺失率告警永久失效（size/PE 历史样本静默降级）。
+        注意：负值（PE<0 亏损股、PB<0）属**业务语义**，不是缺失，原样保留。
+        """
+        if val is None or isinstance(val, bool):
+            return None
         try:
-            f = float(val) if val else 0.0
-            if f != f:  # NaN 检测（NaN != NaN）
-                return 0.0
-            return f
-        except (ValueError, TypeError):
-            return 0.0
+            f = float(val)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(f):
+            return None
+        return f

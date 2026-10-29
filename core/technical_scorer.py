@@ -16,6 +16,7 @@
 """
 
 import math
+import numbers
 from dataclasses import dataclass, field
 from typing import List, Optional
 from enum import Enum
@@ -91,12 +92,28 @@ class TechnicalScorer:
             result.signal = "HOLD"
             return result
 
-        close = df['close'].astype(float)
+        # 2026-09-22 修复（缺陷排查 P2-6）：类型/列守卫。原实现直接
+        # `df['close'].astype(float)` —— 缺 'close' 列抛 KeyError、object 列含
+        # 非数值抛 ValueError，而调用链上（factor_library.compute_all_factors →
+        # score_stock → rank_stocks）此前**都没有 try**，单票脏 K 线会中断当日
+        # 全池评分。此处统一降级为中性 50（与"数据不足"同口径）。
+        try:
+            close = df['close'].astype(float)
+        except (KeyError, ValueError, TypeError) as e:
+            logger.warning(f"技术评分跳过（K 线缺 close 列或含非数值）: {str(e)[:60]}")
+            result.total = 50.0
+            result.signal = "HOLD"
+            return result
 
         # 修复（2026-09-05 审查 P3-5）：最新收盘价缺失/非正（坏数据）时整票
         # 返回中性 50。旧代码会让 0 价混入均线与乖离计算（乖离=-100%、
         # 均线"空头排列"），产出荒谬结论而非中性。
-        if pd.isna(close.iloc[-1]) or close.iloc[-1] <= 0:
+        # 2026-09-22 修复（第二轮回归 P1-1）：原判 `close.iloc[-1] <= 0` 对
+        # **NaN 恒 False** → 末根 close 为 NaN 时照常进入均线/乖离计算。
+        # 实证：末根 NaN 的 22 行序列，趋势分 30（满）+ 乖离 20（满）→
+        # technical=100（满分强趋势）。改为用 math.isfinite 显式拦截非有限值。
+        _last_close = float(close.iloc[-1])
+        if not math.isfinite(_last_close) or _last_close <= 0:
             result.total = 50.0
             result.signal = "HOLD"
             return result
@@ -160,9 +177,15 @@ class TechnicalScorer:
         # MACD 落入 else「空头 -10」，全空记录静默得 37 分而非中性 50 分。
         # 现改用 math.isfinite 统一把「非有限」视同「缺失」。
         def _num(v, default):
-            if isinstance(v, bool) or not isinstance(v, (int, float)):
+            # 2026-09-22 修复（缺陷排查 P2-6）：原白名单 `isinstance(v, (int, float))`
+            # **漏判 numpy 标量**（`np.int64` 不是 `int`，`np.float64` 恰是 `float`
+            # 的子类会通过）→ 若上游改用 `pandas 行.to_dict()`，整值字段（如 cci）
+            # 会被判"缺失"回落默认，结果静默偏中性。
+            # 改用 numbers.Real（覆盖 numpy 数值类型）并排除 bool。
+            if isinstance(v, bool) or not isinstance(v, numbers.Real):
                 return default
-            return v if math.isfinite(v) else default
+            fv = float(v)
+            return fv if math.isfinite(fv) else default
 
         # MACD 状态 (0-30分)
         macd_val = _num(tech.get('macd'), 0)

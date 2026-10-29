@@ -46,9 +46,15 @@ class TestQuotaMessageWording(unittest.TestCase):
         self.assertIn('90/100', msg)
         self.assertNotIn('100次/天', msg,
                          '不得再声称"日配额已用完(100次/天)"，会误导为服务端限流')
+        # 2026-09-23（交接单 A3）：语义由"四源全灭"改为**按源价值分级**——
+        # 低价值三源（moneyflow 0.01 / tech 0.02 / financial 0）熔断；
+        # concepts（→hot_theme **0.55**）保活，仅预取缓存可服务（实时调用仍被闸门挡住）。
         for k in ('asharehub_moneyflow', 'asharehub_tech_factors',
-                  'asharehub_concepts', 'asharehub_financial'):
-            self.assertFalse(de._source_available[k], '四个源必须同时熔断')
+                  'asharehub_financial'):
+            self.assertFalse(de._source_available[k], f'{k} 应熔断（低价值源）')
+        self.assertTrue(de._source_available.get('asharehub_concepts', True),
+                        'concepts 必须保活：其 7 天预取缓存承载 hot_theme(0.55)；'
+                        '四源全灭会把主导因子一并中性化')
 
     def test_gate_follows_budget(self):
         """闸门必须随预算变化，不能硬编码 90"""

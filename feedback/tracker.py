@@ -8,7 +8,9 @@
 """
 
 import sqlite3
+from core import numeric
 import json
+import math
 import os
 import logging
 from typing import Dict, List, Optional
@@ -16,6 +18,10 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+# 2026-09-23（审查报告 R1）：委托 core.numeric（契约 A 唯一实现）
+_finite = numeric.is_finite
 
 
 class PredictionTracker:
@@ -208,13 +214,21 @@ class PredictionTracker:
                 #   可作为近似的买入参考；不强行取 iloc[0]，避免抓到几天后的价）
                 prior = kline[kline['date'] <= pred_ts]
                 if not prior.empty:
-                    buy_idx = prior.index[-1]
-                    buy_price = float(kline.loc[buy_idx, 'close'])
-                    buy_date = kline.loc[buy_idx, 'date']
+                    # 2026-09-22 修复（缺陷排查 P1-23）：原实现用"前一交易日收盘"
+                    # 当买入价，并把 `future = kline[date > buy_date]` 锚定到该日
+                    # → 记入 t1_return 的其实是 (pred_date+1 收盘 / pred_date−1 收盘
+                    # − 1) 的**跨 2 日收益**，而 t1_date 看起来仍是"T+1"，
+                    # 偏差被掩盖。缓存缺口日的 T+1 收益被系统性放大，
+                    # 污染胜率 / kill-switch / 优化器训练集。
+                    # 处理与下方"K线整体晚于推荐日"分支一致：不写 outcomes，
+                    # 留在 pending 池等缓存愈合后按正确 pred_date 重算。
+                    _prior_d = kline.loc[prior.index[-1], 'date'].strftime('%Y-%m-%d')
                     logger.warning(
-                        f"推荐日 {pred_date} 不在K线中，用 {buy_date.strftime('%Y-%m-%d')} "
-                        f"收盘作为买入参考 ID={prediction_id}"
+                        f"推荐日 {pred_date} 不在K线中（最近可用的更早交易日 {_prior_d}）"
+                        f"→ 置 None 不写 outcomes ID={prediction_id}"
+                        f"（用更早收盘作基准会把 T+1 算成跨 2 日收益，等缓存愈合后重算）"
                     )
+                    return
                 else:
                     # K线最早也晚于推荐日：此前 get_kline(code, start_date=pred_date)
                     # 应当能抓到 pred_date 当天，首行 == pred_date 是常态；只有 mootdx
@@ -273,16 +287,21 @@ class PredictionTracker:
             return None, None
 
         # T+1: buy_date 之后的第 1 个交易日
+        # 2026-09-22 修复（契约 A）：`if t1_close` 对 NaN 为真 → 会算出 NaN 收益；
+        # 原实现依赖 SQLite 把 NaN 落成 NULL 才不污染统计（隐式依赖）。改判有限性。
         t1_date, t1_close = fetch_future(1)
-        t1_return = round((t1_close - buy_price) / buy_price * 100, 2) if t1_close else None
+        t1_return = (round((t1_close - buy_price) / buy_price * 100, 2)
+                     if _finite(t1_close) and _finite(buy_price) and buy_price else None)
 
         # T+5: 第 5 个交易日
         t5_date, t5_close = fetch_future(5)
-        t5_return = round((t5_close - buy_price) / buy_price * 100, 2) if t5_close else None
+        t5_return = (round((t5_close - buy_price) / buy_price * 100, 2)
+                     if _finite(t5_close) and _finite(buy_price) and buy_price else None)
 
         # T+20: 第 20 个交易日
         t20_date, t20_close = fetch_future(20)
-        t20_return = round((t20_close - buy_price) / buy_price * 100, 2) if t20_close else None
+        t20_return = (round((t20_close - buy_price) / buy_price * 100, 2)
+                      if _finite(t20_close) and _finite(buy_price) and buy_price else None)
 
         # T2（2026-09-17）：按已回填的最高 T 档位写入正状态 filled_*，
         # 使 outcomes 表从"全 NULL / 仅 no_data 墓碑"变为有 filled 正状态，
@@ -333,8 +352,21 @@ class PredictionTracker:
             date_filter = ""
             params = [mode]
             if days:
-                date_filter = "AND p.date >= date('now', ?)"
-                params.append(f"-{days} days")
+                # 2026-09-22 修复（缺陷排查 P3 · 契约 H）：SQLite `date('now')` 是
+                # **UTC** 日期，而 `p.date` 是北京日期（写入时用本地 date）。
+                # 凌晨任务（03:15 backfill）时 UTC 尚在前一天 → 窗口多算一天。
+                # 改为 Python 侧按北京时间算好起始日期再绑定。
+                try:
+                    # 2026-09-22 修复（第二轮回归 P2-1）：原只导入 beijing_now，
+                    # `timedelta` 未定义 → NameError 被 except 吞掉 → **恒走
+                    # UTC 兜底分支**，本修复等于没生效（守卫测试已补断言）。
+                    from core.trading_calendar import beijing_now, timedelta
+                    _since = (beijing_now() - timedelta(days=int(days))).strftime('%Y-%m-%d')
+                except Exception:
+                    from datetime import datetime as _dt, timedelta as _td
+                    _since = (_dt.now() - _td(days=int(days))).strftime('%Y-%m-%d')
+                date_filter = "AND p.date >= ?"
+                params.append(_since)
 
             # T+1 统计
             c.execute(

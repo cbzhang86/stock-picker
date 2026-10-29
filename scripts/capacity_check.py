@@ -55,8 +55,11 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-COMMISSION = 0.0003      # 佣金万三（与回测口径一致）
-STAMP_DUTY = 0.0005      # 印花税（仅卖出）
+# 2026-09-23（审查报告 R3）：与 config.yml/回测引擎单一来源对齐
+from core.costs import load_costs as _load_costs
+_costs = _load_costs()
+COMMISSION = _costs['commission_rate']   # 佣金万三（与回测口径一致）
+STAMP_DUTY = _costs['stamp_duty']        # 印花税（仅卖出）
 PARTICIPATION_WARN = 0.10
 PARTICIPATION_DANGER = 0.25
 IMPACT_CONST = 1.0       # sqrt 冲击经验常数（Almgren-Chriss 近似）
@@ -139,8 +142,14 @@ def measure_stock(code: str, alloc: float, adv_days: int,
     if kline is None or len(kline) < 5:
         return {'code': code, 'error': 'K线数据不足（缓存缺失或离线）'}
 
-    amounts = [float(a) for a in kline['amount'].tolist() if a]
-    closes = [float(c) for c in kline['close'].tolist() if c]
+    # 2026-09-22 修复（缺陷排查 P2-32 · 契约 A）：原 `if a` 对 NaN 为真（NaN 是
+    # truthy）→ NaN 混入均值 → adv 变 NaN → `adv > 0` 为 False →
+    # participation=inf → 误判 DANGER 并写出 `Infinity`/`NaN`（严格 JSON 解析器
+    # 会拒绝）。非有限值必须按缺失剔除。
+    amounts = [float(a) for a in kline['amount'].tolist()
+               if a is not None and math.isfinite(float(a))]
+    closes = [float(c) for c in kline['close'].tolist()
+              if c is not None and math.isfinite(float(c)) and c > 0]
     if len(amounts) < 5:
         return {'code': code, 'error': '成交额数据不足'}
 

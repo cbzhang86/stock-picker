@@ -66,14 +66,16 @@ DEFAULT_SPLITS = 16
 def annualized_sharpe(daily_returns: np.ndarray) -> float:
     """日频收益 → 年化 Sharpe（rf=0，252 交易日）"""
     r = np.asarray(daily_returns, dtype=float)
-    r = r[~np.isnan(r)]
+    # 2026-09-22 修复（契约 A）：原仅剔 NaN，±Inf 会一路进 mean/std。
+    r = r[np.isfinite(r)]
     if len(r) < 2 or np.std(r, ddof=1) == 0:
         return 0.0
     return float(np.mean(r) / np.std(r, ddof=1) * math.sqrt(252))
 
 
 def skewness(r: np.ndarray) -> float:
-    r = r[~np.isnan(r)]
+    # 2026-09-22（第二轮回归 P3）：±Inf 会让三/四阶矩爆炸成 inf → DSR 全 inf
+    r = r[np.isfinite(r)]
     if len(r) < 3:
         return 0.0
     m = r.mean()
@@ -85,7 +87,8 @@ def skewness(r: np.ndarray) -> float:
 
 def kurtosis(r: np.ndarray) -> float:
     """超额峰度（正态=0）"""
-    r = r[~np.isnan(r)]
+    # 2026-09-22（第二轮回归 P3）：同 skewness，剔 ±Inf
+    r = r[np.isfinite(r)]
     if len(r) < 4:
         return 0.0
     m = r.mean()
@@ -121,7 +124,11 @@ def psr(sharpe: float, n_obs: int, benchmark_sr: float = 0.0,
         return 0.5
     sr_d = sharpe / math.sqrt(252)          # 年化 → 日频
     sr_b_d = benchmark_sr / math.sqrt(252)
-    denom = 1.0 - skew * sr_d + (kurt) / 4.0 * sr_d ** 2
+    # 2026-09-22 修复（缺陷排查 P1-18）：下面的公式（与本文档注释一致）要求
+    # **原始**峰度 γ4（正态 = 3），而 `kurtosis()` 返回的是**超额**峰度 ε = γ4 − 3。
+    # 因此正确的系数是 (γ4−1)/4 = (ε+2)/4，原实现误用 ε/4 → 分母系统性偏小
+    # 0.5·SR_d² → DSR/PSR 被轻微高估（方向是"更容易通过"，属乐观偏差）。
+    denom = 1.0 - skew * sr_d + (kurt + 2.0) / 4.0 * sr_d ** 2
     if denom <= 0:
         return 0.5
     z = (sr_d - sr_b_d) * math.sqrt(n_obs - 1) / math.sqrt(denom)
@@ -183,6 +190,21 @@ def _norm_ppf(p: float) -> float:
 
 # ── PBO（CSCV）───────────────────────────────────────────────
 
+def _perf_sharpe(mat: np.ndarray) -> np.ndarray:
+    """T×M 矩阵 → 每列的年化 Sharpe（NaN/±Inf 安全；std=0 → NaN）。
+
+    2026-09-22 新增（缺陷排查 P1-18）：PBO 的"表现"度量。
+    原实现用 `np.nanmean(axis=0)`（均值收益）作代理 → 对波动率不同的试验
+    排序失真。改用 Sharpe 后与 CSCV 原文口径一致。
+    """
+    with np.errstate(invalid='ignore', divide='ignore'):
+        mu = np.nanmean(mat, axis=0)
+        sd = np.nanstd(mat, axis=0, ddof=1)
+        out = np.where(sd > 0, mu / sd * math.sqrt(252), np.nan)
+    out[~np.isfinite(out)] = np.nan
+    return out
+
+
 def pbo_cscv(returns_matrix: np.ndarray, n_splits: int = DEFAULT_SPLITS) -> Dict:
     """Probability of Backtest Overfitting（组合对称交叉验证）。
 
@@ -194,6 +216,12 @@ def pbo_cscv(returns_matrix: np.ndarray, n_splits: int = DEFAULT_SPLITS) -> Dict
     """
     R = np.asarray(returns_matrix, dtype=float)
     T, M = R.shape
+    # 2026-09-22 修复（缺陷排查 P1-18(c)）：n_splits 必须为偶数 —— 奇数时
+    # 训练/测试块数不等（如 8 块取 half=4 → 训练 4 / 测试 4 尚可，但 7 块取 3
+    # → 训练 3 / 测试 4），CSCV 的对称性前提被破坏。显式拒绝并提示。
+    if int(n_splits) % 2 != 0:
+        return {'pbo': None, 'n_combinations': 0,
+                'note': f'n_splits={n_splits} 必须为偶数（CSCV 要求训练/测试块数对称）'}
     if M < 2:
         return {'pbo': None, 'n_combinations': 0,
                 'note': '试验数 < 2，PBO 无定义'}
@@ -218,21 +246,27 @@ def pbo_cscv(returns_matrix: np.ndarray, n_splits: int = DEFAULT_SPLITS) -> Dict
             continue
         train = R[train_idx, :]
         test = R[test_idx, :]
-        # 训练集最优试验（用均值 Sharpe 代理；NaN 忽略）
-        with np.errstate(invalid='ignore'):
-            train_perf = np.nanmean(train, axis=0)
-            test_perf = np.nanmean(test, axis=0)
-        if np.all(np.isnan(train_perf)) or np.all(np.isnan(test_perf)):
+        # 2026-09-22 修复（缺陷排查 P1-18(a)）：原用"均值收益"作为表现代理
+        # （注释自称"均值 Sharpe 代理"），这对波动率不同的试验会扭曲排序
+        # （高波动试验被系统性高估）。改为按 CSCV 惯例用 **Sharpe**。
+        with np.errstate(invalid='ignore', divide='ignore'):
+            train_perf = _perf_sharpe(train)
+            test_perf = _perf_sharpe(test)
+        if not np.any(np.isfinite(train_perf)) or not np.any(np.isfinite(test_perf)):
             continue
-        best = int(np.nanargmax(train_perf))
+        best = int(np.nanargmax(np.where(np.isfinite(train_perf), train_perf, -np.inf)))
         # 测试集里该试验的相对排名 → logit
         ranks = pd.Series(test_perf).rank(pct=False).values  # 1=最差
         rank_j = ranks[best]
-        n_eff = np.sum(~np.isnan(test_perf))
+        n_eff = np.sum(np.isfinite(test_perf))
         if n_eff < 2:
             continue
         # 相对排名 ω ∈ (0,1)，1=最优；logit = ln(ω/(1-ω))
-        omega = rank_j / n_eff
+        # 2026-09-22 修复（缺陷排查 P1-18(b)）：CSCV 的标准定义是
+        # ω = r/(M+1)（r 为名次、M 为有效试验数）。原用 r/M 会让偶数 M 的
+        # 中位名次恰好得到 ω=0.5 → logit=0 → 被计为"未过拟合"，
+        # 使 PBO 系统性低估（偏乐观）。
+        omega = rank_j / (n_eff + 1.0)
         omega = min(max(omega, 1e-6), 1 - 1e-6)
         logit = math.log(omega / (1 - omega))
         logits.append(logit)
@@ -281,20 +315,39 @@ def run_audit(input_path: str, output_path: str = None,
         unit = 'decimal'
 
     names = list(df.columns)
-    srs = [annualized_sharpe(R[:, j]) for j in range(R.shape[1])]
-    best_idx = int(np.nanargmax(srs))
+    # 2026-09-22 修复（缺陷排查 P1-18(c)）：原实现对"有效样本 < 2 或 std=0"的
+    # 试验列也返回 0.0 并参与 `nanargmax` 与 `deflated_sharpe_ratio` 的
+    # sr_variance —— 无数据试验可能被选为 best_trial 并进入 DSR。
+    # 现改为 None（= 无有效估计），在选择/统计环节显式剔除，报告里也如实呈现。
+    srs = []
+    for j in range(R.shape[1]):
+        col = R[:, j]
+        col = col[np.isfinite(col)]
+        srs.append(annualized_sharpe(col)
+                   if (len(col) >= 2 and np.std(col, ddof=1) > 0) else None)
+
+    valid_idx = [j for j, s in enumerate(srs) if s is not None]
+    if not valid_idx:
+        raise ValueError('试验矩阵中没有任何列具备有效收益数据（无法计算 Sharpe）')
+    if len(valid_idx) < R.shape[1]:
+        logger.warning(f"{R.shape[1] - len(valid_idx)} 个试验列数据不足，"
+                       f"已从 DSR/PBO 统计中剔除")
+    best_idx = max(valid_idx, key=lambda j: srs[j])
+    srs_valid = [srs[j] for j in valid_idx]
 
     report = {
         'input': os.path.abspath(input_path),
         'n_trials': len(names),
         'n_days': int(R.shape[0]),
         'return_unit': unit,
-        'trial_sharpes': {names[j]: round(srs[j], 3) for j in range(len(names))},
+        'trial_sharpes': {names[j]: (round(srs[j], 3) if srs[j] is not None else None)
+                          for j in range(len(names))},
         'best_trial': names[best_idx],
         'best_trial_sharpe': round(srs[best_idx], 3),
+        'n_trials_excluded': R.shape[1] - len(valid_idx),
     }
 
-    dsr_res = deflated_sharpe_ratio(R[:, best_idx], srs)
+    dsr_res = deflated_sharpe_ratio(R[:, best_idx], srs_valid)
     report['dsr'] = dsr_res
 
     pbo_res = pbo_cscv(R, n_splits=n_splits)

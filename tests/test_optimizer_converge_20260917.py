@@ -106,12 +106,16 @@ class TestLoadHistoryLatest(unittest.TestCase):
 class TestOnlyOneV1Writer(unittest.TestCase):
     """T4-3：Grep 静态断言——全项目只有一个 .py 能写 data/weights/v1.json
 
-    精确判定"写 v1.json"：存在 `open(<含 v1 的变量>, 'w'|'a')` 调用。
+    精确判定"写 v1.json"：存在 `open(<含 v1 的变量>, 'w'|'a')` 调用，
+    或原子写 `os.replace(<...>, <含 v1 的路径>)`。
     仅 scripts/calibrate_weights.py 的 --apply 分支满足；其余文件即便出现
     v1.json 字面量也只是读取/注释，不会被判为写入口。
     """
     # 匹配 open(v1_path, 'w' ...) / open(v1Path, "a" ...) 这类写调用
     WRITE_RE = re.compile(r"open\(\s*[^,)]*[vV]1[^,)]*\s*,\s*['\"](?:w|a)")
+    # 2026-09-22 补充：原子写（tmp + os.replace）同样是"写 v1.json"的入口，
+    # 只匹配 open() 会让改用原子写的写入口从守卫中消失（守卫静默失效）。
+    ATOMIC_RE = re.compile(r"os\.replace\(\s*[^,)]+,\s*[^,)]*[vV]1")
 
     def test_only_calibrate_weights_writes_v1(self):
         writers = []
@@ -127,7 +131,7 @@ class TestOnlyOneV1Writer(unittest.TestCase):
                         src = f.read()
                 except OSError:
                     continue
-                if self.WRITE_RE.search(src):
+                if self.WRITE_RE.search(src) or self.ATOMIC_RE.search(src):
                     rel = os.path.relpath(path, ROOT).replace('\\', '/')
                     writers.append(rel)
         self.assertEqual(

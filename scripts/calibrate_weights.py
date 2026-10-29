@@ -43,6 +43,7 @@ import glob
 import json
 import logging
 import os
+import shutil
 import sys
 from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -93,11 +94,29 @@ DEFAULT_CONVENTIONS = ['hold1d', 'intraday', 'overnight']
 
 
 def load_latest_ic(reports_dir: str, convention: str) -> Optional[dict]:
-    """读取指定口径最近一次的 OOS IC 结果"""
+    """读取指定口径最近一次的 OOS IC 结果
+
+    2026-09-22 修复（第二轮回归 P2-3）：glob 会同时命中历史上遗留的
+    `*_size_hold1d.json`（旧版 size 合并脚本的产物，只含 size 单因子），
+    且其 mtime 往往比**全因子**基准报告更新 → 校准会静默改用"只有 size"
+    的报告，其余因子的 IC 证据全部丢失（实操风险：一次校准建议整体失真）。
+    现按优先级挑选：全因子报告 > merged_size 合并报告 > 其余；
+    `_size_hold1d` 这类单因子遗留物降级到最后。
+    """
     pattern = os.path.join(reports_dir, f'oos_ic_*_{convention}.json')
     files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
     if not files:
         return None
+
+    def _rank(p: str) -> int:
+        b = os.path.basename(p)
+        if '_size_hold1d' in b or '_hold1d_size' in b:
+            return 2          # 单因子遗留物，最后考虑
+        if 'merged_size' in b:
+            return 1          # 合并报告（含全部因子 + size），次优
+        return 0              # 全因子基准报告，最优
+
+    files.sort(key=lambda p: (_rank(p), -os.path.getmtime(p)))
     with open(files[0], 'r', encoding='utf-8') as f:
         data = json.load(f)
     data['_source_file'] = os.path.basename(files[0])
@@ -312,6 +331,30 @@ def apply_correlation_discount(consensus: Dict[str, Dict],
         logger.warning(f"相关性折扣归一化不变量偏离: "
                        f"Σ_before={total_before:.6f} Σ_after={total_after:.6f}")
     return n_adj
+
+
+def _round_weights_keep_sum(weights: Dict[str, float],
+                            ndigits: int = 4) -> Dict[str, float]:
+    """四舍五入到 ndigits 位，并把残差补偿给最大权重项，保证 Σw == 1。
+
+    2026-09-22 修复（缺陷排查 P3-20）：13 个因子各自 `round(,4)` 后 Σ 的偏差
+    典型 ~1e-5、最坏 ~6.5e-4，远超 `scripts/evaluate_all.py` 的 `1e-6` 断言
+    （`verify.py` 用的是 1e-3）→ 一次 `--apply` 就会让门禁报"权重和 != 1.0"
+    假失败，且指向的是**已经生效**的文件。补偿后偏差收敛到浮点精度。
+    """
+    if not weights:
+        return {}
+    out = {f: round(float(v), ndigits) for f, v in weights.items()}
+    residual = 1.0 - sum(out.values())
+    if abs(residual) > 0:
+        # 2026-09-22 修复（第二轮回归 P1-2b）：残差**只补给非零且未触顶的因子**。
+        # 原实现无脑补给"最大权重项"——若最大项是有意保持 0 的键（如 north_flow）
+        # 或已触 max_single 上限的键，会把 0 抬成 1e-4 / 突破上限。
+        _cands = [f for f in out
+                  if out[f] > 0 and out[f] < 0.999]
+        k = max(_cands, key=lambda f: out[f]) if _cands else max(out, key=lambda f: out[f])
+        out[k] = round(out[k] + residual, ndigits + 6)
+    return out
 
 
 def _enforce_weight_bounds(weights: Dict[str, float],
@@ -582,11 +625,16 @@ def calibrate(consensus: Dict[str, Dict], current_weights: Dict[str, float],
     # 共线去重结果并入明细（2026-09-18 审查 P2-1）
     if collinear_note:
         detail['collinear_skipped'] = collinear_note
-    return {f: round(w, 4) for f, w in sorted(merged.items(), key=lambda x: -x[1])}, detail
+    # 2026-09-22 修复（缺陷排查 P3-20）：round(,4) 会把 Σw 推出 1e-6 容差 →
+    # 改用残差补偿版（见 _round_weights_keep_sum docstring）。
+    _rounded = _round_weights_keep_sum(merged, 4)
+    return ({f: _rounded[f] for f, _ in sorted(_rounded.items(), key=lambda x: -x[1])},
+            detail)
 
 
 def maximize_icir_weights(ic_matrix, cap: float = 0.30,
-                          min_obs: int = 30, min_improvement: float = 0.05):
+                          min_obs: int = 30, min_improvement: float = 0.05,
+                          allowed: set = None):
     """最大化 ICIR 权重（2026-09-07 P1 论证后实施，华泰多因子系列之十）。
 
     ic_matrix: DataFrame（行=日期，列=因子，值=日频 RankIC）
@@ -604,12 +652,39 @@ def maximize_icir_weights(ic_matrix, cap: float = 0.30,
     import pandas as pd
 
     ic = ic_matrix.copy()
-    all_factors = list(ic.columns)
+    # 2026-09-23 修复（决策分析中发现的缺陷）：IC 矩阵的列来自 OOS 报告，
+    # 其中含**非生产因子的实验变体**（如 `skip_momentum_1/3` —— OOS 面板为
+    # 消融对照生成的派生列）。原实现把它们当作可分配因子参与优化并输出权重，
+    # icir `--apply` 的 `{**current, **proposed}` 会把这些**不存在的因子键写进
+    # v1.json** → `compute_all_factors` 产不出该因子 → 这些权重成为"真空额度"，
+    # 使**有效权重之和 < 1**、评分尺度整体下移（门槛语义随之漂移），且完全静默。
+    # 处理：把优化因子域限制在 `allowed`（= 当前生产权重表的键集）；
+    # 未列入的列一律丢弃并在 note 中披露。
+    _raw_factors = list(ic.columns)
+    if allowed is not None:
+        _dropped = [c for c in _raw_factors if c not in allowed]
+        all_factors = [c for c in _raw_factors if c in allowed]
+    else:
+        _dropped, all_factors = [], _raw_factors
+    if _dropped:
+        ic = ic[all_factors]
     if len(all_factors) < 2:
-        return None, '少于 2 个因子，无需 ICIR 优化'
+        return None, (f'生产因子域内少于 2 个因子（矩阵列 {len(_raw_factors)}）'
+                      f'，无需 ICIR 优化')
 
-    qualified = [c for c in all_factors if ic[c].notna().sum() >= min_obs]
-    unqualified = [c for c in all_factors if c not in qualified]
+    _obs_ok = [c for c in all_factors if ic[c].notna().sum() >= min_obs]
+    # 2026-09-23 修复（决策分析中发现的缺陷 · 符号约束）：
+    # 纯 ICIR 最大化对**均值为负**的因子也会给正权重 —— 数学上它靠压低组合 IC
+    # 方差（分母）刷高 ICIR，而不是提升均值（分子）。实测：给 momentum 16%、
+    # technical 4.9%、dragon_tiger 8.3%，而三者 OOS 均值 IC 均为负；因 momentum
+    # ≈ −reversal_20d，优化器实际构造了"同时做多同一信号两侧"（净敞口 31%）的
+    # 伪解，组合 ICIR 1.029 中有相当部分来自该对冲结构（加符号约束后仅 0.542）。
+    # 这与同一份 OOS 报告给出的判定（"反向（IC −0.031，应降权或取反）"）自相矛盾。
+    # 现按报告判定对齐：**均值 IC ≤ 0 的因子权重固定为 0**（既不参与优化、也不给
+    # 锚定份额），只在正 IC 因子里做 ICIR 优化；被排除者在 note 中披露。
+    zeroed = [c for c in all_factors if float(ic[c].mean()) <= 0]
+    qualified = [c for c in _obs_ok if c not in zeroed]
+    unqualified = [c for c in all_factors if c not in qualified and c not in zeroed]
     anchor_ratio = len(unqualified) / len(all_factors)
     if anchor_ratio > 0.4:
         ew = {c: round(1.0 / len(all_factors), 4) for c in all_factors}
@@ -661,8 +736,16 @@ def maximize_icir_weights(ic_matrix, cap: float = 0.30,
         w_full[c] = x * (1 - anchor_ratio)
     for c in unqualified:
         w_full[c] = anchor_ratio / max(len(unqualified), 1)
-    weights = {c: round(v, 4) for c, v in w_full.items()}
-    return weights, note + f'（未准入锚定 {anchor_ratio:.0%}）'
+    for c in zeroed:
+        w_full[c] = 0.0          # 符号约束：负 IC 因子不参与（见上方注释）
+    # 2026-09-23：改用带残差补偿的舍入 —— 原先 `round(v, 4)` 逐项舍入会让 Σ 变成
+    # 0.9999（实测），与 `_round_weights_keep_sum` 的 docstring 同一问题（P3-20）。
+    weights = _round_weights_keep_sum(w_full, 4)
+    if _dropped:
+        weights = {k: v for k, v in weights.items() if k in all_factors}
+    _drop_note = (f'；已剔除非生产因子实验列 {_dropped}' if _dropped else '')
+    _zero_note = (f'；符号约束置 0（OOS 均值 IC ≤ 0）: {zeroed}' if zeroed else '')
+    return weights, note + f'（未准入锚定 {anchor_ratio:.0%}）' + _drop_note + _zero_note
 
 
 def build_ic_matrix(ic_data: dict) -> 'pd.DataFrame | None':
@@ -825,68 +908,21 @@ def main():
 
     if not all_evidence:
         logger.error("没有任何可用的 IC 结果，退出")
-        return
+        return 1   # 2026-09-22：原为 return（None → exit 0），自动化把"失败"判为成功
 
     if args.primary not in all_evidence:
         logger.error(f"主口径 {args.primary} 的 IC 结果缺失，"
                      f"可用口径：{list(all_evidence.keys())}")
-        return
-
-    # T-A（2026-09-07）：icir 模式独立分支——构建逐日 IC 矩阵 → 最大化 ICIR。
-    # 当前历史报告不含 daily_ics，需用最新 oos_validator 重跑 OOS 后才有。
-    if args.method == 'icir':
-        icm = build_ic_matrix(raw_data.get(args.primary))
-        if icm is None:
-            logger.error("ICIR 模式需要 OOS 报告含逐日 IC 序列（daily_ics）。"
-                         "请先重跑：python scripts/run_backtest.py --mode oos "
-                         f"--ret {args.primary}（新版 oos_validator 会输出 daily_ics），再试")
-            return
-        proposed_icir, note = maximize_icir_weights(
-            icm, cap=args.icir_cap, min_obs=30, min_improvement=0.05)
-        if not proposed_icir:
-            logger.error(f"ICIR 校准失败: {note}")
-            return
-        logger.info(f"ICIR 校准: {note}")
-        proposed = {**current, **proposed_icir}
-        report = (f"ICIR 校准建议（主口径 {args.primary}，单因子上限 {args.icir_cap}）\n"
-                  f"{'=' * 45}\n{note}\n当前权重来源: v1.json\n\n"
-                  + "\n".join(f"  {k}: {current.get(k, 0):.2%} → {v:.2%}"
-                              for k, v in sorted(proposed_icir.items(),
-                                                 key=lambda kv: -kv[1])))
-        if args.out:
-            os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
-            with open(args.out, 'w', encoding='utf-8') as f:
-                f.write(report)
-        else:
-            print(report)
-        if args.apply:
-            weights_dir = os.path.join(project_root, 'data', 'weights')
-            os.makedirs(weights_dir, exist_ok=True)
-            v1_path = os.path.join(weights_dir, 'v1.json')
-            existing = {}
-            if os.path.exists(v1_path):
-                with open(v1_path, 'r', encoding='utf-8') as f:
-                    existing = json.load(f)
-            merged = dict(existing.get('short', {}))
-            merged.update(proposed_icir)
-            existing['short'] = merged
-            with open(v1_path, 'w', encoding='utf-8') as f:
-                json.dump(existing, f, ensure_ascii=False, indent=2)
-            logger.info(f"ICIR 权重已写入: {v1_path}")
-        else:
-            print("\n⚠️ 未写入。确认无误后加 --apply 生效。")
-        return
-
-    # 2. 综合多口径证据
-    consensus = consensus_evidence(all_evidence, all_stats, primary=args.primary)
-
-    # 2.5 P2-L 可选：因子相关性折扣（默认关闭，--corr-discount 启用）
-    if args.corr_discount:
-        apply_correlation_discount(consensus, raw_data.get(args.primary))
+        return 1   # 同上
 
     # 3. 当前权重（2026-09-05 审查 P3-8：实际生效的是 v1.json —— ScoringModel
     #    加载优先级 v1.json > config.yml > 默认。此前这里读 config.yml，导致
     #    首次 --apply 之后所有报告的"当前权重"列失真。改为优先读 v1.json。）
+    # 2026-09-22 修复（缺陷排查 P1-5）：本段原位于 icir 分支**之后**（原 :887-902），
+    # 而 icir 分支会引用 `current` → 由于 `current` 在 main() 内后置赋值，Python 视其为
+    # 局部变量，`proposed = {**current, **proposed_icir}`（原 :850）必然抛
+    # `UnboundLocalError` —— `--method icir` 模式完全不可用。现把读取当前权重
+    # 上移到所有分支之前。
     v1_path = os.path.join(project_root, 'data', 'weights', 'v1.json')
     current = {}
     if os.path.exists(v1_path):
@@ -901,6 +937,108 @@ def main():
         current = dict(cfg.get('short_term', {}).get('weights', {}))
         logger.info("当前权重来源: config.yml（v1.json 不存在或为空）")
 
+    # T-A（2026-09-07）：icir 模式独立分支——构建逐日 IC 矩阵 → 最大化 ICIR。
+    # 当前历史报告不含 daily_ics，需用最新 oos_validator 重跑 OOS 后才有。
+    if args.method == 'icir':
+        icm = build_ic_matrix(raw_data.get(args.primary))
+        if icm is None:
+            logger.error("ICIR 模式需要 OOS 报告含逐日 IC 序列（daily_ics）。"
+                         "请先重跑：python scripts/run_backtest.py --mode oos "
+                         f"--ret {args.primary}（新版 oos_validator 会输出 daily_ics），再试")
+            return 1   # 2026-09-22（第二轮回归 P1-1）：原为 return（None→exit 0）
+        proposed_icir, note = maximize_icir_weights(
+            icm, cap=args.icir_cap, min_obs=30, min_improvement=0.05,
+            allowed=set(current.keys()))
+        if not proposed_icir:
+            logger.error(f"ICIR 校准失败: {note}")
+            return 1   # 同上
+        logger.info(f"ICIR 校准: {note}")
+        proposed = {**current, **proposed_icir}
+        report = (f"ICIR 校准建议（主口径 {args.primary}，单因子上限 {args.icir_cap}）\n"
+                  f"{'=' * 45}\n{note}\n当前权重来源: v1.json\n\n"
+                  + "\n".join(f"  {k}: {current.get(k, 0):.2%} → {v:.2%}"
+                              for k, v in sorted(proposed_icir.items(),
+                                                 key=lambda kv: -kv[1])))
+        if args.out:
+            os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
+            with open(args.out, 'w', encoding='utf-8') as f:
+                f.write(report)
+        else:
+            print(report)
+        if args.apply:
+            # 2026-09-22 修复（缺陷排查 P1-5）：icir 的 --apply 原为裸写盘 ——
+            # 无备份、无 min/max 边界、无覆盖率闸门、无 Σ=1 校验；且
+            # `merged.update(proposed_icir)` 会让未被 IC 报告覆盖的旧键（如
+            # capital_flow 0.01）残留 → Σw 可能 >1（违反契约 L）。
+            # 现与 consensus 分支对齐：边界收紧 → Σ 校验 → 备份 → 原子写。
+            weights_dir = os.path.join(project_root, 'data', 'weights')
+            os.makedirs(weights_dir, exist_ok=True)
+            v1_path = os.path.join(weights_dir, 'v1.json')
+            existing = {}
+            if os.path.exists(v1_path):
+                with open(v1_path, 'r', encoding='utf-8') as f:
+                    existing = json.load(f)
+
+            proposal = {**current, **proposed_icir}
+            # 2026-09-23 纵深防御：只允许**生产权重表已有的键**。
+            # `maximize_icir_weights` 已按 `allowed=current.keys()` 过滤，这里再兜
+            # 一层 —— 防止未来有人改动调用方式后，把 `skip_momentum_*` 这类
+            # OOS 实验列当作真实因子写进 v1.json（会导致有效权重之和 <1、评分
+            # 尺度 silent 漂移）。发现越界键即拒绝写入。
+            _alien = sorted(set(proposed_icir) - set(current.keys()))
+            if _alien:
+                logger.error(
+                    f"ICIR 提案含**非生产因子键** {_alien}（不在 v1.json 权重表中）"
+                    f"→ **拒绝写入**。这些键无法被 compute_all_factors 产出，"
+                    f"写入会成为真空额度并使有效权重和 <1。")
+                return 2
+            # 2026-09-22 修复（第二轮回归 P1-2）：显式传 min_single=0.0 ——
+            # `_enforce_weight_bounds` 默认 min_single=MIN_SINGLE_WEIGHT(0.02)
+            # 会把本仓库**有意保持 0 权重**的键（north_flow/size/liquidity/
+            # valuation_fundamental/event_catalyst）强行抬到 2%，违反
+            # "零权重链路先行"契约（北向停发、size 待 OOS 审批）。
+            proposal, _feasible = _enforce_weight_bounds(
+                proposal, max_single=args.icir_cap, min_single=0.0)
+            if not _feasible:
+                logger.warning("ICIR 权重边界不可行（上限之和 < 1），"
+                               "已返回最接近可行点，请人工复核")
+            proposal = _round_weights_keep_sum(proposal)
+
+            _sum = sum(proposal.values())
+            if abs(_sum - 1.0) > 1e-6:
+                logger.error(
+                    f"ICIR 权重 Σ={_sum:.6f} ≠ 1.0（提案键与当前权重表未完全对齐，"
+                    f"update 后旧键残留）→ **拒绝写入**。请先核对 IC 报告覆盖的因子集。")
+                return 2   # 2026-09-22（第二轮回归 P1-1）：失败退出码可感知
+
+            # 备份（与 consensus 分支同格式）
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup = os.path.join(weights_dir, f'v1.backup_{ts}_icir.json')
+            if os.path.exists(v1_path):
+                shutil.copy2(v1_path, backup)
+                logger.info(f"已备份原权重: {backup}")
+
+            merged = {**existing.get('short', {}), **proposal}
+            existing['short'] = merged
+            v1_tmp = v1_path + '.tmp'
+            with open(v1_tmp, 'w', encoding='utf-8') as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+            os.replace(v1_tmp, v1_path)
+            logger.info(f"ICIR 权重已写入: {v1_path}（Σ={_sum:.6f}）")
+        else:
+            print("\n⚠️ 未写入。确认无误后加 --apply 生效。")
+        return
+
+    # 2. 综合多口径证据
+    consensus = consensus_evidence(all_evidence, all_stats, primary=args.primary)
+
+    # 2.5 P2-L 可选：因子相关性折扣（默认关闭，--corr-discount 启用）
+    if args.corr_discount:
+        apply_correlation_discount(consensus, raw_data.get(args.primary))
+
+    # 3. 当前权重已在上方（icir 分支之前）读取 —— 见修复注释 P1-5
+    #    （原位置在此处，会导致 icir 分支 UnboundLocalError）
+
     # 4. 校准
     _cg = [g.split(':') for g in (args.collinear_groups or '').split(',') if ':' in g]
     proposed, detail = calibrate(consensus, current, gamma=args.gamma,
@@ -908,7 +1046,8 @@ def main():
                                  collinear_groups=_cg,
                                  max_single=args.max_single)
     if not proposed:
-        return
+        # 2026-09-22：原为 return（None → exit 0），"校准未产出"会被判为成功
+        return 2
 
     report = build_report(consensus, current, proposed, sources, detail, args.primary)
 
@@ -944,9 +1083,20 @@ def main():
         merged.update(proposed)
 
         existing['short'] = merged
-        with open(v1_path, 'w', encoding='utf-8') as f:
+
+        # 2026-09-22 修复（缺陷排查 P3-20）：写入前显式校验 Σw，并改为原子写
+        # （tmp + os.replace）。原实现直接覆盖 v1.json —— 写盘中断会留下截断的
+        # 半份权重表，而 ScoringModel 会静默回落到 config.yml 兜底（评分尺度漂移）。
+        _sum_final = sum(merged.values())
+        if abs(_sum_final - 1.0) > 1e-6:
+            logger.error(f"拟写入权重 Σ={_sum_final:.6f} ≠ 1.0 → **拒绝写入**"
+                         f"（门禁 evaluate_all 会判 FAIL）")
+            return 2
+        v1_tmp = v1_path + '.tmp'
+        with open(v1_tmp, 'w', encoding='utf-8') as f:
             json.dump(existing, f, ensure_ascii=False, indent=2)
-        logger.info(f"权重已写入: {v1_path}")
+        os.replace(v1_tmp, v1_path)
+        logger.info(f"权重已写入: {v1_path}（Σ={_sum_final:.6f}）")
         logger.info("⚠️ 注意：ScoringModel 加载优先级 v1.json > config.yml，"
                     "config.yml 中的权重此后将被忽略")
     else:

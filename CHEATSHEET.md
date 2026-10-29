@@ -181,7 +181,7 @@ ScoringModel 不写入 v1.json——权重改动唯一入口 `calibrate_weights.
 python scripts/eod_stock_picker.py --mode short
 
 # 统一 CLI 入口（2026-09-07）：pick/backfill/health/oos/backtest/prefetch/calibrate/slippage
-python scripts/pick.py health          # 快速门禁（9 项）
+python scripts/pick.py health          # 快速门禁（10 项）
 python scripts/pick.py pick            # 尾盘选股
 
 # 每日统一调度（交易日→选股，非交易日→配额预取，内置交易日历分流）
@@ -196,7 +196,7 @@ python scripts/eod_stock_picker.py --status
 # 回测验证（默认近 3 个月）
 python scripts/run_backtest.py --mode short
 
-# 健康检查（9 项）
+# 健康检查（10 项）
 python scripts/verify.py
 ```
 

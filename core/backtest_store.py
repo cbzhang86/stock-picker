@@ -94,11 +94,18 @@ class BacktestStore:
             weight_snapshot['long'] = config['long_term'].get('weights', {})
 
         # 配置快照（去敏）
+        # 2026-09-22 修复（缺陷排查 P1-16）：补记 sizing_mode / tradability_check。
+        # 原快照缺失这两个字段 → "normalized / absolute 口径不可混用比较"这条
+        # 已知约束在 DB 层**无法自证**，`compare_runs` 又会直接对比 strategy_return
+        # → 违规对比随时发生且不可追溯（历史多次 A/B 结论失真即源于此）。
         config_snapshot = {
             'commission_rate': config.get('commission_rate', 0.0003),
             'slippage': config.get('slippage', 0.001),
             'min_score': config.get('buy', {}).get('min_score', 60) if 'buy' in config else None,
             'max_candidates': config.get('buy', {}).get('max_candidates', 3) if 'buy' in config else None,
+            'sizing_mode': config.get('sizing_mode', 'normalized'),
+            'tradability_check': config.get('tradability_check', None),
+            'initial_capital': config.get('initial_capital', None),
         }
 
         factor_perf_json = json.dumps(
@@ -200,12 +207,18 @@ class BacktestStore:
             root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             git_commit, git_dirty = None, None
             try:
+                # 2026-09-22 修复（缺陷排查 P2-13）：补 encoding —— 缺省时 Windows
+                # GBK 控制台解 UTF-8 输出会抛 UnicodeDecodeError 并被外层 except
+                # 吞掉 → git_commit/git_dirty 静默 None（可复现性降级）。
+                # 与 scripts/daily_job.py 的既有做法一致。
                 git_commit = subprocess.run(
                     ['git', 'rev-parse', '--short', 'HEAD'], cwd=root,
-                    capture_output=True, text=True, timeout=5).stdout.strip() or None
+                    capture_output=True, text=True, encoding='utf-8',
+                    errors='replace', timeout=5).stdout.strip() or None
                 dirty = subprocess.run(
                     ['git', 'status', '--porcelain'], cwd=root,
-                    capture_output=True, text=True, timeout=5).stdout.strip()
+                    capture_output=True, text=True, encoding='utf-8',
+                    errors='replace', timeout=5).stdout.strip()
                 git_dirty = 1 if dirty else 0
             except Exception as e:
                 # 2026-09-14 整体审查 P3-3：原为静默 pass——git 不可用（非仓库/无 git
@@ -300,7 +313,15 @@ class BacktestStore:
             ).fetchone()
             if not row:
                 return None
-            cols = [d[0] for d in conn.execute("PRAGMA table_info(backtest_runs)").fetchall()]
+            # 2026-09-22 修复（第二轮回归发现 · 存量 P1）：PRAGMA table_info 返回
+            # (cid, name, type, notnull, dflt_value, pk)，**列名在下标 1**。
+            # 原取 d[0]（cid，恒为 0..n-1 的整数）→ dict(zip(cols,row)) 的键全是
+            # 整数 → get_run 返回的 dict 没有 'weight_snapshot'/'factor_performance'
+            # 等字符串键 → compare_runs / backtest_report 里所有
+            # `result.get(...)` 恒取默认值，指标对比表全部显示 0（检查静默失效）。
+            # 回归断言已补：tests/test_backtest_store_getrun_20260922.py
+            cols = [d[1] for d in
+                    conn.execute("PRAGMA table_info(backtest_runs)").fetchall()]
         finally:
             if conn:
                 conn.close()
@@ -310,6 +331,13 @@ class BacktestStore:
             result['weight_snapshot'] = json.loads(result['weight_snapshot'])
         if result.get('factor_performance'):
             result['factor_performance'] = json.loads(result['factor_performance'])
+        # 2026-09-22 修复（缺陷排查 P1-16）：config_snapshot 也需要解析，
+        # 否则 compare_runs 无法读取 sizing_mode 做口径一致性阻断。
+        if isinstance(result.get('config_snapshot'), str):
+            try:
+                result['config_snapshot'] = json.loads(result['config_snapshot'])
+            except (ValueError, TypeError):
+                result['config_snapshot'] = {}
         return result
 
     def compare_runs(self, run_id_a: int, run_id_b: int) -> str:
@@ -324,6 +352,25 @@ class BacktestStore:
         lines = []
         lines.append(f"=== 回测对比: run#{run_id_a} vs run#{run_id_b} ===")
         lines.append("")
+
+        # 2026-09-22 修复（缺陷排查 P1-16）：仓位口径一致性阻断。
+        # normalized（按当日委托合计归一化，尺度不变）与 absolute（按 alloc%
+        # 绝对投入）**不可混用比较** —— 同一策略在两口径下的收益差异来自
+        # 资金约束/路径依赖，不是选股质量差异。历史多次 A/B 结论失真即源于此。
+        # 原实现直接对比 strategy_return 且无任何警告。
+        _ca = a.get('config_snapshot') or {}
+        _cb = b.get('config_snapshot') or {}
+        _sa = _ca.get('sizing_mode') if isinstance(_ca, dict) else None
+        _sb = _cb.get('sizing_mode') if isinstance(_cb, dict) else None
+        if _sa != _sb:
+            lines.append("!" * 60)
+            lines.append(f"  ⚠️ 仓位口径不一致，指标**不可直接比较**：")
+            lines.append(f"     run#{run_id_a} sizing_mode={_sa!r} / "
+                         f"run#{run_id_b} sizing_mode={_sb!r}")
+            lines.append(f"     仓位/sizing 类改动仅在 absolute 口径下可验证；"
+                         f"normalized 口径的差异只反映选股质量。")
+            lines.append("!" * 60)
+            lines.append("")
 
         # 参数差异
         wa = a.get('weight_snapshot', {})

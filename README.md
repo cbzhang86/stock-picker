@@ -10,7 +10,7 @@
 
 [简体中文](README.md) · [English](README.en.md)
 
-> **状态（2026-09-21）**：代码冻结（稳定版 v-G），进入观察期。497 单元测试 + 门禁 9/0 全绿。
+> **状态（2026-09-21）**：代码冻结（稳定版 v-G），进入观察期。565 单元测试 + 门禁 9/0 全绿。
 
 ---
 
@@ -131,7 +131,7 @@ python scripts/eod_stock_picker.py --mode long
 
 # 统一 CLI 入口：一个命令记住所有常用操作
 python scripts/pick.py pick          # 尾盘选股
-python scripts/pick.py health        # 快速门禁（9 项）
+python scripts/pick.py health        # 快速门禁（10 项）
 python scripts/pick.py backfill      # T+1/T+5/T+20 结果回填
 python scripts/pick.py oos           # 全量 OOS 因子诊断
 python scripts/pick.py calibrate     # 权重校准建议（不自动生效）
@@ -156,7 +156,7 @@ python scripts/postmortem.py candidates --month 2026-09
 # 门槛重校（≥15 个交易日实测后使用）
 python scripts/recalibrate_thresholds.py --from-run-context
 
-# 健康检查（9 项）
+# 健康检查（10 项）
 python scripts/verify.py
 ```
 
@@ -346,7 +346,7 @@ stock-picker/
 ├── scripts/                       # 用户入口
 │   ├── eod_stock_picker.py        # 主入口
 │   ├── run_backtest.py            # 回测入口
-│   ├── verify.py                  # 9 项健康检查
+│   ├── verify.py                  # 10 项健康检查
 │   ├── pick.py                    # 统一 CLI 入口
 │   ├── daily_job.py               # 每日统一调度
 │   ├── evaluate_all.py            # 回归门禁（9 项）
@@ -362,7 +362,7 @@ stock-picker/
 │   ├── prefetch_tdx.py            # 通达信估值/事件预取
 │   └── prefetch_asharehub.py      # 非交易日配额预取
 │
-├── tests/                         # 497 个单元测试（含硬契约锁 + 守卫测试）
+├── tests/                         # 565 个单元测试（含硬契约锁 + 守卫测试）
 ├── config.yml                     # 中心配置
 ├── SKILL.md                       # AI 助手技能文件
 ├── CHEATSHEET.md                  # 使用备忘录
@@ -440,7 +440,7 @@ stock-picker/
 > "茅台基本面怎么样" → 显示 ROE / EPS / 估值
 > "跑一下回测" → 执行回测引擎
 > "对比两次回测" → 查看历史回测记录对比
-> "检查系统健康" → 运行 verify.py 9 项检查
+> "检查系统健康" → 运行 verify.py 10 项检查
 > "复盘命中率多少？" → 运行 postmortem.py stats
 
 ---

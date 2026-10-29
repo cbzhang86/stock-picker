@@ -259,7 +259,26 @@ def main():
             _ov_desc = ', '.join(
                 f"{p.split('=')[0].strip()}={weight_override.get(p.split('=')[0].strip())}"
                 for p in args.weight_override if '=' in p)
-            logger.info(f"权重覆盖: {_ov_desc}")
+            # 2026-09-22 修复（缺陷排查 P1-21）：覆盖后**必须归一化**。
+            # `core/scoring_model.py` 的总分 = Σ(factor_score × effective_weight)，
+            # 其中的 weights_total 只用于"缺失让渡"的基准，**不除数** ——
+            # 因此 Σw ≠ 1 会让全部候选分数整体平移，65/70/75 门槛语义随之漂移，
+            # A/B 结论静默失效（docstring 示例的 size=0.146 + hot_theme=0.384 叠在
+            # Σ=1 的 v1 上会得到 Σ=1.146）。
+            _ov_sum = sum(weight_override.values())
+            if abs(_ov_sum - 1.0) > 1e-9 and _ov_sum > 0:
+                logger.warning(
+                    f"权重覆盖后 Σw={_ov_sum:.6f} ≠ 1.0 → 按比例归一化到 1.0"
+                    f"（否则门槛语义漂移，A/B 结论不可比）")
+                weight_override = {k: v / _ov_sum for k, v in weight_override.items()}
+            elif _ov_sum <= 0:
+                logger.error("权重覆盖后 Σw ≤ 0，覆盖无效 → 忽略本次覆盖")
+                weight_override = None
+            if weight_override:
+                logger.info(f"权重覆盖: {_ov_desc}"
+                            f"（归一化后 Σ={sum(weight_override.values()):.6f}）")
+            else:
+                logger.warning("权重覆盖已忽略（Σw ≤ 0）")
 
     # P2-5（2026-09-17）：--ablate 消融。将被消融因子权重置 0，剩余归一化，
     # 通过 config['weights'] 注入策略（ShortTermStrategy 读取
@@ -267,6 +286,14 @@ def main():
     ablation_label = ""
     ablated = None  # 2026-09-18 修复：非消融模式下未定义，L181 引用会 UnboundLocalError
     if getattr(args, 'ablate', None):
+        # 2026-09-22 修复（第二轮回归 P2-1）：--ablate 会用消融后的权重
+        # **整体覆盖** config['weights']，--weight-override 的注入将被静默丢弃。
+        # A/B 实验里这会造成"以为加了权重扰动，实际跑的是纯消融"的假对照。
+        # 显式拒绝（退出码 2）比静默丢弃安全。
+        if getattr(args, 'weight_override', None):
+            logger.error("--ablate 与 --weight-override 互斥（前者会覆盖后者的注入），"
+                         "请分两次运行")
+            sys.exit(2)
         ablate_factors = []
         for a in args.ablate:
             ablate_factors.extend(x.strip() for x in a.split(',') if x.strip())

@@ -89,18 +89,30 @@ class FakeClient:
         if self.mode == 'raise':
             raise TimeoutError("mock network timeout")
         return pd.DataFrame([
-            # 行序=升序（旧行在前、最新行在后），匹配 data_engine iloc[-1] 的取数语义
-            {'trade_date': '20260820', 'net_mf_amount': -100.0,
-             'symbol': 'BK0804.DC', 'vol': 12000.0},
-            {'trade_date': '20260904', 'net_mf_amount': 1234.5,
+            # 行序=倒序（最新在前、旧行在后），匹配真实 SDK 返回顺序
+            # （2026-10-29 实测：asharehub SDK financial_indicators 返回全量历史，
+            #  最新一期在前、最旧一期在后；且 limit 参数实测不生效）。
+            # data_engine.get_financial_indicators 已改为按 end_date 排序取最新，
+            # 故此处 fixture 与生产语义一致（最新一期=20260904）。
+            {'trade_date': '20260904', 'end_date': '20260930',
+             'net_mf_amount': 1234.5,
              'macd_dif': 0.12, 'macd_dea': 0.10, 'macd': 0.04,
              'rsi_6': 55.0, 'rsi_12': 52.0, 'rsi_24': 50.0,
              'close_hfq': 88.0, 'cci': 66.0,
              'eps': 2.5, 'roe': 15.0, 'roe_waa': 14.5, 'roa': 8.0,
-             'gross_margin': 30.0, 'netprofit_margin': 20.0,
+             'gross_margin': 30.0, 'grossprofit_margin': 30.0,
+             'netprofit_margin': 20.0,
              'debt_to_assets': 40.0, 'bps': 25.0, 'ocfps': 3.0,
              'basic_eps_yoy': 10.0, 'netprofit_yoy': 22.0,
              'symbol': 'BK0804.DC', 'vol': 12345.0},
+            {'trade_date': '20260820', 'end_date': '20260630',
+             'net_mf_amount': -100.0,
+             'eps': 1.0, 'roe': 10.0, 'roe_waa': 9.5, 'roa': 6.0,
+             'gross_margin': 25.0, 'grossprofit_margin': 25.0,
+             'netprofit_margin': 15.0,
+             'debt_to_assets': 35.0, 'bps': 20.0, 'ocfps': 2.0,
+             'basic_eps_yoy': 5.0, 'netprofit_yoy': 12.0,
+             'symbol': 'BK0804.DC', 'vol': 12000.0},
         ])
 
     def moneyflow(self, symbol, limit):

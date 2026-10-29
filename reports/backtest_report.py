@@ -268,9 +268,13 @@ def generate_daily_report(recommendations: List[Dict], mode: str = 'short') -> s
         return "\n".join(lines)
 
     # 数据源状态诊断
-    source_status = recommendations[0].get('data_source_status', {})
+    # 2026-09-22 修复（缺陷排查 P2-19 · 契约 A）：`get(k, {})` 的默认值只在
+    # 键缺失时生效 —— 值为 null 时返回 None，随后 `.items()` 抛 AttributeError
+    # （本函数无 try，且它是 daily_report.save_report → eod 的落盘路径，
+    # 故障表现为"简报已生成、日报缺失"的半失败）。改用 `or {}`。
+    source_status = recommendations[0].get('data_source_status') or {}
     failed_sources = {k: v for k, v in source_status.items()
-                      if not v.get('available', True)}
+                      if isinstance(v, dict) and not v.get('available', True)}
     if failed_sources:
         lines.append("  ⚠️ 数据源状态：")
         for source_name, status in failed_sources.items():
@@ -282,7 +286,7 @@ def generate_daily_report(recommendations: List[Dict], mode: str = 'short') -> s
         lines.append("")
 
     # 市场级数据
-    market_data = recommendations[0].get('market_data', {})
+    market_data = recommendations[0].get('market_data') or {}
     north = market_data.get('north_flow')
     if north and north.get('available'):
         direction = "净流入" if north['total'] > 0 else "净流出"

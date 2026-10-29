@@ -29,6 +29,7 @@ config.yml 里找动态表 —— 找不到是正确状态，不是缺陷。
 属于伪学术包装，会被叫停。
 """
 import os
+import io
 import re
 import sys
 import unittest
@@ -60,6 +61,34 @@ def _script_thresholds():
     if missing:
         return pairs, [f'CURRENT_THRESHOLDS 缺少档位 {missing}（实际键: {list(pairs)}）']
     return {k: int(pairs[k]) for k in KEYS}, []
+
+
+def _config_dynamic_thresholds():
+    """config.yml short_term.buy.dynamic_min_score（2026-09-23 新对账来源）"""
+    import yaml
+    cfg = yaml.safe_load(io.open(os.path.join(ROOT, 'config.yml'),
+                                 encoding='utf-8'))
+    raw = (cfg.get('short_term', {}).get('buy', {}) or {}).get(
+        'dynamic_min_score', {})
+    out = {k: int(v) for k, v in raw.items()}
+    missing = [k for k in KEYS if k not in out]
+    if missing:
+        raise AssertionError(f'config.yml dynamic_min_score 缺档位 {missing}')
+    return out
+
+
+def _recalibrate_thresholds():
+    """recalibrate_thresholds.CURRENT_THRESHOLDS（合法 Python 字面量，逐值核对）"""
+    import ast
+    src = _read('scripts/recalibrate_thresholds.py')
+    m = re.search(r'CURRENT_THRESHOLDS\s*=\s*\{([^}]*)\}', src, re.S)
+    if not m:
+        return None, ['找不到 CURRENT_THRESHOLDS 常量定义']
+    try:
+        pairs = ast.literal_eval('{' + m.group(1) + '}')
+    except (ValueError, SyntaxError) as e:
+        return None, [f'CURRENT_THRESHOLDS 无法解析为字面量: {e}']
+    return {k: int(v) for k, v in pairs.items() if k in KEYS}, []
 
 
 def _strategy_thresholds():
@@ -190,17 +219,30 @@ class TestThresholdConsistency(unittest.TestCase):
                              f'SKILL.md {k}={doc[k]} 与运行时 {b[k]} 不一致')
 
     def test_config_has_no_dynamic_override(self):
-        """config.yml 目前不含 dynamic_min_score（运行时取代码默认值）
+        """config.yml 与代码默认门槛的对账（2026-09-23 语义反转）
 
-        这条断言是**反向守卫**：一旦有人在 config.yml 加了 dynamic_min_score，
-        这里会失败，提醒同步更新本文件的对账来源（否则本文件仍在对代码默认值
-        做校验，而实际生效值已变成 config 覆盖值）。
+        历史：本断言曾要求 config.yml **不含** dynamic_min_score（反向守卫，
+        提醒对账来源是代码默认值）。
+        2026-09-23（审查报告 §2.2）：config 覆盖通道此前是死的 —— 文档声称可
+        覆盖但 config 从无该键 → 改门槛只能改代码且要改两处。现已把四档门槛
+        显式登记进 config.yml（config 为权威，代码默认表仅兜底）。
+        因此本断言反转为：**config 值 == 代码默认值 == recalibrate 统计表**，
+        任何一处漂移都会在此失败。
         """
         src = _read('config.yml')
-        self.assertNotIn('dynamic_min_score', src,
-                         'config.yml 出现了 dynamic_min_score 覆盖项：'
-                         '运行时门槛已不再取自代码默认值，请更新本文件'
-                         '的对账来源（改为读取 config 值）')
+        self.assertIn('dynamic_min_score', src,
+                      'config.yml 应包含 dynamic_min_score（覆盖通道已接线）')
+        cfg = _config_dynamic_thresholds()
+        b, eb = _strategy_thresholds()
+        self.assertEqual(eb, [], f'strategies/short_term.py: {eb}')
+        for k in KEYS:
+            self.assertEqual(cfg[k], b[k],
+                             f'config.yml {k}={cfg[k]} 与运行时 {b[k]} 不一致')
+        rt, ert = _recalibrate_thresholds()
+        self.assertEqual(ert, [], f'recalibrate_thresholds.py: {ert}')
+        for k in KEYS:
+            self.assertEqual(rt[k], cfg[k],
+                             f'recalibrate {k}={rt[k]} 与 config {cfg[k]} 不一致')
 
     def test_thresholds_monotonic(self):
         """弱市 > 中性 > 强市（弱市更严格，否则阈值语义反转）"""

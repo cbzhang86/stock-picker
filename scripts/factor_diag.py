@@ -18,15 +18,26 @@ import argparse
 import pandas as pd
 import numpy as np
 
+# 2026-09-23（审查报告 R2）：本脚本开始 import core.factor_registry（因子单一来源），
+# 需要把项目根加入 sys.path —— 此前只导 stdlib，从未需要。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 DB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                   'data', 'db', 'predictions.db')
-FACTORS = ['capital_flow', 'north_flow', 'momentum', 'technical',
-           'volume_price', 'hot_theme', 'dragon_tiger']
+# 2026-09-23（审查报告 R2）：清单改由 core/factor_registry **单一来源**派生
+# （本文件此前漏掉 4 个启用因子 → 恒值检测"假绿灯"，见 2026-09-22 事故记录）。
+from core.factor_registry import DIAG_FACTORS, SPARSE_FACTORS
+
+FACTORS = list(DIAG_FACTORS)
 # 天生稀疏因子豁免恒值判定：多数样本恒 50（中性值）是设计使然，非数据异常
-# dragon_tiger: 大多数票无上榜记录 → raw 恒 50（中性）
-SPARSE_EXEMPT = {'dragon_tiger', 'north_flow'}
+SPARSE_EXEMPT = set(SPARSE_FACTORS)
 # 恒值判定分析窗口（交易日数）：排除旧 bug 期数据（如 hot_theme 修复前恒 65）
 WINDOW_DAYS = 30
+# 恒值判定的最小样本量（2026-09-22 修复）：新启用因子（如 2026-09-19 方案 G 的
+# liq_dev/vol_dev/volatility/reversal_20d）落库天数极少时 nunique 必然 ==1，
+# 按"恒值"报警是**误报**（会 rc=2 让自动化误判数据源断了）。样本不足时改报
+# "样本不足，无法判定"，不计入 has_const。
+MIN_SAMPLES_FOR_CONST = 10
 
 
 def load_data(mode='short'):
@@ -52,14 +63,49 @@ def load_data(mode='short'):
     return pd.DataFrame(rows)
 
 
-def diag_distinction(wide):
-    """1. 因子区分度"""
+def diag_distinction(wide, recent_days: int = 5):
+    """1. 因子区分度。
+
+    返回 (has_const_window, has_const_recent)：
+      has_const_window  —— WINDOW_DAYS 窗口内检出恒值（可能只是历史坏数据期）；
+      has_const_recent  —— 最近 recent_days 个交易日检出恒值（**当前**数据源故障）。
+    2026-09-22 修复：原实现只看 30 日窗口，而该窗口必然覆盖到历史 bug 期
+    （如 volume_ratio 修复前的 volume_price 恒 52.5），即使当前完全正常也会
+    rc=2 → 自动化把"历史问题已修复"误判为"现在数据源断了"。
+    现以"最近 5 个交易日"作为**退出码**依据，长窗口仅作参考披露。
+    """
+    def _scan(w, label):
+        has_const = False
+        detail = []
+        for f in FACTORS:
+            col = f + '_raw'
+            s = w[col].dropna()
+            if s.empty:
+                continue
+            nunique = s.nunique()
+            mode_val = s.mode().iloc[0] if not s.mode().empty else np.nan
+            mode_ratio = (s == mode_val).mean()
+            flag = ''
+            if f in SPARSE_EXEMPT:
+                flag = '（稀疏因子豁免）'
+            elif len(s) < MIN_SAMPLES_FOR_CONST:
+                flag = f'（样本不足 <{MIN_SAMPLES_FOR_CONST}，无法判定恒值）'
+            elif mode_ratio > 0.40:
+                flag = ' ⚠️ 恒值!'
+                has_const = True
+                detail.append(f)
+            _std = s.std()
+            _std_str = f'{_std:6.2f}' if (_std == _std) else '   —  '
+            print(f"  {f:16s} n={len(s):3d}  nunique={nunique:3d}  std={_std_str}  "
+                  f"min={s.min():6.1f}  max={s.max():6.1f}  "
+                  f"众数={mode_val:.1f}(占{mode_ratio*100:.0f}%){flag}")
+        return has_const, detail
+
     print("=" * 70)
     print("【1】因子区分度诊断（raw_score 全样本）")
-    print(f"    恒值判定窗口: 最近 {WINDOW_DAYS} 个交易日（豁免: {', '.join(sorted(SPARSE_EXEMPT))}）")
+    print(f"    恒值判定窗口: 最近 {WINDOW_DAYS} 个交易日（豁免: {', '.join(sorted(SPARSE_EXEMPT))}）"
+          f"；另单独检查最近 {recent_days} 个交易日（决定退出码）")
     print("=" * 70)
-    has_const = False
-    # 窗口数据：只取最近 WINDOW_DAYS 个交易日（排除旧 bug 期恒值数据污染）
     dates = sorted(wide['date'].unique())
     if len(dates) > WINDOW_DAYS:
         window_dates = set(dates[-WINDOW_DAYS:])
@@ -67,25 +113,17 @@ def diag_distinction(wide):
         print(f"    窗口 {len(dates)}→{len(window_dates)} 天，样本 {len(wide)}→{len(window_wide)}")
     else:
         window_wide = wide
-    for f in FACTORS:
-        col = f + '_raw'
-        s = window_wide[col].dropna()
-        if s.empty:
-            print(f"  {f:16s} 窗口内无有效数据")
-            continue
-        nunique = s.nunique()
-        mode_val = s.mode().iloc[0] if not s.mode().empty else np.nan
-        mode_ratio = (s == mode_val).mean()
-        flag = ''
-        if f in SPARSE_EXEMPT:
-            flag = '（稀疏因子豁免）'
-        elif mode_ratio > 0.40:
-            flag = ' ⚠️ 恒值!'
-            has_const = True
-        print(f"  {f:16s} n={len(s):3d}  nunique={nunique:3d}  std={s.std():6.2f}  "
-              f"min={s.min():6.1f}  max={s.max():6.1f}  "
-              f"众数={mode_val:.1f}(占{mode_ratio*100:.0f}%){flag}")
-    return has_const
+    has_const_window, det_window = _scan(window_wide, 'window')
+
+    # 最近 recent_days 个交易日的"当前健康度"
+    recent_dates = set(dates[-recent_days:])
+    recent_wide = wide[wide['date'].isin(recent_dates)]
+    print(f"    --- 最近 {len(recent_dates)} 个交易日（样本 {len(recent_wide)}）当前健康度 ---")
+    has_const_recent, det_recent = _scan(recent_wide, 'recent')
+    if det_window and not has_const_recent:
+        print(f"    ℹ️ 长窗口检出的恒值因子 {det_window} 未出现在最近 {recent_days} 个交易日"
+              f" → 判定为历史坏数据期残留，不代表当前数据源状态")
+    return has_const_window, has_const_recent
 
 
 def diag_cross_period_corr(wide):
@@ -109,6 +147,10 @@ def diag_cross_period_corr(wide):
             s1 = wide.loc[mask, f1 + '_raw']
             s2 = wide.loc[mask, f2 + '_raw']
             if len(s1) < 5:
+                continue
+            # 2026-09-22 修复：零方差序列会让 numpy corrcoef 抛
+            # "invalid value encountered in divide"（std=0 → NaN），且相关系数无意义。
+            if s1.nunique() <= 1 or s2.nunique() <= 1:
                 continue
             pear = s1.corr(s2)
             spear = s1.corr(s2, method='spearman')
@@ -149,7 +191,14 @@ def diag_cross_section_corr(wide, verbose=False):
         for a, b in pairs_all:
             mask = day[a + '_avail'] & day[b + '_avail']
             if mask.sum() >= 4:
-                c = day.loc[mask, a + '_raw'].corr(day.loc[mask, b + '_raw'])
+                _sa = day.loc[mask, a + '_raw']
+                _sb = day.loc[mask, b + '_raw']
+                # 2026-09-22 修复：零方差序列 corr 产生 NaN + numpy RuntimeWarning
+                if _sa.nunique() <= 1 or _sb.nunique() <= 1:
+                    if verbose:
+                        print(f"    nvar0", end='')
+                    continue
+                c = _sa.corr(_sb)
                 if verbose:
                     print(f" {c:8.3f}", end='')
                 if pd.notna(c) and abs(c) > 0.6:
@@ -204,18 +253,24 @@ def main():
           f"({wide['date'].min()} ~ {wide['date'].max()})")
     print()
 
-    has_const = diag_distinction(wide)
+    has_const_window, has_const_recent = diag_distinction(wide)
     diag_cross_period_corr(wide)
     diag_cross_section_corr(wide, verbose=args.verbose)
     diag_factor_vs_final(wide)
 
     print()
-    if has_const:
-        print("⚠️ 检测到恒值因子（>40% 样本为同一分值）— 可能数据源断或字段漏解析")
+    # 2026-09-22：退出码以**最近 5 个交易日**为准（长窗口会覆盖历史 bug 期，
+    # 用它决定退出码会让自动化把"已修复的历史问题"误判为当前故障）。
+    if has_const_recent:
+        print("⚠️ 最近 5 个交易日检出恒值因子（>40% 样本为同一分值）"
+              "— 当前数据源疑似断供或字段漏解析")
         sys.exit(2)
-    else:
-        print("✅ 未检测到恒值因子")
+    if has_const_window:
+        print("ℹ️ 30 日窗口检出恒值因子，但最近 5 个交易日正常"
+              "→ 属历史坏数据期残留，不判为当前故障（rc=0）")
         sys.exit(0)
+    print("✅ 未检测到恒值因子")
+    sys.exit(0)
 
 
 if __name__ == '__main__':

@@ -1,19 +1,26 @@
 """
 风险过滤器 — 剔除不合格股票
 
-过滤条件：
-  - ST / *ST 股票
-  - 涨停封死（封单量大）
-  - 跌停封死
-  - 成交量过低（< 3000万）
-  - 上市不足60日
+过滤条件（2026-09-22 澄清语义，与 config.yml 注释对齐）：
+  - ST / *ST 股票                                    → 硬过滤（passed=False）
+  - 涨停封死（代理规则 pct_chg >= 板块上限×0.98）      → 硬过滤
+  - 跌停封死                                          → 硬过滤
+  - 成交量过低（< min_volume，默认 3000 万）          → **软扣分**（penalty=0.5，
+    即评分 ×0.75，passed 仍为 True）——历史行为如此，改动需单独 A/B 审批
+  - 上市不足60日（上游提供 listing_days 才校验，缺失跳过）→ 硬过滤
   - PE 为负且尚未盈利（长线过滤）
 """
 
 import logging
+import math
+from core import numeric
 from typing import Dict, List
 
 logger = logging.getLogger(__name__)
+
+
+# 2026-09-23（审查报告 R1）：委托 core.numeric（契约 A 唯一实现）
+_as_float = numeric.float_or
 
 
 class RiskFilter:
@@ -103,13 +110,16 @@ class RiskFilter:
 
         # 1. ST 股票检查
         if self.exclude_st:
-            name = stock_info.get('name_raw', stock_info.get('name', ''))
+            # 2026-09-22 修复（契约 A）：`name_raw` 为 JSON null 时
+            # `'ST' in None` 直接 TypeError 中断整条候选流水线。
+            name = stock_info.get('name_raw', stock_info.get('name', '')) or ''
             if 'ST' in name or '退' in name:
                 reasons.append('ST/退市股')
                 penalty = 1.0
 
-        # 2. 成交量检查
-        amount = stock_info.get('amount', 0) or 0
+        # 2. 成交量检查（软扣分：penalty 0.5 → passed 仍为 True，仅降分；
+        #    硬过滤由 config buy.min_volume 的语义说明见模块 docstring）
+        amount = _as_float(stock_info.get('amount'), 0.0)
         if amount < self.min_amount:
             reasons.append(f'成交额不足 ({amount/1e4:.0f}万 < {self.min_amount/1e4:.0f}万)')
             penalty = max(penalty, 0.5)
@@ -120,7 +130,7 @@ class RiskFilter:
         #    修复：改用代理规则 pct_chg >= 板块上限×0.98 直接硬过滤（回测/实盘统一口径）：
         #    10%板→9.8%、20%板→19.6%、30%板→29.4%，接近涨停即视为次日无法以合理价格成交。
         if self.exclude_limit_up:
-            pct_chg = stock_info.get('pct_chg', 0) or 0
+            pct_chg = _as_float(stock_info.get('pct_chg'), 0.0)
             code = stock_info.get('code', '')
             board_limit = self.get_board_limit(code)
             proxy_threshold = board_limit * 0.98
@@ -129,7 +139,7 @@ class RiskFilter:
                 penalty = max(penalty, 0.8)
 
         # 4. 跌停检查（根据板块涨跌幅限制）
-        pct_chg_val = stock_info.get('pct_chg', 0) or 0
+        pct_chg_val = _as_float(stock_info.get('pct_chg'), 0.0)
         code = stock_info.get('code', '')
         board_limit = self.get_board_limit(code)
         dd_threshold = board_limit * -0.95
@@ -138,13 +148,13 @@ class RiskFilter:
             penalty = max(penalty, 0.8)
 
         # 5. 换手率异常
-        turnover = stock_info.get('turnover', 0) or 0
+        turnover = _as_float(stock_info.get('turnover'), 0.0)
         if turnover > 30:
             reasons.append(f'换手率过高 ({turnover:.1f}%)')
             penalty = max(penalty, 0.4)
 
         # 6. 量比异常
-        vol_ratio = stock_info.get('volume_ratio', 1) or 1
+        vol_ratio = _as_float(stock_info.get('volume_ratio'), 1.0) or 1.0
         if vol_ratio > 10:
             reasons.append(f'量比异常 ({vol_ratio:.1f})')
             penalty = max(penalty, 0.3)

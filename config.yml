@@ -83,6 +83,10 @@ short_term:
                                 # 84% 是小市值效应；由 liq_dev 替代，本键保留 0 不启用）
     valuation_fundamental: 0.00 # 通达信估值/基本面：PE/PB/ROE/股息率（见 core/fundamental_provider.py）
     event_catalyst: 0.00        # 事件催化：公告/业绩预告/新闻（见 core/event_provider.py）
+    # 2026-09-22（缺陷排查 P2-36）：以上两个零权重键**已同步登记**到
+    # data/weights/v1.json 与 ScoringModel.DEFAULT_WEIGHTS —— 此前只有本段有，
+    # 三层键集不一致（`_weights_equivalent` 把缺键当 0，等价性测试恒过，
+    # 但 v1.json 丢失回落兜底层时"显式 0"会退化为"未登记"走默认 50 静默路径）。
     # 合计 1.00。
     # 新因子启用条件：data/cache 下积累 >= 60 个交易日的估值/事件快照后，
     # 跑 `python scripts/run_backtest.py --mode oos` 计算其 OOS IC，
@@ -93,10 +97,23 @@ short_term:
   buy:
     max_candidates: 3         # 最多推荐数量
     min_score: 75             # 最低评分（0-100），低于此值跳过
+    # 2026-09-23 修复（审查报告 §2.2）：动态门槛的 **config 覆盖通道此前是死的** ——
+    # `strategies/short_term.py` 以 `buy_cfg.get('dynamic_min_score') or DEFAULT_...` 读取，
+    # 但本文件从无该键，且 `极差市` 档通过 `min_score` 兜底 → 改门槛只能改代码（还要改两处）。
+    # 现显式登记四档（与 short_term.DEFAULT_DYNAMIC_MIN_SCORE 逐值一致，由守卫测试锁定）：
+    #   强市 65 / 中性市 70 / 弱市 75 / 极差市 75（极差市 skip=True，门槛仅记录用）
+    dynamic_min_score:
+      强市: 65
+      中性市: 70
+      弱市: 75
+      极差市: 75
     exclude_st: true
     exclude_limit_up: true    # 涨停封死的股票（2026-09-05 P0-E：limit_up_amount 无数据源，
                               # 改用代理规则 pct_chg >= 板块上限×0.98 直接硬过滤）
-    min_volume: 30000000      # 最低日成交额（3000万）
+    min_volume: 30000000      # 最低日成交额（3000万）。⚠️ 语义 = **软扣分**（评分×0.75，
+                              # passed 仍 True），非硬过滤 —— 与 core/risk_filter.py:129
+                              # 的实现一致（2026-09-22 澄清）。改硬过滤会缩小实盘选股
+                              # 集合，需单独 A/B 审批。
     min_listing_days: 60      # 最低上市天数
     momentum_filter_rps_max: 80  # 动量硬过滤：剔除非热点·rps_20>=80（候选池分位）的票。
                                  # 实测该段胜率 40.3%/日均-1.09%（n=7370）；热点票豁免。0=关闭

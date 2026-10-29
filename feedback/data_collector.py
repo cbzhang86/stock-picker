@@ -10,7 +10,10 @@
 """
 
 import logging
+from core import numeric
+import math
 import os
+import re
 import sqlite3
 from datetime import date
 from typing import Dict, List, Optional
@@ -18,6 +21,10 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+# 2026-09-23（审查报告 R1）：委托 core.numeric（契约 A 唯一实现）
+_finite = numeric.is_finite
 
 # 默认数据库路径
 DEFAULT_DB_PATH = os.path.join(
@@ -116,19 +123,30 @@ class FactorDataCollector:
 
         conn = sqlite3.connect(self.db_path)
 
+        # 2026-09-22 修复（缺陷排查 P1-13）：子步骤隔离 + 逐步提交。
+        # 原实现把 5 个子步骤写在同一个 try 里、末尾才 commit → 任何一步抛异常
+        # （如龙虎榜字段为 null 触发 float(None)）都会 `rollback()` 掉**当日全部**
+        # 写入（含已成功的 capital_flow/north_flow/hot_stocks/factor_raw），
+        # 且调用方只记 warning → 当日因子库静默空洞（回测快照出现日期缺口）。
+        # 现每个子步骤独立提交：失败只影响它自己，并在日志中留下可定位的失败清单。
+        steps = [
+            ('capital_flow', lambda: self._save_capital_flow(conn, enriched_stocks, trade_date)),
+            ('north_flow', lambda: self._save_north_flow(conn, enriched_stocks, trade_date)),
+            ('hot_stocks', lambda: self._save_hot_stocks(conn, hot_df, trade_date)),
+            ('dragon_tiger', lambda: self._save_dragon_tiger(conn, recommendations, trade_date)),
+            ('factor_raw', lambda: self._save_factor_raw(conn, enriched_stocks, trade_date)),
+        ]
+        failed = []
         try:
-            # 1. 资金流
-            self._save_capital_flow(conn, enriched_stocks, trade_date)
-            # 2. 北向
-            self._save_north_flow(conn, enriched_stocks, trade_date)
-            # 3. 热点
-            self._save_hot_stocks(conn, hot_df, trade_date)
-            # 4. 龙虎榜
-            self._save_dragon_tiger(conn, recommendations, trade_date)
-            # 5. 因子原始值（架构对标 #6）
-            self._save_factor_raw(conn, enriched_stocks, trade_date)
+            for name, fn in steps:
+                try:
+                    fn()
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    failed.append(name)
+                    logger.warning(f"因子采集子步骤失败（仅跳过该步）: {name}: {str(e)[:100]}")
 
-            conn.commit()
             n_flow = sum(1 for s in enriched_stocks
                          if s.get('main_fund_accumulated') is not None)
             n_north = sum(1 for s in enriched_stocks
@@ -139,10 +157,8 @@ class FactorDataCollector:
                 f"北向 {n_north}/{len(enriched_stocks)} | "
                 f"热点 {len(hot_df) if hot_df is not None else 0} | "
                 f"龙虎榜 {len(recommendations)}"
+                + (f" | ⚠️ 失败子步骤: {failed}" if failed else "")
             )
-        except Exception as e:
-            conn.rollback()
-            logger.warning(f"因子数据采集失败: {e}")
         finally:
             conn.close()
 
@@ -233,9 +249,18 @@ class FactorDataCollector:
 
         rows = []
         for _, row in hot_df.iterrows():
-            code = str(row.get(code_col, '')).zfill(6)
+            raw_code = row.get(code_col)
+            # 2026-09-22 修复（缺陷排查 P1-13）：pandas 缺失值为 NaN 时
+            # `str(nan)='nan'` → `zfill(6)='000nan'`（真值）→ 通过下面的
+            # `if code:` 写入，产出永远无法匹配的假代码行（hot_stocks 脏行根因；
+            # 2026-09-20 只清理了历史脏行，未改写入逻辑）。
+            # short_term.py 对同一来源是 `if pd.notna(c)` 过滤，两处口径不一致。
+            if raw_code is None or not pd.notna(raw_code):
+                continue
+            code = str(raw_code).strip().zfill(6)
             name = str(row.get(name_col, '')) if name_col else ''
-            if code:
+            # 只接受 6 位纯数字代码，其余（含 'nan'/'--'/空串）一律拒收
+            if re.fullmatch(r'\d{6}', code):
                 rows.append((trade_date, code, name))
         if rows:
             conn.executemany(
@@ -247,15 +272,27 @@ class FactorDataCollector:
         """保存推荐标的的龙虎榜数据"""
         rows = []
         for rec in recommendations:
-            code = str(rec.get('code', '')).zfill(6)
+            code = str(rec.get('code', '') or '').zfill(6)
+            # 2026-09-22 修复（第二轮回归 P3-4）：元信息条目（skip_reason/
+            # top_unqualified 标记，code 为空）会落成 `000000` 假代码行，
+            # 与 hot_stocks 的拒收口径不一致。空 code 一律跳过。
+            if not re.fullmatch(r'\d{6}', code) or code == '000000':
+                continue
             dt = rec.get('dragon_tiger', {})
             if dt and dt.get('records'):
                 latest = dt['records'][0]
-                inst = dt.get('institution', {})
+                inst = dt.get('institution', {}) or {}
+                # 2026-09-22 修复（缺陷排查 P1-13）：`float(latest.get('net_buy_wan', 0))`
+                # 的默认值只在键缺失时生效 —— 值为 null 时抛 TypeError；
+                # 而本函数所有写入共用一个 connection、末尾才 commit
+                # → 一次异常把当日 capital_flow / north_flow / hot_stocks /
+                # factor_raw **全部回滚**（当日因子库空洞）。
+                _nbw = latest.get('net_buy_wan', 0)
+                _ina = inst.get('net_amt', 0)
                 rows.append((
                     trade_date, code,
-                    float(latest.get('net_buy_wan', 0)),
-                    float(inst.get('net_amt', 0)),
+                    float(_nbw) if _finite(_nbw) else 0.0,
+                    float(_ina) if _finite(_ina) else 0.0,
                     1
                 ))
             else:

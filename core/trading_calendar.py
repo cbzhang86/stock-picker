@@ -121,11 +121,26 @@ def _all_days() -> set:
     return s
 
 
+def _covered_years() -> set:
+    return {int(y) for y in _memory['years']}
+
+
 def trading_days(start, end) -> list:
-    """返回 [start, end] 闭区间内的交易日列表（升序），未知时返回 None。"""
+    """返回 [start, end] 闭区间内的交易日列表（升序），未知时返回 None。
+
+    2026-09-22 修复（缺陷排查 P2-1）：区间末端**超出日历覆盖年份**时返回 None
+    （未知），而不是返回一个不完整的列表 —— 原实现只在 `ed.year > max_year + 1`
+    时告警（off-by-one，恰好漏掉最危险的那一年），并把"未覆盖"当"没有交易日"
+    返回，调用方（如 backtest_engine）会静默按空日历跑。
+    """
     if not _ensure_loaded():
         return None
     sd, ed = _to_date(start), _to_date(end)
+    years = _covered_years()
+    if years and ed.year > max(years):
+        logger.warning(f"交易日历缓存未覆盖 {ed.year} 年（已覆盖至 {max(years)}）"
+                       f"→ 返回 None（未知）而非不完整列表")
+        return None
     all_days = _all_days()
     out, cur = [], sd
     while cur <= ed:
@@ -133,17 +148,26 @@ def trading_days(start, end) -> list:
         if ds in all_days:
             out.append(ds)
         cur += timedelta(days=1)
-    # 区间超出缓存年份范围
-    if ed.year > max(int(y) for y in _memory['years']) + 1:
-        logger.warning("交易日历缓存未覆盖查询区间末端，结果可能不完整")
     return out
 
 
 def is_trading_day(d=None):
-    """是否为交易日。返回 True/False，日历不可用时返回 None（未知，不猜）。"""
+    """是否为交易日。返回 True/False，日历不可用或年份未覆盖时返回 None（未知，不猜）。
+
+    2026-09-22 修复（缺陷排查 P2-1）：原实现在"年份超出覆盖范围"时返回 **False**
+    —— 把"未知"伪装成"非交易日"。后果：2027 年首个交易日会走"非交易日"分支，
+    `daily_job` 跳过尾盘选股、交易日守卫拒绝写入，且日志写"为非交易日"。
+    现改为返回 None（未知），由调用方按保守策略处理。
+    """
     if not _ensure_loaded():
         return None
-    return _to_date(d).strftime('%Y-%m-%d') in _all_days()
+    dt = _to_date(d)
+    years = _covered_years()
+    if years and dt.year > max(years):
+        logger.warning(f"交易日历未覆盖 {dt.year} 年（已覆盖至 {max(years)}）"
+                       f"→ is_trading_day 返回 None（未知）")
+        return None
+    return dt.strftime('%Y-%m-%d') in _all_days()
 
 
 def is_trading_day_strict(d=None) -> bool:

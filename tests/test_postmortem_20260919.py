@@ -155,9 +155,18 @@ class TestPostmortem(unittest.TestCase):
         self.assertEqual(_verdict_of(-0.3), 'neutral')
 
     def test_hit_semantics(self):
-        self.assertTrue(_hit('up', 0.1))
+        """命中判定语义（2026-09-22 修正为对称死区）。
+
+        原实现 up/down **无死区**（+0.01% 即算命中）而 flat 用 ±FLAT_BAND(0.5)
+        → 判定口径不对称、命中率系统性偏高 → `HIT_RATE_FLOOR`（≤50% 熔断）
+        更难触发，把"复盘无信息增量"这一信号掩盖掉。
+        现 up/down 同样要求超出 FLAT_BAND（方向相反）。
+        """
+        self.assertTrue(_hit('up', 0.6))
+        self.assertFalse(_hit('up', 0.4), '死区内不应计为命中')
         self.assertFalse(_hit('up', -0.1))
-        self.assertTrue(_hit('down', -0.1))
+        self.assertTrue(_hit('down', -0.6))
+        self.assertFalse(_hit('down', -0.4), '死区内不应计为命中')
         self.assertFalse(_hit('down', 0.1))
         self.assertTrue(_hit('flat', 0.4))
         self.assertFalse(_hit('flat', 0.6))

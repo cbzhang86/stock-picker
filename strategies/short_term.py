@@ -279,8 +279,16 @@ class ShortTermStrategy(BaseStrategy):
         _cg_scale = self._crowding_position_scale(market_assessment)
         position_scale *= _cg_scale
         # 2026-09-18 审查补充：记录 crowding 取值供 run_context 追溯
-        self._last_crowding = {'breaker': False, 'reason': None,
-                               'scale': _cg_scale, 'avg_chg': _crowding_avg}
+        # 2026-09-22 修复（缺陷排查 P1-1）：原实现**无条件**覆写为 breaker=False，
+        # 把上面 :208 写入的 breaker=True 抹掉。触发断路器且 shadow_enabled=true
+        # （本文件默认值，config.yml 亦显式开启）时流程不 return，必然会走到这里
+        # → run_context.regime.crowding.breaker 恒 false，事后无法复原"哪些日子
+        # 被拥挤度断路器停推"。现改为仅在未触发时写入，触发时只补充分档系数。
+        if (getattr(self, '_last_crowding', None) or {}).get('breaker'):
+            self._last_crowding['scale'] = _cg_scale
+        else:
+            self._last_crowding = {'breaker': False, 'reason': None,
+                                   'scale': _cg_scale, 'avg_chg': _crowding_avg}
 
         # 2. 批量过滤 + 预评分
         # 2.0 预热 lockup 缓存（一次 akshare 调用 ~3-4s，让 5000+ 只预过滤不走 IO）
@@ -315,6 +323,9 @@ class ShortTermStrategy(BaseStrategy):
         # 2026-09-14：提前到 null 判断之前——"零推荐"分支会提前 return，
         # 若仍留在下方会导致零推荐日因子采集拿不到 enriched 而断采。
         self._last_enriched = enriched
+        # 2026-09-23（交接单 D1）：暴露当日候选池 top-N（含零推荐日），
+        # 供 eod 落库为"与是否推荐解耦"的漂移样本源（见 feedback/drift_sample.py）。
+        self._last_diagnostics = _diag
 
         if not recommendations:
             logger.info("今日尾盘策略跳过：没有评分达标的标的")
@@ -442,7 +453,17 @@ class ShortTermStrategy(BaseStrategy):
                     'amount_ratio': src_full.get('volume_ratio'),
                     '_decision_date': rec.get('_decision_date') or src_full.get('_decision_date'),
                 }
-                verdict = ensemble.fuse(src_for_ensemble)
+                # 2026-09-22 修复（缺陷排查 P0 配套）：per-rec 隔离。
+                # 原实现把 try 放在 for 之外，单条 rec 触发异常（如 model_score
+                # 非有限 → fuse 显式抛错）会让**全部**推荐一起丢掉 ensemble 字段。
+                # 改为单条失败只跳过该条，其余照常获得第二意见。
+                try:
+                    verdict = ensemble.fuse(src_for_ensemble)
+                except Exception as _ee:
+                    logger.warning(
+                        f"[{rec.get('code')}] 专家 ensemble 跳过（降级为仅主模型分数）: "
+                        f"{str(_ee)[:100]}")
+                    continue
                 rec['expert_score'] = verdict.expert_score
                 rec['expert_delta'] = verdict.delta
                 rec['ensemble_score'] = verdict.ensemble_score
@@ -566,6 +587,16 @@ class ShortTermStrategy(BaseStrategy):
 
         任何异常都被吞掉（仅 warning），绝不影响选股主流程。
         """
+        # 2026-09-22 修复（缺陷排查 P1-2）：`is_backtest` 此前是**未被使用的死参数**。
+        # 文件名固定为 `run_context_{_run_id}.json`，而 `_run_id` 取的是
+        # `datetime.now().strftime('%Y%m%d')` —— 回测逐日调用本函数时，每个回测日
+        # 都会用该日的档位/门槛/推荐**覆盖当日生产存档**。下游
+        # `scripts/recalibrate_thresholds.py --from-run-context`（门槛重校）
+        # 与 `scripts/verify.py::check_run_context_freshness` 都读这批文件
+        # → 跑一次回测即可静默污染门槛重校的输入。
+        # 回测不需要 run_context 存档（回测自身的结果落在 backtest DB），直接跳过。
+        if is_backtest:
+            return
         try:
             from datetime import datetime as _dt
             date_str = _dt.now().strftime('%Y-%m-%d')
@@ -1247,7 +1278,9 @@ class ShortTermStrategy(BaseStrategy):
                     # 资金流是短线最高权重因子(0.35)，但 big_deal 缓存已能覆盖主力资金
                     # 所以 ASHareHub moneyflow 只给可能进入推荐池的前 10 只用精确数据
                     # 预算：moneyflow 10 + 技术 10 + 概念 20 + 财务 15 = 55/次，留 45 余量
-                    skip_ash = idx >= 10
+                    # 2026-09-23（交接单 R2 · 纵深防御）：回测不走 AShareHub 实时调用。
+                    # 回测的资金流来自 factor_daily.db 快照，此处仅断掉实盘 API。
+                    skip_ash = is_backtest or idx >= 10
                     main_accum = self.data_engine.get_main_fund_accumulated(code, days=10, skip_asharehub=skip_ash)
                 except Exception:
                     main_accum = None
@@ -1313,7 +1346,11 @@ class ShortTermStrategy(BaseStrategy):
                     stock['raw_return_20'] = raw_return_20
                 else:
                     stock['macd_status'] = {'score': 50, 'status': 'unknown'}
-                    stock['raw_return_20'] = 0
+                    # 2026-09-22 修复（剩余项 #2 · 契约 B）：无 K 线时原写
+                    # `raw_return_20 = 0`（伪造值）→ 进入 all_raw_returns 参与横截面
+                    # rank → rps_20 被压到最低分位 → momentum/reversal_20d（合计权重
+                    # 0.12）拿到**假信号**而非中性。缺失一律 None（不入横截面）。
+                    stock['raw_return_20'] = None
 
                 # AShareHub 分级配额分配（日限100次，按优先级分四档）
                 # top 10:  资金流 moneyflow（10次）— 短线最高权重(0.35)，但 big_deal 兜底
@@ -1325,7 +1362,8 @@ class ShortTermStrategy(BaseStrategy):
                 # 配额账本已持久化跨进程共享 + 线程锁 + 原子写（见 data_engine）
 
                 # 双源技术校验：AShareHub 技术因子（仅 top 10，独立熔断）
-                if rank_index < 10:
+                # 2026-09-23（交接单 R2）：回测不调实盘 API（因子走 factor_daily.db 快照）
+                if (not is_backtest) and rank_index < 10:
                     try:
                         asharehub_tech = self.data_engine.get_technical_factors_asharehub(code)
                         if asharehub_tech is not None:
@@ -1334,7 +1372,8 @@ class ShortTermStrategy(BaseStrategy):
                         logger.warning(f"{code} AShareHub技术因子失败: {e}")
 
                 # AShareHub 概念板块（top 20，hot_theme 增强，独立熔断）
-                if rank_index < 20:
+                # 2026-09-23（交接单 R2）：回测不调实盘 API
+                if (not is_backtest) and rank_index < 20:
                     try:
                         concepts = self.data_engine.get_concept_members(code)
                         if concepts is not None:
@@ -1343,7 +1382,8 @@ class ShortTermStrategy(BaseStrategy):
                         logger.warning(f"{code} AShareHub概念板块失败: {e}")
 
                 # AShareHub 财务指标（top 15，长线基本面，独立熔断）
-                if rank_index < 15:
+                # 2026-09-23（交接单 R2）：回测不调实盘 API
+                if (not is_backtest) and rank_index < 15:
                     try:
                         fin = self.data_engine.get_financial_indicators(code)
                         if fin is not None:
@@ -1353,7 +1393,8 @@ class ShortTermStrategy(BaseStrategy):
             except Exception as e:
                 logger.warning(f"{code} 技术面失败: {str(e)[:60]}")
                 stock['macd_status'] = {'score': 50, 'status': 'unknown'}
-                stock['raw_return_20'] = 0
+                # 2026-09-22 修复（剩余项 #2 · 契约 B）：同上，异常分支不伪造 0
+                stock['raw_return_20'] = None
             return stock
 
         # baostock 是全局单例，只能用1个线程。但大部分已缓存，串行走就行。
@@ -1367,7 +1408,8 @@ class ShortTermStrategy(BaseStrategy):
                     # 超时或异常：跳过该股票
                     stock = futures[future]
                     stock['macd_status'] = {'score': 50, 'status': 'unknown'}
-                    stock['raw_return_20'] = 0
+                    # 2026-09-22 修复（剩余项 #2 · 契约 B）：同上，不伪造 0
+                    stock['raw_return_20'] = None
                     enriched.append(stock)
 
         # 横截面RPS计算

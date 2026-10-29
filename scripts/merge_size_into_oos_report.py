@@ -40,7 +40,7 @@ def main():
                  if '_size' not in p]
         if not cands:
             print('未找到基准 OOS 报告')
-            return
+            return 1   # 2026-09-22：失败退出码可感知
         base_path = max(cands, key=os.path.getmtime)
     print(f"基准报告: {os.path.basename(base_path)}")
     base = json.load(io.open(base_path, encoding='utf-8'))
@@ -60,7 +60,7 @@ def main():
     panel = v.build_panel(start, end, factors=['momentum'])
     if panel.empty:
         print('面板为空')
-        return
+        return 1
     print(f"面板 {len(panel):,} 行 | {panel['code'].nunique()} 只 | {panel['date'].nunique()} 天")
 
     de = DataEngine({})
@@ -81,7 +81,7 @@ def main():
     ic_full = v.daily_ic(panel, 'size', ret_col=RET_HOLD1D)
     if ic_full.empty:
         print('size IC 为空')
-        return
+        return 1
 
     # 按原报告 split 切分（test 段为 daily_ics 落盘范围，与其他因子一致）
     test_range = split.get('test_range')
@@ -124,16 +124,31 @@ def main():
     }
 
     base['result']['factors']['size'] = entry
-    out_path = base_path.replace('.json', '_size.json')
+    # 2026-09-22 修复（缺陷排查 P1-17）：原只写出 `..._hold1d_size.json`，
+    # 而 `calibrate_weights.load_latest_ic` 的 glob 是 `oos_ic_*_hold1d.json`
+    # （必须以 `_hold1d.json` 结尾），`monthly_review.py` 还显式排除 `_size`
+    # → 本脚本自称"并入了审批流程"，实际没有任何消费者读取它，size 因子闭环仍断。
+    # 现额外写一份**匹配 glob** 的合并报告（含全部基础因子 + size），
+    # 使 `calibrate_weights.py` 能真正看到 size 的 OOS IC。
+    _dir, _base = os.path.split(base_path)
+    _stem = _base[:-len('.json')] if _base.endswith('.json') else _base
+    out_path = os.path.join(_dir, _stem + '_size.json')          # 非破坏性留档
+    _tail = _stem[len('oos_ic_'):] if _stem.startswith('oos_ic_') else _stem
+    merged_path = os.path.join(_dir, f'oos_ic_merged_size_{_tail}.json')
     with io.open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(base, f, ensure_ascii=False, indent=2)
+    with io.open(merged_path, 'w', encoding='utf-8') as f:
         json.dump(base, f, ensure_ascii=False, indent=2)
 
     print(f"\nsize 因子：全窗 IC {stats_full['ic']:+.4f} (t={stats_full['t_stat']}) | "
           f"test 段 IC {stats_test['ic']:+.4f} (t={stats_test['t_stat']}, "
           f"n={stats_test['n_days']}) | walk-forward 均值 {wf_mean:+.4f} | 符号稳定 {sign_stable}")
     print(f"已写出（含 size 的标准结构报告）: {os.path.basename(out_path)}")
+    print(f"已写出（进入校准闭环，匹配 calibrate_weights 的 glob）: "
+          f"{os.path.basename(merged_path)}")
     print("→ 下一步：python scripts/calibrate_weights.py（不加 --apply 为只读预览）")
 
 
 if __name__ == '__main__':
-    main()
+    # 2026-09-22：透传返回码，否则失败被解释为 exit 0
+    sys.exit(main())

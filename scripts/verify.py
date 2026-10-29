@@ -18,6 +18,7 @@ manual review. It only catches the "obvious" failures.
 
 import argparse
 import json
+import math
 import os
 import platform
 import sys
@@ -44,6 +45,20 @@ CONFIG_YML = PROJECT_ROOT / "config.yml"
 CRON_RUNLOG = Path(os.environ.get("LOCALAPPDATA", "")) / "hermes" / "cron" / "runlog.jsonl"
 CRON_HEALTH_SCRIPT = Path(os.environ.get("LOCALAPPDATA", "")) / "hermes" / "scripts" / "cron_health_panel.py"
 DATA_REPORTS = DATA_DIR / "reports"
+
+
+def _is_finite_num(v) -> bool:
+    """硬契约 A（2026-09-22 加固）：非有限值 ≡ 缺失。
+
+    None / NaN / ±Inf / 非数值一律视为缺失。不能用 `isinstance(v, float)`：
+    NaN 是 float 会被漏判 —— 正是本文件多处检查项崩溃/误报的根因。
+    """
+    if v is None or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(float(v))
+    except (TypeError, ValueError):
+        return False
 
 # ANSI helpers — degrade gracefully on dumb terminals.
 USE_COLOR = sys.stdout.isatty()
@@ -96,20 +111,45 @@ def check_asharehub_endpoints(do_live: bool = False):
         return 'WARN', "ASHAREHUB_API_KEY not in env (skip live test)"
 
     if not do_live:
-        # Zero-quota path: read last-known source status from DataEngine.
+        # Zero-quota path: read last-known source status.
+        # 2026-09-22 修复（缺陷排查 P1-4）：原实现 `DataEngine(); get_data_source_summary()`
+        # 读的是**新建实例**的 `_source_status` —— 该字段在 __init__ 中默认全绿，
+        # 与运行期真实熔断状态无关（这正是本项目契约 D 的结构性陷阱）。
+        # 因此本检查无论数据源是否熔断，都恒返回 'OK'：唯一的"数据源整体中断"
+        # 观测点在 verify 里完全失效。
+        # 现改为优先读**最近一份生产 run_context_*.json 的 data_source_status**
+        # （eod_stock_picker 每交易日写入，是真实运行期快照）；
+        # 读不到时才回退到新建实例，并按 WARN 披露"无运行期快照"。
         try:
-            sys.path.insert(0, str(PROJECT_ROOT))
-            from core.data_engine import DataEngine
-            de = DataEngine()
-            summary = de.get_data_source_summary()
+            import glob as _glob
+            import json as _json
+            _rcs = sorted(_glob.glob(str(DATA_REPORTS / 'run_context_*.json')))
+            if _rcs:
+                with open(_rcs[-1], encoding='utf-8') as _f:
+                    _ctx = _json.load(_f)
+                summary = _ctx.get('data_source_status') or {}
+                src = f"run_context {os.path.basename(_rcs[-1])}"
+            else:
+                sys.path.insert(0, str(PROJECT_ROOT))
+                from core.data_engine import DataEngine
+                summary = DataEngine().get_data_source_summary()
+                src = 'fresh DataEngine（无运行期快照，状态可信度低）'
+
             # summary is dict like {'asharehub_moneyflow': {...}, ...}
             statuses = []
+            down = []
             for k in ('asharehub_moneyflow', 'asharehub_tech_factors',
                       'asharehub_concepts', 'asharehub_financial'):
                 entry = summary.get(k, {})
                 avail = entry.get('available', False) if isinstance(entry, dict) else False
                 statuses.append(f"{k.split('_', 1)[-1]}={'OK' if avail else 'DOWN'}")
-            return 'OK', f"last-known: {', '.join(statuses)} (no quota used)"
+                if not avail:
+                    down.append(k.split('_', 1)[-1])
+            # 有源 DOWN → WARN（不 FAIL：配额闸门触发的熔断是正常设计态）。
+            if down:
+                return 'WARN', (f"{src}: {', '.join(statuses)} | "
+                                f"熔断源: {', '.join(down)} (no quota used)")
+            return 'OK', f"{src}: {', '.join(statuses)} (no quota used)"
         except Exception as e:
             return 'WARN', f"can't read source status: {type(e).__name__} (no quota used)"
 
@@ -190,13 +230,22 @@ def check_weights_consistency():
     except Exception as e:
         return 'FAIL', f"v1.json parse: {e}"
     for mode in ('short', 'long'):
-        s = sum(v1.get(mode, {}).values())
+        _mw = v1.get(mode, {}) or {}
+        # 2026-09-22 修复（缺陷排查 P1-26 · 契约 A）：权重值为 null/NaN 时
+        # `sum(...)` 与 `w > 0.60` 都会 TypeError，主检查项会以
+        # "check crashed: TypeError" 形式 FAIL —— 语义被误导（真正的故障是
+        # "权重表有非有限值"）。先归一化并显式报告缺失键。
+        _bad = [f for f, w in _mw.items() if not _is_finite_num(w)]
+        if _bad:
+            problems.append(f"v1.json {mode} 存在非有限权重值: {_bad}")
+        _mw = {f: (float(w) if _is_finite_num(w) else 0.0) for f, w in _mw.items()}
+        s = sum(_mw.values())
         if abs(s - 1.0) > 0.001:
             problems.append(f"v1.json {mode} sum={s:.3f}")
-        if v1.get(mode, {}).get('north_flow', -1) != 0.0:
-            problems.append(f"v1.json {mode}.north_flow={v1[mode]['north_flow']} (expect 0)")
+        if _mw.get('north_flow', -1) != 0.0:
+            problems.append(f"v1.json {mode}.north_flow={_mw.get('north_flow')} (expect 0)")
         # P0-A/P2-L：单因子集中度
-        for fac, w in v1.get(mode, {}).items():
+        for fac, w in _mw.items():
             if w > 0.60:
                 problems.append(f"v1.json {mode}.{fac}={w:.2f} >0.60 集中度风险")
 

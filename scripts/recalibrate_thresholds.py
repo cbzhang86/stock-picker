@@ -40,7 +40,12 @@ PANEL_CACHE = os.path.join(PROJECT_ROOT, 'data', 'cache',
                            '_tmp_panel_2023-10_2026-09.pkl')
 # 档位标签与 short_term 的 LEVEL_* 常量一致（'强市'/'中性市'/'弱市'），
 # 门槛从短_term.DEFAULT_DYNAMIC_MIN_SCORE 对齐（此处硬编码以便离线运行，测试锁一致性）
-CURRENT_THRESHOLDS = {'强市': 65, '中性市': 70, '弱市': 75}
+CURRENT_THRESHOLDS = {'强市': 65, '中性市': 70, '弱市': 75,
+                      # 2026-09-22 修复（缺陷排查 P1-20(c)）：生产确实会产生
+                      # '极差市' 档（skip=True），原表缺该键 → 统计与打印显示 '?'。
+                      # 其实际生效门槛 = buy.min_score（动态表无该键时回落），
+                      # 即 config.yml 的 75。
+                      '极差市': 75}
 MIN_DAYS = 15
 
 W_OLD = {'hot_theme': .42, 'reversal_20d': .42, 'momentum': .03,
@@ -48,8 +53,9 @@ W_OLD = {'hot_theme': .42, 'reversal_20d': .42, 'momentum': .03,
 W_NEW = {'hot_theme': .55, 'liq_dev': .14, 'reversal_20d': .10, 'vol_dev': .07,
          'volatility': .06, 'momentum': .02, 'technical': .02,
          'volume_price': .02, 'dragon_tiger': .01, 'capital_flow': .01}
-PANEL_FACTORS = ['hot_theme', 'liq_dev', 'reversal_20d', 'vol_dev', 'volatility',
-                 'momentum', 'technical', 'volume_price', 'dragon_tiger']
+# 2026-09-23（审查报告 R2）：改由 core/factor_registry 单一来源派生
+from core.factor_registry import PANEL_FACTORS as _PANEL_FROM_REGISTRY
+PANEL_FACTORS = list(_PANEL_FROM_REGISTRY)
 
 
 # ── 路径 A：run_context 实测 ────────────────────────────
@@ -83,10 +89,18 @@ def from_run_context():
     print("=" * 74)
     print("路径 A：run_context 实测统计")
     print("=" * 74)
-    ready = False
+    # 2026-09-22 修复（缺陷排查 P1-20(a)(b)）：
+    #   (a) 原实现只用"有推荐日"的最高分求分位 → 零推荐日（常态）被剔除，
+    #       top 分布被高估、q40 建议门槛偏高。此处显式披露"无分数信息天数"，
+    #       使截断（censoring）在选择门槛时可见，而不是静默丢弃。
+    #   (b) 原 `ready` 为全局开关：任一档位达标即 return 0，与文案
+    #       "各档位均需 ≥15 天"矛盾。现要求**所有**出现过的档位都达标。
+    ready_levels = []
+    short_levels = []
     for lvl, rows in sorted(buckets.items()):
         n_days = len(rows)
         n_pass = sum(1 for r in rows if r['n'] > 0)
+        n_no_score = sum(1 for r in rows if not r['scores'])
         all_scores = [s for r in rows for s in r['scores']]
         top = [max(r['scores']) for r in rows if r['scores']]
         gap = [max(r['scores']) - r['eff'] for r in rows if r['scores']]
@@ -94,6 +108,9 @@ def from_run_context():
               f"样本 {n_days} 天（需 ≥{MIN_DAYS}）")
         print(f"  有推荐天数: {n_pass}/{n_days}"
               f"（通过率 {n_pass / n_days:.0%}）")
+        if n_no_score:
+            print(f"  ⚠️ 无分数信息天数: {n_no_score}（run_context 未记录当日最高分，"
+                  f"分位统计存在截断偏差）")
         if all_scores:
             print(f"  推荐分数: 均值 {np.mean(all_scores):.1f} / "
                   f"中位 {np.median(all_scores):.1f} / 最低 {min(all_scores):.1f}")
@@ -105,11 +122,14 @@ def from_run_context():
             # 分位匹配：保持与旧体系相近的通过率（旧体系下"当日最高分≥门槛"比例）
             q = np.percentile(top, 40)
             print(f"  → 分位匹配建议门槛 ≈ {q:.0f} 分（保持约 60% 天数有推荐）")
-            ready = True
-    if not ready:
-        print(f"\n[A] 样本不足（各档位均需 ≥{MIN_DAYS} 天）→ 暂不产出最终门槛，"
-              f"请继续积累 run_context 后用本命令复算。")
+            ready_levels.append(lvl)
+        else:
+            short_levels.append(lvl)
+    if short_levels:
+        print(f"\n[A] 样本不足的档位 {short_levels}（各档位均需 ≥{MIN_DAYS} 天）"
+              f"→ 暂不产出最终门槛，请继续积累 run_context 后用本命令复算。")
         return 1
+    print(f"\n[A] 全部档位样本达标 {ready_levels} → 可按上方分位建议复核门槛。")
     return 0
 
 
@@ -136,7 +156,10 @@ def oos_proxy(top_n=5, pool=200):
         _ret = df.groupby('code', sort=False)['close'].pct_change()
         _vol = (_ret.groupby(df['code'], sort=False).rolling(20).std()
                 .reset_index(level=0, drop=True))
-        _vlevel = (_vol.fillna(0).groupby(df['code'], sort=False)
+        # 2026-09-22 修复（与 core/oos_validator.py 同口径）：原为 `_vol.fillna(0)`
+        # → 前 20 日波动率被填 0 参与 60 日滚动中位数，min_periods=30 失效、
+        # vdev 失真。保留 NaN 以维持与生产 OOS 相同的计算口径。
+        _vlevel = (_vol.groupby(df['code'], sort=False)
                    .rolling(60, min_periods=30).median().reset_index(level=0, drop=True))
         df['vol_dev'] = 100.0 - ((_vol - _vlevel).groupby(df['date']).rank(pct=True) * 100)
     fac = [f for f in PANEL_FACTORS if f in df.columns]
@@ -160,18 +183,28 @@ def oos_proxy(top_n=5, pool=200):
 
     need = set(list(W_OLD) + list(W_NEW))
     df = df.dropna(subset=[c for c in need if c in df.columns]).copy()
+
+    # 2026-09-22 修复（缺陷排查 P1-20(d)）：候选池**固定用旧权重 W_OLD 选出**。
+    # 原实现在循环内用各自 tag 的权重选池（`d = daily_scores(w)` → `g['_s']`），
+    # 与上方注释"按旧权重综合分取前 pool 只"不符 —— 两标签池子不同，
+    # "分位点位移"里混入了选择效应，G 侧池内最高分被选择性抬高，
+    # 通过率变化被高估（弱市保护减弱的量化证据因此不可信）。
+    d_pool = daily_scores(W_OLD)
+    pool_idx_by_date = {}
+    for dt, g in d_pool.groupby('date', sort=True):
+        if len(g) < 100:
+            continue
+        s_all = g['_s'].to_numpy()
+        k = min(pool, len(s_all))
+        pool_idx_by_date[dt] = g.index[np.argpartition(-s_all, k - 1)[:k]]
+
     out = {}
     for tag, w in (('旧权重A', W_OLD), ('新权重G', W_NEW)):
         d = daily_scores(w)
         tops, q60s, q80s = [], [], []
-        for _, g in d.groupby('date', sort=True):
-            if len(g) < 100:
-                continue
-            # 候选池代理：按旧权重综合分取前 pool 只（近似"进入详评"的集合）
-            s_all = g['_s'].to_numpy()
-            k = min(pool, len(s_all))
-            idx = np.argpartition(-s_all, k - 1)[:k]
-            pool_s = s_all[idx]
+        for dt, idx in pool_idx_by_date.items():
+            # 候选池固定（W_OLD 选池），仅评分口径随 tag 变化
+            pool_s = d.loc[idx, '_s'].to_numpy()
             tops.append(pool_s.max())
             q60s.append(np.percentile(pool_s, 60))
             q80s.append(np.percentile(pool_s, 80))

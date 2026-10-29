@@ -12,9 +12,14 @@
 
 import logging
 import math
+from core import numeric
 from typing import Dict, List
 
 logger = logging.getLogger(__name__)
+
+
+# 2026-09-23（审查报告 R1）：委托 core.numeric（契约 A 唯一实现）
+_finite = numeric.is_finite
 
 
 class PortfolioOptimizer:
@@ -65,11 +70,28 @@ class PortfolioOptimizer:
           公式：effective_score = 0.6 * score + 0.4 * ensemble_score * weight_factor
         """
         # 优先使用 ensemble_score（如果存在）作为加权基础
+        # 2026-09-22 修复（缺陷排查 P0）：
+        #   · `r.get('score', 0)` 的默认值只在键缺失时生效 —— 值为 None 时
+        #     返回 None → `0.6 * None` TypeError；值为 NaN 时整条分配链 NaN，
+        #     最终触发出口不变量断言 `AssertionError: 单票仓位 nan% 突破上限`。
+        #   · `rec['ensemble_score']` 同理会 TypeError。
+        # 统一：评分非有限按缺失（0 分）处理，并告警，避免单个脏推荐炸掉
+        # 当日 eod（生产）或整日回测（被上层 except 吞成"0 交易"伪象）。
+        def _score_of(r, key):
+            v = r.get(key)
+            if not _finite(v):
+                if v is not None:
+                    logger.warning(
+                        f"推荐 {r.get('code')!r} 的 {key} 非有限（{v!r}）→ 按 0 处理")
+                return 0.0
+            return float(v)
+
         def effective_score(r):
-            base = r.get('score', 0)
+            base = _score_of(r, 'score')
             if 'ensemble_score' in r:
                 wf = r.get('weight_factor', 1.0)
-                return 0.6 * base + 0.4 * r['ensemble_score'] * wf
+                wf = float(wf) if _finite(wf) else 1.0
+                return 0.6 * base + 0.4 * _score_of(r, 'ensemble_score') * wf
             return base
 
         total_score = sum(effective_score(r) for r in recs)

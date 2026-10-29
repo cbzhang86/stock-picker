@@ -23,6 +23,7 @@ import logging
 import os
 import sqlite3
 import sys
+import time  # 2026-09-22 修复（P2-28）：原在 __main__ 块内 import，被 import 调用 main() 时 NameError
 
 import requests
 
@@ -63,7 +64,14 @@ def _captured_dates() -> set:
 
 
 def _fetch(date: str) -> list:
-    r = requests.get(URL.format(date=date), headers=HEADERS, timeout=15)
+    # 2026-09-22 修复（缺陷排查 P2-24）：本机代理会干扰直连（与
+    # core/data_engine._session.trust_env=False 同因），改用关闭代理的会话。
+    _sess = requests.Session()
+    _sess.trust_env = False
+    try:
+        r = _sess.get(URL.format(date=date), headers=HEADERS, timeout=15)
+    finally:
+        _sess.close()
     data = r.json()
     if data.get('errocode', 0) != 0:
         raise RuntimeError(data.get('errormsg', 'errocode!=0'))
@@ -130,11 +138,11 @@ def main():
             logger.info(f"进度 {i}/{len(todo)} 成功 {ok} 失败 {fail} 累计 {total_rows} 行")
         time.sleep(0.3)          # 温和限速
 
-    import time as _t
+    # 2026-09-22：原 `import time as _t`（未使用）与 __main__ 块内的重复 import
+    # 已随模块级 `import time` 一并清理。
     logger.info(f"回填完成: 成功 {ok} 失败 {fail} 写入 {total_rows} 行")
     return 0 if fail == 0 else 1
 
 
 if __name__ == '__main__':
-    import time
     sys.exit(main())

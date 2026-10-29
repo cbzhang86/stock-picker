@@ -14,6 +14,7 @@
 """
 
 import json
+import math
 import os
 import logging
 from typing import Dict, List, Optional, Tuple
@@ -22,7 +23,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from core.factor_library import FactorLibrary
+from core.factor_library import FactorLibrary, _is_finite_number
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,15 @@ def score_to_rating(score: float) -> Tuple[str, str]:
     return 'sell', '卖出'
 
 
+# 2026-09-22（第二轮回归 P2-1）：横截面百分位的最小样本阈值。
+# 病理场景 = 池中**只有 1 只**票有数据 → percentile=1.0（n=1 时"唯一值"既是
+# 最大也是最小）→ 100 分，与同池其他票的中性 50 形成断崖。
+# 阈值取 2：≥2 个样本即可产生有意义的相对排序（2 只票 → 0.5/1.0，方向正确）；
+# n=1 时全池保持中性。守卫测试 test_size_factor / test_deviation_factors
+# 锁定的 2~3 票行为与此一致。
+MIN_CROSS_SECTION_N = 2
+
+
 class ScoringModel:
     """
     核心评分模型
@@ -67,8 +77,6 @@ class ScoringModel:
     # 默认权重（fallback 兜底，2026-09-06 审查修复：与 data/weights/v1.json
     # 对齐。原先 DEFAULT 与 v1.json 严重矛盾（hot_theme 0.10 vs 0.50），
     # 一旦 v1.json 丢失会静默回退到 DEFAULT 导致选股行为 5× 漂移）。
-    # 真正生效权重以 get_weights() 为准：v1.json > config.yml > 此处兜底。
-    # risk 不进权重表，由 penalty 路径独立扣分（见 ActiveWeight 与 penalty 注释）
     DEFAULT_WEIGHTS = {
         'short': {
             # 2026-09-19 方案G（保守混合，用户决策后定稿，与 v1.json/config.yml 同步）：
@@ -100,6 +108,11 @@ class ScoringModel:
             # 路径，与"零权重链路先通、≥60 交易日后再审批加权"的约定不对称。
             'size': 0.00,      # 小市值（估值快照积累 ≥60 交易日后 OOS 验证）
             'liquidity': 0.00,  # 原始流动性（已证伪：84% 是小市值效应）
+            # 2026-09-22 补登记（缺陷排查 P2-36）：这两个键此前只写在 config.yml，
+            # v1.json 与本层均缺 → 三层键集不一致（`_weights_equivalent` 把缺键当 0
+            # 故等价性测试恒过，但 v1.json 丢失回落本层时"显式 0"退化为"未登记"）。
+            'valuation_fundamental': 0.00,  # 通达信估值/基本面（链路已通，待 OOS）
+            'event_catalyst': 0.00,         # 事件催化（链路已通，待 OOS）
         },
         'long': {
             'fundamental': 0.40,
@@ -218,7 +231,15 @@ class ScoringModel:
         """
         score = 0.0
         breakdown = {}
-        weights = self.get_weights(mode)
+        # 2026-09-22 修复（契约 A）：权重文件被手工编辑成 null/NaN/非法字符串时，
+        # `sum(weights.values())` 与 `factor_score * weight` 都会 TypeError 中断
+        # 当日全流程。非有限权重一律视同缺失（按 0 处理）并告警。
+        weights = dict(self.get_weights(mode) or {})
+        _bad_w = [k for k, v in weights.items() if not _is_finite_number(v)]
+        if _bad_w:
+            logger.warning(f"权重表存在非有限值，按 0 处理: {_bad_w}")
+        weights = {k: (float(v) if _is_finite_number(v) else 0.0)
+                   for k, v in weights.items()}
 
         # 计算各因子得分
         # P2-K hook（2026-09-05 审查报告）：横截面标准化由 rank_stocks 批量注入
@@ -243,6 +264,17 @@ class ScoringModel:
                 continue  # risk 走后的 penalty 路径，不在加权循环里混
             factor_score = factors.get(factor_name, 50.0)
             is_neutral = False
+
+            # 2026-09-22 修复（契约 A · 缺陷排查 P0）：`dict.get(k, default)` 的
+            # 默认值**只在键缺失时生效**——键存在而值为 None/NaN/±Inf 时默认值无效，
+            # 后续 `factor_score * effective_weight` 会直接 TypeError 中断当日全流程，
+            # 或产出 NaN 总分（被 `score >= min_score` 恒 False 静默剔除，日志却报
+            # "门槛过滤"）。统一按"数据不可用"处理：回落中性 50 并触发权重让渡。
+            if not _is_finite_number(factor_score):
+                factor_score = 50.0
+                is_neutral = True
+            else:
+                factor_score = float(factor_score)
 
             # 资金流/北向：原始数据为 None → 数据不可用
             if factor_name == 'capital_flow' and stock_data.get('main_fund_accumulated') is None:
@@ -276,25 +308,32 @@ class ScoringModel:
             # 判定依据 = 原始百分位是否写入（由 rank_stocks 计算）：
             #   有百分位 → 真实横截面值（0-100）可参与排序
             #   无百分位 → 数据不足（K 线行数不够 / 快照模式无行情）→ 让渡权重
+            # 2026-09-22 修复（剩余项 #2）：momentum / reversal_20d 接入可用性判定。
+            # 上游（strategies/short_term.py 的 3 个 fallback 分支）已改为"无 K 线
+            # → raw_return_20=None → 不参与横截面 rank → 无 rps_20"，
+            # 因此 rps_20 现在是**可靠的可用性判据**：
+            #   有 rps_20 → 真实横截面分位（0-100）
+            #   无 rps_20 → 数据不足 → 中性 50 + 让渡权重（与 liq_dev 等四因子同机制）
+            # 口径一致性：OOS 面板的 daily_ic 本就剔除 NaN 行，即动量/反转的 IC
+            # 证据**只来自有数据的样本**——实盘对缺数据票让渡权重与该证据口径一致，
+            # 而此前的"伪造 0 → 最低分位"反而与 OOS 口径相悖。
             _peri_map = {
                 'liq_dev': '_liq_dev_percentile',
                 'vol_dev': '_vol_dev_percentile',
                 'volatility': '_volatility_percentile',
                 'liquidity': '_liquidity_percentile',
                 'size': '_size_percentile',
+                'momentum': 'rps_20',
+                'reversal_20d': 'rps_20',
             }
             if factor_name in _peri_map \
-                    and stock_data.get(_peri_map[factor_name]) is None:
+                    and not _is_finite_number(stock_data.get(_peri_map[factor_name])):
+                # 2026-09-22（第二轮回归 P3-5）：原 `is None` 判不出 NaN ——
+                # NaN 分位会被当作"真实横截面值"参与加权（契约 A 违反）。
                 is_neutral = True
 
-            # momentum / reversal_20d 的数据源是 rps_20，但 data_engine 在无 K 线时
-            # **返回恒 50 而非 None**（data_engine.py:1272），因此 rps_20 无法作为
-            # 可用性判据（用 None 判断永不触发，会给出虚假的安全感）。
-            # 正确修法是改 data_engine 返回 None 或按 kline_df 存在性判定 ——
-            # 那会改变动量腿（权重 0.12）在实盘/回测两条路径上的行为，属未经 OOS
-            # 验证的语义变更，故**本轮不动**，记为遗留项（见深查报告 P2-4）。
-            # 影响评估：无 K 线股票（无成交量/停牌）在候选池中占比很低，且
-            # raw_return_20=0 会落到横截面中位附近，偏差有界。
+            # （历史遗留说明已删除：momentum/reversal_20d 已于 2026-09-22 接入
+            #   _peri_map 可用性判定，见上方注释；上游伪造 0 的三个分支同步修复。）
 
             factor_scores[factor_name] = (factor_score, weight, is_neutral)
             if is_neutral:
@@ -361,6 +400,9 @@ class ScoringModel:
                 # 分段系数让轻度软风险（量比异常 0.3）不受太大影响，
                 # 同时让高风险的惩罚力度拉开差距
                 risk_penalty = risk_check.get('score_penalty', 0)
+                # 2026-09-22 修复（契约 A）：同上，值为 null 时默认值失效 →
+                # `risk_penalty < 0.4` 直接 TypeError。非有限一律按 0（无扣分）。
+                risk_penalty = float(risk_penalty) if _is_finite_number(risk_penalty) else 0.0
                 if risk_penalty > 0:
                     risk_note = f"软风险扣分(penalty={risk_penalty})"
 
@@ -397,7 +439,11 @@ class ScoringModel:
         decision = self._make_decision(final_score, mode)
 
         # 计算目标价和止损价（优先从 sell_config 读取）
-        price = stock_data.get('price', 0)
+        # 2026-09-22 修复（契约 A）：`stock_data.get('price', 0)` 在键存在而值为
+        # None 时返回 None → `price * (1+tp)` TypeError。非有限一律按 0 处理
+        # （与"键缺失"的既有行为一致，下游 `price<=0` 分支已有守卫）。
+        _price_raw = stock_data.get('price', 0)
+        price = float(_price_raw) if _is_finite_number(_price_raw) else 0.0
         if mode == 'short':
             tp = self.sell_config.get('take_profit', 0.02)
             sl = abs(self.sell_config.get('stop_loss', -0.02))
@@ -513,9 +559,20 @@ class ScoringModel:
 
         # 动量
         rps = stock_data.get('rps_20')
-        if rps:
-            parts.append(f"RPS 20日排位约{float(rps):.0f}分位" if not isinstance(rps, (int, float)) or rps <= 100
-                         else f"短期涨幅强劲，RPS处于较高分位")
+        # 2026-09-22 修复（第二轮回归 P3-3）：原 `if rps` 对 rps='85'（字符串，
+        # 来自缓存反序列化）为真 → `float(rps)` 虽能转但与数值分支的判断
+        # `not isinstance(rps,(int,float))` 组合后，字符串会**恒走
+        # "短期涨幅强劲"**（因为 not isinstance → True），把 3 分位的弱动量
+        # 说成"强劲"。缺失/不可解析时改口"暂无"，数值才做分位表述。
+        rps_f = None
+        if isinstance(rps, (int, float)) and not isinstance(rps, bool) \
+                and math.isfinite(float(rps)):
+            rps_f = float(rps)
+        if rps_f is not None:
+            parts.append(f"RPS 20日排位约{rps_f:.0f}分位"
+                         if rps_f <= 100 else "短期涨幅强劲，RPS处于较高分位")
+        elif rps:
+            parts.append("动量数据暂不可用（已按中性处理）")
 
         # 技术面
         macd = stock_data.get('macd_status', {})
@@ -549,7 +606,10 @@ class ScoringModel:
         dt = stock_data.get('dragon_tiger', {})
         if dt and dt.get('records'):
             inst = dt.get('institution', {})
-            inst_net = inst.get('net_amt', 0)
+            # 2026-09-22 修复（契约 A）：值为 null 时 `get(..., 0)` 默认值失效 →
+            # 比较/格式化直接 TypeError。非有限按 0（"无机构净买入"）处理。
+            _inst_net = inst.get('net_amt', 0) if isinstance(inst, dict) else 0
+            inst_net = float(_inst_net) if _is_finite_number(_inst_net) else 0.0
             if inst_net > 0:
                 parts.append(f"龙虎榜机构净买入{inst_net:.0f}万")
             elif inst_net < 0:
@@ -575,7 +635,11 @@ class ScoringModel:
             quality = "基本面稳健" if mode == 'long' else "流动性良好，风险可控"
             reasoning += f"整体{quality}，具备"
 
+        # 2026-09-22 修复（契约 A）：同 score_stock 主体 —— `get('price', 0)` 对
+        # 值为 None 的键无效 → `price * (1+tp)` TypeError（此前在
+        # `_generate_reasoning` 这条路径上仍会崩）。
         price = stock_data.get('price', 0)
+        price = float(price) if _is_finite_number(price) else 0.0
         if mode == 'short':
             # 从 sell_config 读取，避免 config.yml 调整后简报文案与实际参数脱节
             # （此前此处硬编码 1.02 / 0.98，与 score_stock 中的 sell_config 不一致）
@@ -617,13 +681,20 @@ class ScoringModel:
             if s.get('main_fund_accumulated') is not None
             and abs(s['main_fund_accumulated']) > 0
         ]
+        # 2026-09-22（第二轮回归 P2-1）：横截面分位在**只有 1 个样本**时退化
+        # （n=1 → "唯一值"的 rank 恒为 1.0 → 100 分，与同池其他票的中性 50 形成断崖）。
+        # 处理：仍照常写分位（保住 `data_available=True` 的"有真实数据"语义，
+        # 守卫测试 test_rank_then_score_mixed_kline_lengths 依赖它），
+        # 但样本数 < MIN_CROSS_SECTION_N 时把分位**置 0.5（无截面信息）**，
+        # 既不虚报 100 分，也不把有数据的票伪装成缺失。
         if main_values:
             for s in stocks_data:
                 mv = s.get('main_fund_accumulated')
                 if mv is not None and abs(mv) > 0:
                     # 百分位 = 有多少股票 <= 该值 / 总数
                     rank = sum(1 for v in main_values if v <= mv) / len(main_values)
-                    s['_capital_flow_percentile'] = rank
+                    s['_capital_flow_percentile'] = (
+                        rank if len(main_values) >= MIN_CROSS_SECTION_N else 0.5)
 
         # R-B（2026-09-18）：小市值因子横截面百分位——市值越小分越高。
         # 依据 study-vault F09 洞察（小市值 = A 股最稳健截面因子，现有 9 因子
@@ -638,7 +709,9 @@ class ScoringModel:
                 if mv:
                     # 大市值秩（市值<=该值占比）取反 → 小市值百分位
                     big_rank = sum(1 for v in mcap_values if v <= mv) / len(mcap_values)
-                    s['_size_percentile'] = 1.0 - big_rank
+                    _r = 1.0 - big_rank
+                    s['_size_percentile'] = (
+                        _r if len(mcap_values) >= MIN_CROSS_SECTION_N else 0.5)
 
         # R-C（2026-09-18 对标 Barra Liquidity）：流动性因子横截面百分位——
         # 量比与换手率的均值百分位（高流动性=高换手=高分）。
@@ -648,17 +721,18 @@ class ScoringModel:
         for s in stocks_data:
             vr = s.get('volume_ratio')
             to = s.get('turnover')
-            if vr and vr > 0 and to is not None:
-                try:
-                    liq_vals.append((s, float(vr) * float(to)))
-                except (TypeError, ValueError):
-                    pass
+            # 2026-09-22 修复（契约 A）：原 `vr and vr > 0 and to is not None`
+            # 无法拦 NaN —— float(nan) 会进入 liq_sorted，令 sorted 顺序未定义，
+            # 从而污染**全池**的 _liquidity_percentile。改用有限性判定。
+            if _is_finite_number(vr) and vr > 0 and _is_finite_number(to):
+                liq_vals.append((s, float(vr) * float(to)))
         if liq_vals:
             liq_sorted = sorted(v for _, v in liq_vals)
             n = len(liq_sorted)
             for s, combined in liq_vals:
                 rank = sum(1 for _, v in liq_vals if v <= combined) / n
-                s['_liquidity_percentile'] = rank
+                s['_liquidity_percentile'] = (
+                    rank if n >= MIN_CROSS_SECTION_N else 0.5)
 
         # R-D（2026-09-18 对标 Barra Volatility）：波动率因子——20 日日收益率标准差
         # 横截面百分位取反（低波动=高分，Barra 低波动溢价）。
@@ -682,7 +756,8 @@ class ScoringModel:
             n_v = len(sorted_vols)
             for s, v in vol_raws:
                 rank = sum(1 for _, x in vol_raws if x <= v) / n_v
-                s['_volatility_percentile'] = rank  # 高波动 → 高百分位 → 低分
+                s['_volatility_percentile'] = (
+                    rank if n_v >= MIN_CROSS_SECTION_N else 0.5)  # 高波动 → 高百分位 → 低分
 
         # R-E（2026-09-19 方案G·OOS 实证）：缩量偏离因子——当日成交额相对自身常态的偏离。
         # 证据（2024-01~2026-09，299.9万行/647天/5225只，ret_hold1d，剔除接近涨停）：
@@ -714,7 +789,8 @@ class ScoringModel:
             n_liq = len(liq_raws)
             for s, dev in liq_raws:
                 rank = sum(1 for _, x in liq_raws if x <= dev) / n_liq
-                s['_liq_dev_percentile'] = rank  # 高偏离（放量）→ 高百分位 → 低分
+                s['_liq_dev_percentile'] = (
+                    rank if n_liq >= MIN_CROSS_SECTION_N else 0.5)  # 高偏离（放量）→ 高百分位 → 低分
 
         # R-F（2026-09-19 方案G·OOS 实证）：波动收敛偏离因子——20 日波动率相对自身
         # 60 日常态的偏离。证据：vol_dev IC +0.0263 / ICIR 0.225 / t +5.37，
@@ -741,7 +817,8 @@ class ScoringModel:
             n_vd = len(vol_dev_raws)
             for s, dev in vol_dev_raws:
                 rank = sum(1 for _, x in vol_dev_raws if x <= dev) / n_vd
-                s['_vol_dev_percentile'] = rank  # 高偏离（波动放大）→ 高百分位 → 低分
+                s['_vol_dev_percentile'] = (
+                    rank if n_vd >= MIN_CROSS_SECTION_N else 0.5)  # 高偏离（波动放大）→ 高百分位 → 低分
 
         # P2-K（2026-09-05 审查报告）：横截面因子标准化（实验开关）。
         # 批量预计算因子分 → 每个因子横截面 rank 0-100 → 写入 _factors_override，
@@ -759,7 +836,16 @@ class ScoringModel:
                 if penalty >= 0.8:
                     continue  # 严重风险，直接跳过
 
-            result = self.score_stock(stock, mode)
+            # 2026-09-22 修复（缺陷排查 P2-5）：单票评分隔离。原实现无 try ——
+            # 一只票的脏数据（异常形态的 K 线 / 第三方字段）会中断**当日全池**
+            # 评分；而调用方补算环节（strategies/short_term.py）对同一函数是有
+            # try 的，两处语义不一致。现统一为"单票失败只跳过该票并告警"。
+            try:
+                result = self.score_stock(stock, mode)
+            except Exception as e:
+                logger.warning(f"评分失败（跳过该票）: {stock.get('code')} "
+                               f"{type(e).__name__}: {str(e)[:80]}")
+                continue
             # 附带全字段源 dict 引用：下游补算（如 blocks/dragon_tiger 补全后重算）
             # 需要完整因子输入，瘦 result 缺 main_fund_accumulated/rps_20/macd_status 等
             result['_src'] = stock
@@ -767,6 +853,27 @@ class ScoringModel:
 
         # 按评分降序
         results.sort(key=lambda x: x['score'], reverse=True)
+
+        # 2026-09-23（交接单 D1 结构性解法）：把**当日候选池 top-N** 无条件外送
+        # （含"无任何标的达标"的日子）—— 这是绩效漂移监控摆脱幸存者偏差的样本源。
+        # 背景：漂移监控原先只统计 predictions 表中"有正式推荐"的交易日，弱市/
+        # 门槛清零日不产生样本 → 监控在最需要它的行情里冻结（实测 09 月覆盖率仅 29%）。
+        # 口径与既有完全对齐（同一 `score`、同一排序），且不改变任何返回值/行为：
+        # diagnostics=None 时（如回测）零副作用。
+        # 消费方：strategies/short_term.py 暴露 → scripts/eod_stock_picker.py 落库
+        # → feedback/drift_sample.py 计算 T+1 → core/drift_monitor.py 读取。
+        if diagnostics is not None:
+            # 口径说明（2026-09-23）：记录**完整详评池**（`results`，即当日全部
+            # 完成评分的候选，≤200 只），而不是仅 top-20 —— 理由：
+            #   ① 与 feedback/data_collector 的 `factor_raw` 表同源同规模
+            #      （都是 `_last_enriched` 的详评池）→ live 与历史自举口径一致；
+            #   ② 日度均值样本量更大（约 160 只 vs 20 只）→ PSI/均值漂移更稳；
+            #   ③ 池的构造与"是否产生推荐"完全无关（含未达标池）→ 消除幸存者偏差。
+            diagnostics['top_pool'] = [
+                {'code': r.get('code', ''), 'name': r.get('name', ''),
+                 'score': round(float(r.get('score', 0.0)), 2)}
+                for r in results[:200] if r.get('code')
+            ]
 
         # 过滤最低分并限制数量
         qualified = [r for r in results if r['score'] >= min_score]
@@ -820,11 +927,24 @@ class ScoringModel:
                 s['_factor_scores'] = {}
         if not stocks_data:
             return
-        factor_names = list(stocks_data[0].get('_factor_scores', {}).keys())
+        # 2026-09-22 修复（缺陷排查 P2-4）：原实现只取首只票的因子键集 ——
+        # 若 `stocks_data[0]` 的预计算恰好失败（上面 except 把 `_factor_scores`
+        # 置为 {}），`factor_names` 会是空列表 → **全池静默不标准化**，
+        # 日志只报 "0/0"，评分口径悄悄退回未标准化。
+        # 改为取全池并集并保持稳定顺序。
+        _seen = {}
+        for s in stocks_data:
+            for k in (s.get('_factor_scores') or {}):
+                _seen.setdefault(k, None)
+        factor_names = list(_seen.keys())
+        if not factor_names:
+            logger.warning("标准化：全池因子键集为空（预计算全部失败？）→ 本次跳过标准化")
+            return
         # 修复（2026-09-06 审查）：risk 不是加权因子（penalty 路径独立处理），
         # 恒中性值进标准化只会制造虚假名次，排除
         factor_names = [f for f in factor_names if f != 'risk']
         n_std = 0
+        _std_done = {}          # 因子名 → 本池是否真的执行了标准化
         for fname in factor_names:
             vals = {}
             for s in stocks_data:
@@ -839,12 +959,35 @@ class ScoringModel:
                         # 样本量（影响因子分位），留痕便于发现上游字段漂移。
                         logger.debug(f"因子 {fname} 值不可解析，已跳过: {v!r}")
             if len(vals) < 5:
+                _std_done[fname] = False
                 continue
             std = cross_sectional_standardize(vals, method='rank')
             for s in stocks_data:
                 code = str(s.get('code'))
                 if std.get(code) is not None:
                     s.setdefault('_factors_override', {})[fname] = std[code]
+            _std_done[fname] = True
             n_std += 1
+        # 2026-09-22 修复（第二轮回归 P1-2 · 契约 E）：`_factors_override` 是**逐
+        # 因子稀疏写入**的 —— 样本 <5 / 值不可解析的因子不会出现在某些票的
+        # override 里。而 `score_stock` 的覆盖逻辑是"override 里有这个键才用"，
+        # 缺键 → 静默回落**原始分**。实测（standardize=true，2 票池）：A 票
+        # rps_score=82.6、B 票 rps=None 造原始分 50，标准化后 82.6 覆盖、50 落空
+        # → **同一因子在相邻分位上出现 82.6 与 50 的断崖**，横截面可比性被破坏
+        # （标准化本应为 100 vs 0）。
+        # 处理：对"本池确实执行了标准化"的因子，把未拿到标准化值的票显式补成
+        # 中性 50，确保 override 对该因子是全集覆盖。
+        n_padded = 0
+        for s in stocks_data:
+            ov = s.setdefault('_factors_override', {})
+            for fname in factor_names:
+                if fname in ov or not _std_done.get(fname):
+                    continue
+                ov[fname] = 50.0
+                n_padded += 1
+        if n_padded:
+            logger.info(
+                f"标准化补齐: {n_padded} 个 (票,因子) 组合未参与标准化（样本<5 或值不可解析）"
+                f"→ 显式置中性 50，避免与已标准化票产生断崖")
         logger.info(f"横截面因子标准化启用: {n_std}/{len(factor_names)} 个因子 "
                     f"已按候选池 rank 0-100 重排（standardize=true）")
