@@ -562,10 +562,8 @@ class FactorLibrary:
                 has_data = True
                 score -= 10  # 机构净卖出
 
-            # 有上榜记录
-            if dragon_tiger.get('records'):
-                has_data = True
-                score += 5
+            # 有上榜但无机构净买 → 不额外加分（2026-11-09 同步短线 8-14「去泛上榜」修复，
+            # 泛上榜含游资杂单，已被实证为反信号；只保留机构净买方向的加分）
 
         # 主力资金净流入
         if main_fund is not None and abs(main_fund) > 0:
